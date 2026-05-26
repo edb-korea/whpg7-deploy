@@ -1,0 +1,27 @@
+---
+# os_preconfig role 기본값 (group_vars에서 override 가능)
+gpadmin_user: gpadmin
+gpadmin_group: gpadmin
+gpadmin_uid: 5000
+gpadmin_gid: 5000
+gpadmin_home: /home/gpadmin
+gpadmin_password: "changeme"
+
+whpg_local_repo_enabled: false
+whpg_local_repo_baseurl: "http://repo.internal/whpg"
+whpg_local_repo_gpgcheck: false
+
+xfs_data_device: ""         # 비어있으면 XFS 포맷/마운트 skip
+xfs_mount_point: /data
+xfs_mount_options: "rw,noatime,nobarrier,allocsize=16m,inode64,logbufs=8,logbsize=256k"
+
+io_scheduler: "none"
+io_udev_pattern: "sd[a-z]"
+tuned_profile_name: "whpg-optimized"
+
+sshd_max_startups: "100:30:200"
+sshd_max_sessions: 200
+
+ntp_servers:
+  - 0.rhel.pool.ntp.org
+  - 1.rhel.pool.ntp.org

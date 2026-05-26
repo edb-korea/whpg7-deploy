@@ -1,0 +1,300 @@
+---
+# ======================================================
+# Role: wem
+# WEM (Warehouse Enterprise Manager) 설치
+# Standby Coordinator 노드: Prometheus, Loki, Dashboard
+# 모든 노드: WEM Collector
+# ======================================================
+
+# ---------- 1. Prometheus 설치 (scdw 노드) ----------
+- name: prometheus 사용자 생성
+  ansible.builtin.user:
+    name: prometheus
+    system: true
+    shell: /sbin/nologin
+    home: /var/lib/prometheus
+    create_home: true
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Prometheus 다운로드 및 압축해제
+  ansible.builtin.unarchive:
+    src: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+    dest: /opt
+    remote_src: true
+    creates: "/opt/prometheus-{{ prometheus_version }}.linux-amd64"
+    owner: prometheus
+    group: prometheus
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Prometheus 바이너리 링크 생성
+  ansible.builtin.file:
+    src: "/opt/prometheus-{{ prometheus_version }}.linux-amd64/prometheus"
+    dest: /usr/local/bin/prometheus
+    state: link
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Prometheus 설정 디렉토리 생성
+  ansible.builtin.file:
+    path: /etc/prometheus
+    state: directory
+    owner: prometheus
+    group: prometheus
+    mode: '0755'
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Prometheus prometheus.yml 배포
+  ansible.builtin.template:
+    src: prometheus.yml.j2
+    dest: /etc/prometheus/prometheus.yml
+    owner: prometheus
+    group: prometheus
+    mode: '0644'
+  when: inventory_hostname in groups['standby_coordinator']
+  notify: restart_prometheus
+
+- name: Prometheus systemd 서비스 등록
+  ansible.builtin.template:
+    src: prometheus.service.j2
+    dest: /etc/systemd/system/prometheus.service
+    owner: root
+    group: root
+    mode: '0644'
+  when: inventory_hostname in groups['standby_coordinator']
+  notify: restart_prometheus
+
+- name: Prometheus 서비스 시작 및 활성화
+  ansible.builtin.systemd:
+    name: prometheus
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: inventory_hostname in groups['standby_coordinator']
+
+# ---------- 2. Loki 설치 (scdw 노드) ----------
+- name: Loki 다운로드
+  ansible.builtin.get_url:
+    url: "https://github.com/grafana/loki/releases/download/v{{ loki_version }}/loki-linux-amd64.zip"
+    dest: "/tmp/loki-linux-amd64.zip"
+    mode: '0644'
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Loki 압축 해제
+  ansible.builtin.unarchive:
+    src: "/tmp/loki-linux-amd64.zip"
+    dest: /usr/local/bin
+    remote_src: true
+    creates: /usr/local/bin/loki-linux-amd64
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Loki 바이너리 권한 설정
+  ansible.builtin.file:
+    path: /usr/local/bin/loki-linux-amd64
+    mode: '0755'
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Loki 설정 디렉토리
+  ansible.builtin.file:
+    path: /etc/loki
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Loki 설정파일 배포
+  ansible.builtin.template:
+    src: loki-config.yml.j2
+    dest: /etc/loki/loki-config.yml
+    owner: root
+    group: root
+    mode: '0644'
+  when: inventory_hostname in groups['standby_coordinator']
+  notify: restart_loki
+
+- name: Loki systemd 서비스 등록
+  ansible.builtin.template:
+    src: loki.service.j2
+    dest: /etc/systemd/system/loki.service
+    owner: root
+    group: root
+    mode: '0644'
+  when: inventory_hostname in groups['standby_coordinator']
+  notify: restart_loki
+
+- name: Loki 서비스 시작 및 활성화
+  ansible.builtin.systemd:
+    name: loki
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: inventory_hostname in groups['standby_coordinator']
+
+# ---------- 3. Grafana (WEM Dashboard) 설치 (scdw 노드) ----------
+- name: Grafana YUM 레포 추가
+  ansible.builtin.yum_repository:
+    name: grafana
+    description: Grafana OSS
+    baseurl: https://rpm.grafana.com
+    gpgcheck: false
+    enabled: true
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Grafana 설치
+  ansible.builtin.package:
+    name: grafana
+    state: present
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Grafana 설정 (포트, 데이터소스)
+  ansible.builtin.template:
+    src: grafana.ini.j2
+    dest: /etc/grafana/grafana.ini
+    owner: root
+    group: grafana
+    mode: '0640'
+  when: inventory_hostname in groups['standby_coordinator']
+  notify: restart_grafana
+
+- name: Grafana 서비스 시작 및 활성화
+  ansible.builtin.systemd:
+    name: grafana-server
+    state: started
+    enabled: true
+  when: inventory_hostname in groups['standby_coordinator']
+
+# Grafana가 완전히 시작될 때까지 대기
+- name: Grafana 시작 대기 (포트 응답 확인)
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ wem_dashboard_port }}"
+    delay: 5
+    timeout: 60
+  when: inventory_hostname in groups['standby_coordinator']
+
+# Grafana datasource provisioning 디렉토리
+- name: Grafana provisioning 디렉토리 생성
+  ansible.builtin.file:
+    path: /etc/grafana/provisioning/datasources
+    state: directory
+    owner: root
+    group: grafana
+    mode: '0755'
+  when: inventory_hostname in groups['standby_coordinator']
+
+- name: Grafana Prometheus datasource 등록
+  ansible.builtin.template:
+    src: grafana-datasource-prometheus.yml.j2
+    dest: /etc/grafana/provisioning/datasources/prometheus.yml
+    owner: root
+    group: grafana
+    mode: '0640'
+  when: inventory_hostname in groups['standby_coordinator']
+  notify: restart_grafana
+
+- name: Grafana Loki datasource 등록
+  ansible.builtin.template:
+    src: grafana-datasource-loki.yml.j2
+    dest: /etc/grafana/provisioning/datasources/loki.yml
+    owner: root
+    group: grafana
+    mode: '0640'
+  when: inventory_hostname in groups['standby_coordinator']
+  notify: restart_grafana
+
+# ---------- 4. WEM Collector 설치 (모든 WHPG 노드) ----------
+- name: postgres_exporter (WEM Collector) 다운로드
+  ansible.builtin.get_url:
+    url: "https://github.com/prometheus-community/postgres_exporter/releases/latest/download/postgres_exporter-0.15.0.linux-amd64.tar.gz"
+    dest: /tmp/postgres_exporter.tar.gz
+    mode: '0644'
+  when: wem_collector_install_all
+
+- name: postgres_exporter 압축 해제
+  ansible.builtin.unarchive:
+    src: /tmp/postgres_exporter.tar.gz
+    dest: /opt
+    remote_src: true
+    creates: /opt/postgres_exporter
+  when: wem_collector_install_all
+
+- name: postgres_exporter 서비스 등록 (Coordinator)
+  ansible.builtin.template:
+    src: postgres_exporter.service.j2
+    dest: /etc/systemd/system/postgres_exporter.service
+    owner: root
+    group: root
+    mode: '0644'
+  when:
+    - wem_collector_install_all
+    - inventory_hostname in groups['coordinator']
+  notify: restart_postgres_exporter
+
+- name: postgres_exporter 서비스 시작 (Coordinator)
+  ansible.builtin.systemd:
+    name: postgres_exporter
+    state: started
+    enabled: true
+    daemon_reload: true
+  when:
+    - wem_collector_install_all
+    - inventory_hostname in groups['coordinator']
+
+- name: node_exporter 설치 (모든 노드 시스템 메트릭)
+  ansible.builtin.package:
+    name: node_exporter
+    state: present
+  ignore_errors: true
+  when: wem_collector_install_all
+
+# ---------- 5. Promtail 설치 (모든 노드 → Loki로 로그 전송) ----------
+- name: Promtail 다운로드
+  ansible.builtin.get_url:
+    url: "https://github.com/grafana/loki/releases/download/v{{ loki_version }}/promtail-linux-amd64.zip"
+    dest: "/tmp/promtail-linux-amd64.zip"
+    mode: '0644'
+  when: wem_collector_install_all
+
+- name: Promtail 압축 해제
+  ansible.builtin.unarchive:
+    src: "/tmp/promtail-linux-amd64.zip"
+    dest: /usr/local/bin
+    remote_src: true
+    creates: /usr/local/bin/promtail-linux-amd64
+  when: wem_collector_install_all
+
+- name: Promtail 설정 디렉토리 생성
+  ansible.builtin.file:
+    path: /etc/promtail
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: wem_collector_install_all
+
+- name: Promtail 설정파일 배포
+  ansible.builtin.template:
+    src: promtail-config.yml.j2
+    dest: /etc/promtail/promtail-config.yml
+    owner: root
+    group: root
+    mode: '0644'
+  when: wem_collector_install_all
+  notify: restart_promtail
+
+- name: Promtail systemd 서비스 등록
+  ansible.builtin.template:
+    src: promtail.service.j2
+    dest: /etc/systemd/system/promtail.service
+    owner: root
+    group: root
+    mode: '0644'
+  when: wem_collector_install_all
+  notify: restart_promtail
+
+- name: Promtail 서비스 시작 및 활성화
+  ansible.builtin.systemd:
+    name: promtail
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: wem_collector_install_all

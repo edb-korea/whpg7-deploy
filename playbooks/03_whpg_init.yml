@@ -1,0 +1,6 @@
+---
+- name: WHPG 클러스터 초기화 (단독 실행)
+  hosts: coordinator
+  become: true
+  roles:
+    - whpg_init

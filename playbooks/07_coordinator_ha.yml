@@ -1,0 +1,6 @@
+---
+- name: Coordinator HA 구성 (단독 실행)
+  hosts: coordinator:standby_coordinator
+  become: true
+  roles:
+    - coordinator_ha

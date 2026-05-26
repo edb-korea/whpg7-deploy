@@ -1,0 +1,11 @@
+---
+- name: reload_whpg
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpstop -u -a
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  changed_when: true

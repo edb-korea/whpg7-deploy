@@ -1,0 +1,113 @@
+---
+# ======================================================
+# Role: whpg_install
+# WarehousePG RPM 설치 (모든 클러스터 노드)
+# ======================================================
+
+# ---------- 1. RPM 전송 및 설치 ----------
+- name: RPM 패키지를 모든 호스트에 복사
+  ansible.builtin.copy:
+    src: "{{ whpg_rpm_local_path }}"
+    dest: "/tmp/{{ whpg_rpm_name }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: WarehousePG RPM 설치
+  ansible.builtin.yum:
+    name: "/tmp/{{ whpg_rpm_name }}"
+    state: present
+    disable_gpg_check: true
+
+- name: 임시 RPM 파일 제거
+  ansible.builtin.file:
+    path: "/tmp/{{ whpg_rpm_name }}"
+    state: absent
+
+# ---------- 2. 설치 디렉토리 소유권 변경 ----------
+- name: WHPG 설치 디렉토리 소유권 gpadmin으로 변경
+  ansible.builtin.find:
+    paths: /usr/local
+    patterns: 'warehousepg*,greenplum*'
+    file_type: directory
+  register: installed_dirs
+
+- name: 소유권 변경 적용
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    recurse: true
+  loop: "{{ installed_dirs.files }}"
+
+# ---------- 3. 데이터 디렉토리 생성 ----------
+- name: Coordinator 데이터 디렉토리 생성
+  ansible.builtin.file:
+    path: "{{ coordinator_data_dir | dirname }}"
+    state: directory
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0750'
+  when: inventory_hostname in groups['coordinator'] or inventory_hostname in groups['standby_coordinator']
+
+- name: Segment Primary 데이터 디렉토리 생성
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0750'
+  loop: "{{ primary_data_dirs }}"
+  when: inventory_hostname in groups['segments']
+
+- name: Segment Mirror 데이터 디렉토리 생성
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0750'
+  loop: "{{ mirror_data_dirs }}"
+  when: inventory_hostname in groups['segments']
+
+# ---------- 4. gpssh-exkeys 실행 (Coordinator에서) ----------
+- name: hostfile 생성 (gpssh-exkeys 용)
+  ansible.builtin.template:
+    src: hostfile_all.j2
+    dest: "{{ gpadmin_home }}/hostfile_all"
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0644'
+  when: inventory_hostname == coordinator_host
+
+- name: gpssh-exkeys 실행 (클러스터 전체 SSH 키 교환)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpssh-exkeys -f {{ gpadmin_home }}/hostfile_all
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when: inventory_hostname == coordinator_host
+  changed_when: true
+
+# ---------- 5. gpcheckperf (선택적 검증) ----------
+- name: 네트워크 성능 점검 (선택사항 - 시간 소요)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpcheckperf -f {{ gpadmin_home }}/hostfile_all -r N -d /tmp 2>&1 | tail -20
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - inventory_hostname == coordinator_host
+    - whpg_run_checkperf | default(false)
+  register: checkperf_result
+  changed_when: false
+
+- name: gpcheckperf 결과 출력
+  ansible.builtin.debug:
+    var: checkperf_result.stdout_lines
+  when:
+    - inventory_hostname == coordinator_host
+    - whpg_run_checkperf | default(false)
+    - checkperf_result is defined

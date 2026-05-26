@@ -1,0 +1,12 @@
+---
+whpg_encoding: UTF8
+whpg_locale: ko_KR.UTF-8
+whpg_timezone: Asia/Seoul
+whpg_max_connections: 2000
+whpg_shared_buffers: 2GB
+whpg_effective_cache_size: 8GB
+whpg_primary_segments_per_host: 2
+whpg_mirror_segments_per_host: 2
+coordinator_host: cdw
+standby_coordinator_host: scdw
+segment_hosts: []

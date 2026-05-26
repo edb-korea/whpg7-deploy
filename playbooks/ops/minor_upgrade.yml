@@ -1,0 +1,88 @@
+---
+# ======================================================
+# WarehousePG Minor Upgrade 플레이북
+# 사용: ansible-playbook playbooks/ops/minor_upgrade.yml \
+#         -e "new_rpm=/path/to/warehousepg-db-7.4.1-rhel8-x86_64.rpm"
+# ======================================================
+
+- name: WHPG 마이너 업그레이드 - 클러스터 정지
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: 업그레이드 전 상태 확인
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstate -s 2>&1 | head -30
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: pre_upgrade_state
+      changed_when: false
+
+    - name: 업그레이드 전 상태 출력
+      ansible.builtin.debug:
+        var: pre_upgrade_state.stdout_lines
+
+    - name: WHPG 클러스터 정지
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstop -af 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      changed_when: true
+
+- name: WHPG 마이너 업그레이드 - 새 RPM 설치
+  hosts: whpg_cluster
+  become: true
+  tasks:
+    - name: 새 RPM 복사
+      ansible.builtin.copy:
+        src: "{{ new_rpm }}"
+        dest: "/tmp/{{ new_rpm | basename }}"
+        mode: '0644'
+
+    - name: 새 RPM 설치 (업그레이드)
+      ansible.builtin.yum:
+        name: "/tmp/{{ new_rpm | basename }}"
+        state: present
+        disable_gpg_check: true
+
+    - name: 임시 파일 제거
+      ansible.builtin.file:
+        path: "/tmp/{{ new_rpm | basename }}"
+        state: absent
+
+- name: WHPG 마이너 업그레이드 - 클러스터 재시작
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: WHPG 클러스터 시작
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstart -a 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: gpstart_result
+      changed_when: true
+
+    - name: 업그레이드 후 버전 확인
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          psql -d gpadmin -c "SELECT version();" 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      register: version_check
+      changed_when: false
+
+    - name: 버전 출력
+      ansible.builtin.debug:
+        var: version_check.stdout_lines

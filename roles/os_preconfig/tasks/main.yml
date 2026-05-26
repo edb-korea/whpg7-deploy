@@ -1,0 +1,316 @@
+---
+# ======================================================
+# Role: os_preconfig
+# RHEL 기반 OS 사전 구성 (모든 WHPG 클러스터 노드)
+# ======================================================
+
+# ---------- 1. SELinux 비활성화 ----------
+- name: SELinux 비활성화
+  ansible.posix.selinux:
+    state: disabled
+  notify: reboot_required
+
+- name: SELinux 설정파일 확인 (즉시 적용)
+  ansible.builtin.lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: 'SELINUX=disabled'
+
+# ---------- 2. firewalld 비활성화 ----------
+- name: firewalld 중지 및 비활성화
+  ansible.builtin.systemd:
+    name: firewalld
+    state: stopped
+    enabled: false
+  ignore_errors: true
+
+# ---------- 3. /etc/hosts 구성 ----------
+- name: /etc/hosts 클러스터 호스트 항목 추가
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} WarehousePG Cluster Hosts"
+    block: |
+      {{ hostvars['cdw']['ansible_host'] }} cdw
+      {{ hostvars['scdw']['ansible_host'] }} scdw
+      {% for host in segment_hosts %}
+      {{ hostvars[host]['ansible_host'] }} {{ host }}
+      {% endfor %}
+
+# ---------- 4. sysctl OS 파라미터 ----------
+- name: sysctl 파라미터 설정 (kernel/vm/net)
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: /etc/sysctl.d/95-whpg.conf
+    reload: true
+  loop:
+    # Shared Memory
+    - { key: "kernel.shmmax",        value: "500000000" }
+    - { key: "kernel.shmmni",        value: "4096" }
+    - { key: "kernel.shmall",        value: "4000000000" }
+    - { key: "kernel.sem",           value: "500 2048000 200 4096" }
+    - { key: "kernel.sysrq",         value: "1" }
+    - { key: "kernel.core_uses_pid", value: "1" }
+    - { key: "kernel.msgmnb",        value: "65536" }
+    - { key: "kernel.msgmax",        value: "65536" }
+    - { key: "kernel.msgmni",        value: "2048" }
+    # Virtual Memory
+    - { key: "vm.overcommit_memory", value: "2" }
+    - { key: "vm.overcommit_ratio",  value: "95" }
+    - { key: "vm.swappiness",        value: "10" }
+    - { key: "vm.dirty_expire_centisecs",    value: "500" }
+    - { key: "vm.dirty_writeback_centisecs", value: "100" }
+    - { key: "vm.dirty_background_ratio",    value: "0" }
+    - { key: "vm.dirty_ratio",               value: "0" }
+    - { key: "vm.dirty_background_bytes",    value: "1610612736" }
+    - { key: "vm.dirty_bytes",               value: "4294967296" }
+    # Network
+    - { key: "net.ipv4.tcp_tw_reuse",          value: "1" }
+    - { key: "net.ipv4.conf.all.arp_filter",   value: "1" }
+    - { key: "net.ipv4.ip_local_port_range",   value: "10000 65535" }
+    - { key: "net.core.netdev_max_backlog",    value: "2000" }
+    - { key: "net.core.rmem_max",              value: "4194304" }
+    - { key: "net.core.wmem_max",              value: "4194304" }
+    - { key: "net.core.rmem_default",          value: "4194304" }
+    - { key: "net.core.wmem_default",          value: "4194304" }
+    - { key: "net.core.optmem_max",            value: "4194304" }
+    - { key: "net.ipv4.tcp_mem",               value: "4194304 4194304 4194304" }
+    - { key: "net.ipv4.tcp_rmem",              value: "4096 4194304 4194304" }
+    - { key: "net.ipv4.tcp_wmem",              value: "4096 4194304 4194304" }
+
+# ---------- 5. PAM / Ulimits ----------
+- name: gpadmin 사용자 ulimits 설정 (/etc/security/limits.d)
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/95-gpadmin.conf
+    content: |
+      gpadmin soft nofile 524288
+      gpadmin hard nofile 524288
+      gpadmin soft nproc  131072
+      gpadmin hard nproc  131072
+      gpadmin soft core   unlimited
+      gpadmin hard core   unlimited
+      gpadmin soft memlock unlimited
+      gpadmin hard memlock unlimited
+    owner: root
+    group: root
+    mode: '0644'
+
+# ---------- 6. cgroup v2 비활성화 (v1 사용) ----------
+- name: cgroup v1 강제 사용 (grub 설정)
+  ansible.builtin.lineinfile:
+    path: /etc/default/grub
+    regexp: '^GRUB_CMDLINE_LINUX='
+    line: 'GRUB_CMDLINE_LINUX="crashkernel=auto rd.lvm.lv=rhel/root rd.lvm.lv=rhel/swap rhgb quiet systemd.unified_cgroup_hierarchy=0"'
+  notify: update_grub
+
+# ---------- 7. gpadmin 사용자 / 그룹 생성 ----------
+- name: gpadmin 그룹 생성
+  ansible.builtin.group:
+    name: "{{ gpadmin_group }}"
+    gid: "{{ gpadmin_gid }}"
+    state: present
+
+- name: gpadmin 사용자 생성
+  ansible.builtin.user:
+    name: "{{ gpadmin_user }}"
+    uid: "{{ gpadmin_uid }}"
+    group: "{{ gpadmin_group }}"
+    home: "{{ gpadmin_home }}"
+    shell: /bin/bash
+    password: "{{ gpadmin_password | password_hash('sha512') }}"
+    create_home: true
+    state: present
+
+- name: gpadmin .bashrc에 WHPG 환경변수 추가
+  ansible.builtin.blockinfile:
+    path: "{{ gpadmin_home }}/.bashrc"
+    marker: "# {mark} WarehousePG Environment"
+    create: true
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    block: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+      export PGPORT=5432
+      export PGDATABASE=gpadmin
+
+# ---------- 8. gpadmin SSH 키 생성 및 무암호 로그인 ----------
+- name: gpadmin .ssh 디렉토리 생성
+  ansible.builtin.file:
+    path: "{{ gpadmin_home }}/.ssh"
+    state: directory
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0700'
+
+- name: Coordinator에서 gpadmin SSH 키 생성
+  ansible.builtin.user:
+    name: "{{ gpadmin_user }}"
+    generate_ssh_key: true
+    ssh_key_bits: 4096
+    ssh_key_type: rsa
+    ssh_key_file: "{{ gpadmin_home }}/.ssh/id_rsa"
+  when: inventory_hostname == coordinator_host
+
+- name: Coordinator의 gpadmin 공개키 가져오기
+  ansible.builtin.slurp:
+    src: "{{ gpadmin_home }}/.ssh/id_rsa.pub"
+  register: gpadmin_pubkey
+  delegate_to: "{{ coordinator_host }}"
+  run_once: true
+
+- name: 모든 노드에 gpadmin authorized_keys 배포
+  ansible.posix.authorized_key:
+    user: "{{ gpadmin_user }}"
+    key: "{{ gpadmin_pubkey['content'] | b64decode }}"
+    state: present
+
+- name: SSH known_hosts 설정 (StrictHostKeyChecking 비활성화)
+  ansible.builtin.copy:
+    dest: "{{ gpadmin_home }}/.ssh/config"
+    content: |
+      Host *
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0600'
+
+# ---------- 9. 로컬 YUM 레포지토리 ----------
+- name: WHPG 로컬 YUM 레포 설정
+  ansible.builtin.template:
+    src: whpg-local.repo.j2
+    dest: /etc/yum.repos.d/whpg-local.repo
+    owner: root
+    group: root
+    mode: '0644'
+  when: whpg_local_repo_enabled
+
+# ---------- 10. XFS 마운트 옵션 ----------
+- name: XFS 데이터 파티션 포맷 (이미 포맷된 경우 skip)
+  ansible.builtin.command:
+    cmd: "mkfs.xfs -f {{ xfs_data_device }}"
+  args:
+    creates: /proc/mounts  # idempotent trick - 실제 운영 시 별도 체크 권장
+  ignore_errors: true
+  when: xfs_data_device is defined
+
+- name: /data 마운트 포인트 생성
+  ansible.builtin.file:
+    path: "{{ xfs_mount_point }}"
+    state: directory
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0755'
+
+- name: /etc/fstab에 XFS 마운트 항목 추가
+  ansible.posix.mount:
+    path: "{{ xfs_mount_point }}"
+    src: "{{ xfs_data_device }}"
+    fstype: xfs
+    opts: "{{ xfs_mount_options }}"
+    state: mounted
+  when: xfs_data_device is defined
+
+# ---------- 11. I/O 스케쥴러 udev 규칙 ----------
+- name: I/O 스케쥴러 udev 규칙 설정 (VMware/SSD용 none)
+  ansible.builtin.copy:
+    dest: /etc/udev/rules.d/99-vmware-db-scheduler.rules
+    content: |
+      # WarehousePG I/O Scheduler Tuning
+      ACTION=="add|change", KERNEL=="{{ io_udev_pattern }}", ATTR{queue/scheduler}="{{ io_scheduler }}"
+      ACTION=="add|change", KERNEL=="{{ io_udev_pattern }}", ATTR{bdi/read_ahead_kb}="16"
+    owner: root
+    group: root
+    mode: '0644'
+  notify: reload_udev
+
+# ---------- 12. THP 비활성화 + Read-ahead 조정 (tuned) ----------
+- name: tuned 설치
+  ansible.builtin.package:
+    name: tuned
+    state: present
+
+- name: WHPG tuned 프로파일 디렉토리 생성
+  ansible.builtin.file:
+    path: "/etc/tuned/{{ tuned_profile_name }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: WHPG tuned.conf 배포
+  ansible.builtin.template:
+    src: tuned.conf.j2
+    dest: "/etc/tuned/{{ tuned_profile_name }}/tuned.conf"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: tuned 서비스 활성화 및 시작
+  ansible.builtin.systemd:
+    name: tuned
+    state: started
+    enabled: true
+
+- name: WHPG tuned 프로파일 활성화
+  ansible.builtin.command:
+    cmd: "tuned-adm profile {{ tuned_profile_name }}"
+  changed_when: true
+
+# ---------- 13. SSH 연결 임계값 설정 ----------
+- name: sshd_config MaxStartups 설정
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?MaxStartups'
+    line: "MaxStartups {{ sshd_max_startups }}"
+  notify: restart_sshd
+
+- name: sshd_config MaxSessions 설정
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?MaxSessions'
+    line: "MaxSessions {{ sshd_max_sessions }}"
+  notify: restart_sshd
+
+# ---------- 14. NTP (chrony) 설정 ----------
+- name: chrony 설치
+  ansible.builtin.package:
+    name: chrony
+    state: present
+
+- name: chrony NTP 서버 설정
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony.conf
+    owner: root
+    group: root
+    mode: '0644'
+  notify: restart_chronyd
+
+- name: chronyd 서비스 활성화 및 시작
+  ansible.builtin.systemd:
+    name: chronyd
+    state: started
+    enabled: true
+
+# ---------- 15. 필수 패키지 설치 ----------
+- name: 필수 패키지 설치
+  ansible.builtin.package:
+    name:
+      - rsync
+      - zip
+      - unzip
+      - net-tools
+      - bind-utils
+      - lsof
+      - sysstat
+      - perl
+      - python3
+      - python3-pip
+      - java-11-openjdk
+      - apr
+      - apr-util
+      - bash-completion
+    state: present

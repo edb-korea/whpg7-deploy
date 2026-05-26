@@ -1,0 +1,78 @@
+---
+# ======================================================
+# WarehousePG 전체 배포 메인 플레이북 (site.yml)
+# 실행 순서: OS 구성 → WHPG 설치 → 초기화 → Extension → WEM → pgBouncer → HA
+# ======================================================
+
+# Phase 1: OS 사전 구성 (모든 클러스터 노드)
+- name: "Phase 1: OS 사전 구성"
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - os_preconfig
+  tags:
+    - phase1
+    - os
+
+# Phase 2: WHPG RPM 설치 및 SSH 키 교환
+- name: "Phase 2: WarehousePG 설치"
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - whpg_install
+  tags:
+    - phase2
+    - install
+
+# Phase 3: 클러스터 초기화 (cluster → mirror → standby)
+- name: "Phase 3: WarehousePG 클러스터 초기화"
+  hosts: coordinator
+  become: true
+  roles:
+    - whpg_init
+  tags:
+    - phase3
+    - init
+
+# Phase 4: Extension 설치 (기본 + 선택)
+- name: "Phase 4: Extension 설치"
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - whpg_extensions
+  tags:
+    - phase4
+    - extensions
+
+# Phase 5: WEM (Prometheus + Loki + Grafana + Collector)
+- name: "Phase 5: WEM 설치"
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - role: wem
+      when: wem_enabled | default(true)
+  tags:
+    - phase5
+    - wem
+
+# Phase 6: pgBouncer (Coordinator)
+- name: "Phase 6: pgBouncer 설치"
+  hosts: pgbouncer_node
+  become: true
+  roles:
+    - role: pgbouncer
+      when: pgbouncer_enabled | default(true)
+  tags:
+    - phase6
+    - pgbouncer
+
+# Phase 7: Coordinator HA (keepalived VIP)
+- name: "Phase 7: Coordinator HA 구성"
+  hosts: coordinator:standby_coordinator
+  become: true
+  roles:
+    - role: coordinator_ha
+      when: coordinator_ha_enabled | default(false)
+  tags:
+    - phase7
+    - ha

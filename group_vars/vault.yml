@@ -1,0 +1,21 @@
+---
+# ======================================================
+# Ansible Vault 민감 변수 파일
+# 실제 사용 시 반드시 vault로 암호화하세요:
+#   ansible-vault encrypt group_vars/vault.yml
+#
+# site.yml 실행 시:
+#   ansible-playbook playbooks/site.yml --ask-vault-pass
+# ======================================================
+
+# gpadmin 비밀번호
+vault_gpadmin_password: "changeme_strong_password"
+
+# keepalived 인증 비밀번호
+vault_keepalived_auth_pass: "changeme_ha_pass"
+
+# pgBouncer auth (선택)
+vault_pgbouncer_auth_password: "changeme_bouncer"
+
+# Grafana admin 비밀번호
+vault_grafana_admin_password: "changeme_grafana"

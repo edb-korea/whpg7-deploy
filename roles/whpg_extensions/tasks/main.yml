@@ -1,0 +1,407 @@
+---
+# ======================================================
+# Role: whpg_extensions
+# 기본 Extension + Optional Extension 설치
+# ======================================================
+
+# ----------------------------------------
+# 공통 helper macro: gpconfig enable
+# ----------------------------------------
+- name: WHPG 클러스터 기동 확인
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpstate -s 2>&1 | grep -c 'Up' || true
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when: inventory_hostname == coordinator_host
+  changed_when: false
+  register: gpstate_check
+
+# ==========================================
+# 기본 Extension (항상 설치)
+# ==========================================
+
+# --- PXF (Hadoop/HDFS 연동) ---
+- name: PXF RPM 설치 (모든 노드)
+  ansible.builtin.package:
+    name: pxf
+    state: present
+  when: install_pxf
+
+- name: PXF 환경 초기화 (Coordinator에서)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      pxf cluster init 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_pxf
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+- name: PXF Hadoop core-site.xml 설정
+  ansible.builtin.template:
+    src: pxf-core-site.xml.j2
+    dest: "{{ gpadmin_home }}/pxf/conf/core-site.xml"
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0644'
+  when:
+    - install_pxf
+    - pxf_hadoop_enabled
+    - inventory_hostname == coordinator_host
+
+- name: PXF 클러스터 시작
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      pxf cluster start 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_pxf
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- shared_preload_libraries 목록 동적 구성 ---
+# 활성화된 라이브러리를 하나씩 추가하는 대신 목록을 조립 후 한 번에 gpconfig
+
+- name: shared_preload_libraries 목록 초기화
+  ansible.builtin.set_fact:
+    whpg_preload_libs: []
+  when: inventory_hostname == coordinator_host
+
+- name: pgaudit을 preload 목록에 추가
+  ansible.builtin.set_fact:
+    whpg_preload_libs: "{{ whpg_preload_libs + ['pgaudit'] }}"
+  when:
+    - install_pgaudit
+    - inventory_hostname == coordinator_host
+
+- name: diskquota를 preload 목록에 추가
+  ansible.builtin.set_fact:
+    whpg_preload_libs: "{{ whpg_preload_libs + ['diskquota'] }}"
+  when:
+    - install_diskquota
+    - inventory_hostname == coordinator_host
+
+- name: user_profile을 preload 목록에 추가
+  ansible.builtin.set_fact:
+    whpg_preload_libs: "{{ whpg_preload_libs + ['user_profile'] }}"
+  when:
+    - install_user_profile
+    - inventory_hostname == coordinator_host
+
+# --- pgaudit ---
+- name: pgaudit 설치 (모든 노드)
+  ansible.builtin.package:
+    name: warehousepg-pgaudit
+    state: present
+  when: install_pgaudit
+
+- name: pgaudit CREATE EXTENSION (DB 내 등록)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pgaudit;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_pgaudit
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- user_profile ---
+- name: user_profile 설치 (모든 노드)
+  ansible.builtin.package:
+    name: warehousepg-user-profile
+    state: present
+  when: install_user_profile
+
+# --- anonymizer ---
+- name: postgresql_anonymizer 설치
+  ansible.builtin.package:
+    name: warehousepg-anonymizer
+    state: present
+  when: install_anonymizer
+
+- name: anonymizer CREATE EXTENSION
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS anon CASCADE;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_anonymizer
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- whpg_fdw ---
+- name: whpg_fdw CREATE EXTENSION
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS whpg_fdw;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_whpg_fdw
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- diskquota ---
+- name: diskquota 설치 (모든 노드)
+  ansible.builtin.package:
+    name: warehousepg-diskquota
+    state: present
+  when: install_diskquota
+
+# --- Data Science Pack (Python) ---
+- name: Data Science Python 패키지 설치 (모든 노드)
+  ansible.builtin.package:
+    name:
+      - warehousepg-python3-datascience
+    state: present
+  when: install_datascience_python
+
+# --- MADlib ---
+- name: MADlib 설치 (모든 노드)
+  ansible.builtin.package:
+    name: warehousepg-madlib
+    state: present
+  when: install_madlib
+
+- name: MADlib 설치 스크립트 실행 (Coordinator)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      $GPHOME/madlib/bin/madpack -s madlib install -p warehousepg -c gpadmin@localhost:5432/gpadmin 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_madlib
+    - inventory_hostname == coordinator_host
+  changed_when: true
+  ignore_errors: true
+
+# --- PLR ---
+- name: PLR 설치 (모든 노드)
+  ansible.builtin.package:
+    name: warehousepg-plr
+    state: present
+  when: install_plr
+
+- name: PLR CREATE EXTENSION
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS plr;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_plr
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- PL/Java ---
+- name: PL/Java 설치 (모든 노드)
+  ansible.builtin.package:
+    name: warehousepg-pljava
+    state: present
+  when: install_pljava
+
+- name: PL/Java CREATE EXTENSION
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pljava;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_pljava
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# ==========================================
+# Optional Extension
+# ==========================================
+
+# --- PostGIS ---
+- name: PostGIS 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-postgis
+    state: present
+  when: install_postgis
+
+- name: PostGIS CREATE EXTENSION (옵션)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_postgis
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- HLL ---
+- name: HLL 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-hll
+    state: present
+  when: install_hll
+
+- name: HLL CREATE EXTENSION (옵션)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS hll;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_hll
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- pgvector ---
+- name: pgvector 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-pgvector
+    state: present
+  when: install_pgvector
+
+- name: pgvector CREATE EXTENSION (옵션)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_pgvector
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- pgfs ---
+- name: pgfs 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-pgfs
+    state: present
+  when: install_pgfs
+
+# --- shared_preload_libraries 한 번에 gpconfig 적용 ---
+- name: shared_preload_libraries 통합 설정
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpconfig -c shared_preload_libraries -v '{{ whpg_preload_libs | join(",") }}' 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when:
+    - inventory_hostname == coordinator_host
+    - whpg_preload_libs | length > 0
+  changed_when: true
+
+# --- q3c (선택) ---
+- name: q3c 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-q3c
+    state: present
+  when: install_q3c
+
+- name: q3c CREATE EXTENSION (옵션)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS q3c;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_q3c
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- pgSphere (선택) ---
+- name: pgSphere 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-pgsphere
+    state: present
+  when: install_pgsphere
+
+- name: pgSphere CREATE EXTENSION (옵션)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pgsphere;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_pgsphere
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- VectorChord (선택) ---
+- name: VectorChord 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-vectorchord
+    state: present
+  when: install_vectorchord
+
+- name: VectorChord CREATE EXTENSION (옵션)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS vectorchord;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_vectorchord
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- pgaa (선택) ---
+- name: pgaa 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-pgaa
+    state: present
+  when: install_pgaa
+
+- name: pgaa CREATE EXTENSION (옵션)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pgaa;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - install_pgaa
+    - inventory_hostname == coordinator_host
+  changed_when: true
+
+# --- flowserver (선택) ---
+- name: flowserver 설치 (옵션)
+  ansible.builtin.package:
+    name: warehousepg-flowserver
+    state: present
+  when: install_flowserver
+
+# --- WHPG 재시작 (shared_preload_libraries 적용) ---
+- name: WHPG 재시작 (extension shared lib 적용)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpstop -ra -a 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when: inventory_hostname == coordinator_host
+  changed_when: true

@@ -1,0 +1,6 @@
+---
+- name: WHPG Extension 설치 (단독 실행)
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - whpg_extensions

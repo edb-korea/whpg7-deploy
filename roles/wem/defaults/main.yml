@@ -1,0 +1,9 @@
+---
+wem_enabled: true
+prometheus_version: "2.51.2"
+loki_version: "2.9.6"
+wem_dashboard_port: 3000
+prometheus_port: 9090
+loki_port: 3100
+wem_collector_install_all: true
+postgres_exporter_version: "0.15.0"

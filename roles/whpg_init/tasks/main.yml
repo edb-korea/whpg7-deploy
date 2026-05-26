@@ -1,0 +1,175 @@
+---
+# ======================================================
+# Role: whpg_init
+# 순서: cluster init → mirror → standby coordinator
+# ======================================================
+
+# ---------- 1. gpinitsystem 설정파일 생성 ----------
+- name: gpinitsystem_config 생성
+  ansible.builtin.template:
+    src: gpinitsystem_config.j2
+    dest: "{{ gpadmin_home }}/gpinitsystem_config"
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0644'
+  when: inventory_hostname == coordinator_host
+
+- name: seg_hosts 파일 생성 (세그먼트 전용)
+  ansible.builtin.template:
+    src: seg_hosts.j2
+    dest: "{{ gpadmin_home }}/seg_hosts"
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0644'
+  when: inventory_hostname == coordinator_host
+
+# ---------- 2. gpinitsystem 실행 (Cluster 초기화) ----------
+- name: WarehousePG 클러스터 초기화 (gpinitsystem)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpinitsystem -c {{ gpadmin_home }}/gpinitsystem_config
+      -h {{ gpadmin_home }}/seg_hosts -a 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when: inventory_hostname == coordinator_host
+  register: gpinit_result
+  changed_when: "'Greenplum Database instance successfully created' in gpinit_result.stdout or
+                 'WarehousePG instance successfully created' in gpinit_result.stdout"
+  failed_when:
+    - gpinit_result.rc != 0
+    - "'already exists' not in gpinit_result.stdout"
+
+- name: gpinitsystem 결과 출력
+  ansible.builtin.debug:
+    var: gpinit_result.stdout_lines
+  when: inventory_hostname == coordinator_host
+
+# ---------- 3. Mirror 세그먼트 추가 ----------
+- name: Mirror 세그먼트 추가 (gpaddmirrors)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpaddmirrors -a 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when: inventory_hostname == coordinator_host
+  register: mirror_result
+  changed_when: "'mirrors successfully added' in mirror_result.stdout"
+  failed_when:
+    - mirror_result.rc != 0
+    - "'already' not in mirror_result.stderr | default('')"
+
+- name: Mirror 추가 결과 출력
+  ansible.builtin.debug:
+    var: mirror_result.stdout_lines
+  when: inventory_hostname == coordinator_host
+
+# ---------- 4. Standby Coordinator 추가 ----------
+- name: Standby Coordinator 추가 (gpinitstandby)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpinitstandby -s {{ standby_coordinator_host }} -a 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when: inventory_hostname == coordinator_host
+  register: standby_result
+  changed_when: "'Standby coordinator successfully created' in standby_result.stdout"
+  failed_when:
+    - standby_result.rc != 0
+    - "'already' not in standby_result.stderr | default('')"
+
+- name: Standby 추가 결과 출력
+  ansible.builtin.debug:
+    var: standby_result.stdout_lines
+  when: inventory_hostname == coordinator_host
+
+# ---------- 5. 기본 DB 파라미터 설정 ----------
+- name: postgresql.conf 추가 파라미터 설정
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpconfig -c {{ item.param }} -v "{{ item.value }}" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  loop:
+    - { param: "max_connections",    value: "{{ whpg_max_connections }}" }
+    - { param: "shared_buffers",     value: "{{ whpg_shared_buffers }}" }
+    - { param: "effective_cache_size", value: "{{ whpg_effective_cache_size }}" }
+    - { param: "gp_resource_manager",  value: "group" }
+    - { param: "statement_mem",        value: "256MB" }
+    - { param: "max_statement_mem",    value: "2GB" }
+    - { param: "wal_level",            value: "replica" }
+    - { param: "logging_collector",    value: "on" }
+    - { param: "log_min_duration_statement", value: "1000" }
+  when: inventory_hostname == coordinator_host
+  changed_when: true
+
+- name: WHPG 재시작 (파라미터 적용)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpstop -ra -a 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when: inventory_hostname == coordinator_host
+  changed_when: true
+
+# ---------- 6. pg_hba.conf 기본 접근 설정 ----------
+- name: pg_hba.conf 접근 규칙 추가
+  ansible.builtin.blockinfile:
+    path: "{{ coordinator_data_dir }}/pg_hba.conf"
+    marker: "# {mark} Ansible Managed WHPG Access Rules"
+    block: |
+      host    all             gpadmin         0.0.0.0/0         md5
+      host    all             all             127.0.0.1/32      md5
+      host    all             all             ::1/128           md5
+  when: inventory_hostname == coordinator_host
+  notify: reload_whpg
+
+# ---------- 7. 타임존 설정 ----------
+- name: DB 타임존 설정
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpconfig -c TimeZone -v '{{ whpg_timezone }}' 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when: inventory_hostname == coordinator_host
+  changed_when: true
+
+# ---------- 8. resource group 활성화 ----------
+- name: resource group cgroup 마운트 확인
+  ansible.builtin.shell:
+    cmd: mount | grep cgroup
+  register: cgroup_mount
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == coordinator_host
+
+- name: gpconfig resource_manager 설정
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpconfig -c gp_resource_manager -v 'group' 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment:
+    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  when:
+    - inventory_hostname == coordinator_host
+    - cgroup_mount.stdout | length > 0
+  changed_when: true

@@ -1,0 +1,17 @@
+[Unit]
+Description=pgBouncer Connection Pooler
+After=network.target
+
+[Service]
+User={{ gpadmin_user }}
+Group={{ gpadmin_group }}
+Type=forking
+PIDFile=/var/run/pgbouncer/pgbouncer.pid
+ExecStartPre=/bin/mkdir -p /var/run/pgbouncer /var/log/pgbouncer
+ExecStartPre=/bin/chown {{ gpadmin_user }}:{{ gpadmin_group }} /var/run/pgbouncer /var/log/pgbouncer
+ExecStart=/usr/bin/pgbouncer -d /etc/pgbouncer/pgbouncer.ini
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

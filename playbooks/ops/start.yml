@@ -1,0 +1,21 @@
+---
+# WarehousePG 클러스터 시작
+- name: WHPG 클러스터 시작
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: gpstart 실행
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstart -a 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: gpstart_result
+      changed_when: "'already running' not in gpstart_result.stdout"
+
+    - name: 시작 결과 출력
+      ansible.builtin.debug:
+        var: gpstart_result.stdout_lines

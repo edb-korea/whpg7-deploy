@@ -1,0 +1,9 @@
+---
+pgbouncer_enabled: true
+pgbouncer_listen_port: 5433
+pgbouncer_max_client_conn: 5000
+pgbouncer_default_pool_size: 200
+pgbouncer_pool_mode: transaction
+pgbouncer_admin_users: "gpadmin"
+pgbouncer_target_db: "gpadmin"
+pgbouncer_target_port: 5432

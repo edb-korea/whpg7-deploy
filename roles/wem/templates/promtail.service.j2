@@ -1,0 +1,13 @@
+[Unit]
+Description=Promtail Log Shipper (WHPG → Loki)
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/lib/promtail
+ExecStart=/usr/local/bin/promtail-linux-amd64 -config.file=/etc/promtail/promtail-config.yml
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

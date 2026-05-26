@@ -1,0 +1,7 @@
+#!/bin/bash
+# WarehousePG Coordinator 헬스체크 스크립트
+source {{ whpg_install_dir }}/greenplum_path.sh
+export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+
+psql -h 127.0.0.1 -p 5432 -U {{ gpadmin_user }} -d gpadmin -c "SELECT 1" -q -t 2>/dev/null | grep -q 1
+exit $?

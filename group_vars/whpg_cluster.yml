@@ -1,0 +1,165 @@
+---
+# ======================================================
+# WarehousePG Ansible Deployment - Group Variables
+# 대상: whpg_cluster (coordinator + standby + segments)
+# ======================================================
+
+# ------------------------------------------
+# 공통 접속 설정
+# ------------------------------------------
+ansible_user: root
+ansible_ssh_private_key_file: ~/.ssh/id_rsa
+ansible_python_interpreter: /usr/bin/python3
+
+# ------------------------------------------
+# WarehousePG 버전 및 설치 경로
+# ------------------------------------------
+whpg_version: "7.4.0"
+whpg_rpm_name: "warehousepg-db-{{ whpg_version }}-rhel8-x86_64.rpm"
+whpg_install_dir: "/usr/local/warehousepg-db"
+whpg_rpm_local_path: "/tmp/{{ whpg_rpm_name }}"   # 로컬 RPM 위치 (control node)
+
+# ------------------------------------------
+# gpadmin 사용자 설정
+# ------------------------------------------
+gpadmin_user: gpadmin
+gpadmin_group: gpadmin
+gpadmin_uid: 5000
+gpadmin_gid: 5000
+gpadmin_home: /home/gpadmin
+gpadmin_password: "{{ vault_gpadmin_password | default('changeme') }}"  # vault로 암호화 권장
+
+# ------------------------------------------
+# 데이터 디렉토리 경로
+# ------------------------------------------
+coordinator_data_dir: /data/coordinator/gpseg-1
+standby_data_dir: /data/coordinator/gpseg-1
+primary_data_dirs:
+  - /data/primary/gpseg0
+  - /data/primary/gpseg1
+mirror_data_dirs:
+  - /data/mirror/gpseg0
+  - /data/mirror/gpseg1
+
+# ------------------------------------------
+# 클러스터 호스트 정보
+# ------------------------------------------
+coordinator_host: cdw
+standby_coordinator_host: scdw
+segment_hosts:
+  - sdw1
+  - sdw2
+  - sdw3
+  - sdw4
+
+# ------------------------------------------
+# DB 초기화 파라미터
+# ------------------------------------------
+whpg_encoding: UTF8
+whpg_locale: ko_KR.UTF-8
+whpg_timezone: Asia/Seoul
+whpg_max_connections: 2000
+whpg_seg_max_connections: 2000
+whpg_shared_buffers: 2GB
+whpg_effective_cache_size: 8GB
+whpg_primary_segments_per_host: 2
+whpg_mirror_segments_per_host: 2
+
+# ------------------------------------------
+# 로컬 YUM 레포지토리 설정
+# ------------------------------------------
+whpg_local_repo_enabled: true
+whpg_local_repo_baseurl: "http://repo.internal/whpg"   # 환경에 맞게 수정
+whpg_local_repo_gpgcheck: false
+
+# ------------------------------------------
+# OS 튜닝 설정
+# ------------------------------------------
+# XFS 마운트 데이터 파티션
+xfs_data_device: /dev/sdb       # 환경에 맞게 수정
+xfs_mount_point: /data
+xfs_mount_options: "rw,noatime,nobarrier,allocsize=16m,inode64,logbufs=8,logbsize=256k"
+
+# I/O 스케쥴러 (VMware 환경: none, 물리서버: mq-deadline)
+io_scheduler: "none"
+io_udev_pattern: "sd[a-z]"
+
+# THP/Read-ahead tuned 프로파일
+tuned_profile_name: "whpg-optimized"
+
+# ------------------------------------------
+# SSH 임계값 설정
+# ------------------------------------------
+sshd_max_startups: "100:30:200"
+sshd_max_sessions: 200
+
+# ------------------------------------------
+# NTP 서버
+# ------------------------------------------
+ntp_servers:
+  - 0.rhel.pool.ntp.org
+  - 1.rhel.pool.ntp.org
+
+# ------------------------------------------
+# Extension 설치 플래그 (기본 항상 설치)
+# ------------------------------------------
+install_pxf: true
+install_pgaudit: true
+install_user_profile: true
+install_anonymizer: true
+install_whpg_fdw: true
+install_diskquota: true
+install_datascience_python: true
+install_madlib: true
+install_plr: true
+install_pljava: true
+
+# PXF Hadoop 연동
+pxf_hadoop_enabled: true
+pxf_namenode_host: "namenode.internal"  # 환경에 맞게 수정
+pxf_hdfs_port: 8020
+
+# ------------------------------------------
+# Optional Extension 플래그
+# ------------------------------------------
+install_postgis: false
+install_hll: false
+install_q3c: false
+install_pgsphere: false
+install_pgfs: false
+install_pgaa: false
+install_pgvector: true
+install_vectorchord: false
+install_flowserver: false
+
+# ------------------------------------------
+# WEM 설정 (Standby Coordinator 노드에 설치)
+# ------------------------------------------
+wem_enabled: true
+prometheus_version: "2.51.2"
+loki_version: "2.9.6"
+wem_dashboard_port: 3000
+prometheus_port: 9090
+loki_port: 3100
+wem_collector_install_all: true
+
+# ------------------------------------------
+# pgBouncer 설정 (Coordinator 노드)
+# ------------------------------------------
+pgbouncer_enabled: true
+pgbouncer_listen_port: 5433
+pgbouncer_max_client_conn: 5000
+pgbouncer_default_pool_size: 200
+pgbouncer_pool_mode: transaction
+pgbouncer_admin_users: "gpadmin"
+pgbouncer_target_db: "gpadmin"
+pgbouncer_target_port: 5432
+
+# ------------------------------------------
+# Coordinator HA 설정 (keepalived/corosync)
+# ------------------------------------------
+coordinator_ha_enabled: true
+coordinator_vip: "192.168.10.100"        # 환경에 맞게 수정
+coordinator_vip_interface: "eth0"
+coordinator_ha_method: "keepalived"      # keepalived or pacemaker
+keepalived_auth_pass: "{{ vault_keepalived_auth_pass | default('whpg2024') }}"  # vault 암호화 권장

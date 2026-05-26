@@ -1,0 +1,7 @@
+---
+# OS 사전 구성만 단독 실행
+- name: OS 사전 구성 (단독 실행)
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - os_preconfig

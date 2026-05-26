@@ -1,0 +1,17 @@
+---
+whpg_version: "7.4.0"
+whpg_rpm_name: "warehousepg-db-{{ whpg_version }}-rhel8-x86_64.rpm"
+whpg_install_dir: "/usr/local/warehousepg-db"
+whpg_rpm_local_path: "/tmp/{{ whpg_rpm_name }}"
+whpg_run_checkperf: false
+
+coordinator_data_dir: /data/coordinator/gpseg-1
+standby_data_dir: /data/coordinator/gpseg-1
+
+primary_data_dirs:
+  - /data/primary/gpseg0
+  - /data/primary/gpseg1
+
+mirror_data_dirs:
+  - /data/mirror/gpseg0
+  - /data/mirror/gpseg1

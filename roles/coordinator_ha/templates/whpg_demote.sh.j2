@@ -1,0 +1,15 @@
+#!/bin/bash
+# Fault 상태 처리 스크립트
+LOGFILE=/var/log/whpg_ha_demote.log
+echo "[$(date)] keepalived FAULT state detected. Stopping WHPG if running." >> $LOGFILE
+
+source {{ whpg_install_dir }}/greenplum_path.sh
+export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+
+# 세그먼트에 영향을 주지 않도록 coordinator만 중지
+su - {{ gpadmin_user }} -c "
+    source {{ whpg_install_dir }}/greenplum_path.sh
+    export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+    pg_ctl stop -D {{ coordinator_data_dir }} -m fast
+" >> $LOGFILE 2>&1
+echo "[$(date)] FAULT handling complete. RC=$?" >> $LOGFILE

@@ -1,0 +1,63 @@
+---
+# ======================================================
+# 세그먼트 복구 플레이북
+# 사용: ansible-playbook playbooks/ops/recover_segments.yml
+# ======================================================
+
+- name: 세그먼트 복구 (gprecoverseg)
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: Down 세그먼트 확인
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstate -s 2>&1 | grep -i 'down\|not synchronized' || echo "모든 세그먼트 정상"
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: seg_status
+      changed_when: false
+
+    - name: 세그먼트 상태 출력
+      ansible.builtin.debug:
+        var: seg_status.stdout_lines
+
+    - name: gprecoverseg 실행 (증분 복구)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gprecoverseg -a 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: recover_result
+      changed_when: true
+      when: "'모든 세그먼트 정상' not in seg_status.stdout"
+
+    - name: 복구 결과 출력
+      ansible.builtin.debug:
+        var: recover_result.stdout_lines
+      when: recover_result is defined
+
+    - name: rebalance 실행 (Primary/Mirror 역할 원복)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gprecoverseg -ra 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: rebalance_result
+      changed_when: true
+      when:
+        - recover_result is defined
+        - recover_result.rc == 0
+
+    - name: rebalance 결과 출력
+      ansible.builtin.debug:
+        var: rebalance_result.stdout_lines
+      when: rebalance_result is defined

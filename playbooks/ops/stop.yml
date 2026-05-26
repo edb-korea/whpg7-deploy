@@ -1,0 +1,21 @@
+---
+# WarehousePG 클러스터 정지
+- name: WHPG 클러스터 정지
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: gpstop 실행 (fast mode)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstop -af 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: gpstop_result
+      changed_when: true
+
+    - name: 정지 결과 출력
+      ansible.builtin.debug:
+        var: gpstop_result.stdout_lines

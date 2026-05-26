@@ -1,0 +1,58 @@
+---
+# ======================================================
+# Standby Coordinator 재동기화 플레이북
+# Coordinator HA failover 후 standby 재구성 시 사용
+# 사용: ansible-playbook playbooks/ops/resync_standby.yml
+# ======================================================
+
+- name: Standby Coordinator 제거 후 재동기화
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: 기존 standby 제거
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpinitstandby -r -a 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: remove_standby
+      changed_when: true
+      ignore_errors: true
+
+    - name: standby 제거 결과 출력
+      ansible.builtin.debug:
+        var: remove_standby.stdout_lines
+
+    - name: 구 standby 노드 데이터 디렉토리 초기화
+      ansible.builtin.file:
+        path: "{{ standby_data_dir }}"
+        state: absent
+      delegate_to: "{{ standby_coordinator_host }}"
+
+    - name: Standby 데이터 디렉토리 재생성
+      ansible.builtin.file:
+        path: "{{ standby_data_dir | dirname }}"
+        state: directory
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0750'
+      delegate_to: "{{ standby_coordinator_host }}"
+
+    - name: Standby Coordinator 재동기화 (gpinitstandby)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpinitstandby -s {{ standby_coordinator_host }} -a 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: init_standby
+      changed_when: true
+
+    - name: Standby 동기화 결과 출력
+      ansible.builtin.debug:
+        var: init_standby.stdout_lines

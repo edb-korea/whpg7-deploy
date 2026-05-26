@@ -1,0 +1,25 @@
+#!/bin/bash
+# Standby → Active Coordinator 승격 스크립트
+# keepalived MASTER 상태 전환 시 호출됨
+ROLE=$1
+LOGFILE=/var/log/whpg_ha_promote.log
+
+echo "[$(date)] keepalived notify_master called (role=$ROLE)" >> $LOGFILE
+
+source {{ whpg_install_dir }}/greenplum_path.sh
+export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+
+# 현재 Active Coordinator 확인
+HOSTNAME=$(hostname -s)
+
+if [ "$HOSTNAME" == "{{ standby_coordinator_host }}" ]; then
+    echo "[$(date)] Activating standby coordinator via gpinitstandby -n" >> $LOGFILE
+    su - {{ gpadmin_user }} -c "
+        source {{ whpg_install_dir }}/greenplum_path.sh
+        export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+        gpinitstandby -n -a
+    " >> $LOGFILE 2>&1
+    echo "[$(date)] Promotion complete. RC=$?" >> $LOGFILE
+else
+    echo "[$(date)] Already active coordinator, no action needed." >> $LOGFILE
+fi

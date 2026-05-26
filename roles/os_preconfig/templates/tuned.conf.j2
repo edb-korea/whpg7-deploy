@@ -1,0 +1,18 @@
+# WarehousePG Tuned Profile
+# THP 비활성화, Read-ahead 최소화
+
+[main]
+summary=WarehousePG Optimized Profile
+include=throughput-performance
+
+[cpu]
+force_latency=1
+
+[disk]
+readahead=16
+
+[vm]
+transparent_hugepages=never
+
+[bootloader]
+cmdline=transparent_hugepage=never
