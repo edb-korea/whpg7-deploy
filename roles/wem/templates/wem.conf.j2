@@ -1,0 +1,33 @@
+# WarehousePG Enterprise Manager 설정
+# /etc/wem/wem.conf
+# 참고: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/wem/installing/wem/
+
+# -------- 대상 WHPG 클러스터 --------
+WHPG_HOST={{ wem_whpg_host }}
+WHPG_PORT={{ wem_whpg_port }}
+WHPG_DATABASE={{ wem_whpg_database }}
+WHPG_USER={{ wem_whpg_user }}
+WHPG_PASSWORD={{ wem_whpg_password }}
+
+# -------- Observability 엔드포인트 --------
+PROMETHEUS_URL={{ prometheus_url }}
+LOKI_URL={{ loki_url }}
+
+# -------- WEM 포털 포트 --------
+PORT={{ wem_portal_port }}
+
+# -------- 세션 보안 --------
+# WEM_COOKIE_SECRET은 openssl rand -base64 32 로 생성한 값 사용
+WEM_COOKIE_SECRET={{ wem_cookie_secret | default('CHANGE_ME_openssl_rand_base64_32') }}
+WEM_INSECURE_COOKIES=1
+
+# -------- admin 비밀번호 파일 --------
+WEM_ADMIN_PASSWORD_FILE=/etc/wem/admin.pw
+
+# -------- 로그 / 수집 주기 --------
+WEM_EXPORTER_LOG_LEVEL=info
+WEM_EXPORTER_REMOTE_WRITE_INTERVAL=15s
+WEM_EXPORTER_REMOTE_WRITE_TIMEOUT=30s
+
+# -------- AI Assistant (선택) --------
+# ANTHROPIC_API_KEY=YOUR_API_KEY_HERE

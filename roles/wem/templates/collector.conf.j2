@@ -1,0 +1,12 @@
+# WarehousePG Observability Collector 설정
+# /var/lib/whpg-observability-collector/collector.conf
+# 참고: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/wem/installing/collector/
+
+# WHPG 클러스터 연결 정보 (superuser 필요)
+WHPG_OBS_DSN="host={{ coordinator_host }} port=5432 dbname={{ wem_whpg_database }} user={{ wem_whpg_user }} password={{ wem_whpg_password }} sslmode=disable"
+
+# Loki 엔드포인트 (로그 수집)
+LOKI_ENDPOINT="{{ loki_push_url }}"
+
+# Prometheus 엔드포인트 (메트릭 remote write)
+PROMETHEUS_ENDPOINT="{{ prometheus_remote_write_url }}"

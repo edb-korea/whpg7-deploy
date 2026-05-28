@@ -10,6 +10,7 @@ install_datascience_python: true
 install_madlib: true
 install_plr: true
 install_pljava: true
+install_whpg_backup: true
 
 # PXF Hadoop 연동
 pxf_hadoop_enabled: false

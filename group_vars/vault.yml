@@ -19,3 +19,12 @@ vault_pgbouncer_auth_password: "changeme_bouncer"
 
 # Grafana admin 비밀번호
 vault_grafana_admin_password: "changeme_grafana"
+
+# EDB 구독 토큰 (EDB 계정 → Downloads 페이지에서 확인)
+vault_edb_subscription_token: ""
+
+# WEM admin 비밀번호
+vault_wem_admin_password: "changeme_wem"
+
+# WEM Cookie Secret (openssl rand -base64 32 로 생성)
+vault_wem_cookie_secret: "CHANGE_ME_run_openssl_rand_base64_32"

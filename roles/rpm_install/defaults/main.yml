@@ -1,0 +1,15 @@
+---
+# ======================================================
+# rpm_install role 기본값
+# 로컬 RPM 디렉토리를 먼저 탐색하고 없으면 dnf로 설치
+# ======================================================
+
+# 로컬 RPM 저장 디렉토리 (Control Node 기준 또는 각 노드 로컬 경로)
+# 이 디렉토리에 RPM 파일이 있으면 해당 파일로 설치, 없으면 dnf 사용
+local_rpm_dir: "/opt/whpg-rpms"
+
+# dnf fallback 허용 여부
+rpm_dnf_fallback: true
+
+# RPM 설치 시 GPG 체크 비활성화 (내부 레포 사용 시 true)
+rpm_disable_gpg_check: true

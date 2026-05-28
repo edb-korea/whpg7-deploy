@@ -1,0 +1,194 @@
+---
+# ======================================================
+# WEM 업그레이드 플레이북
+# - edb-whpg-observability-collector (Alloy 포함)
+# - whpg-enterprise-manager (WEM Dashboard)
+#
+# 사용법:
+#   # 로컬 RPM 사용
+#   ansible-playbook playbooks/upgrade/upgrade_wem.yml \
+#     -e "local_rpm_dir=/opt/whpg-rpms"
+#
+#   # dnf만 사용
+#   ansible-playbook playbooks/upgrade/upgrade_wem.yml \
+#     -e "rpm_dnf_fallback=true" -e "local_rpm_dir=/nonexistent"
+#
+#   # Collector만 업그레이드
+#   ansible-playbook playbooks/upgrade/upgrade_wem.yml \
+#     --tags collector
+#
+#   # WEM Dashboard만 업그레이드
+#   ansible-playbook playbooks/upgrade/upgrade_wem.yml \
+#     --tags dashboard
+# ======================================================
+
+# -------- Part 1: WEM Collector 업그레이드 (모든 WHPG 노드) --------
+- name: "WEM Upgrade - Collector (edb-whpg-observability-collector)"
+  hosts: coordinator
+  become: true
+  tags: [collector]
+  tasks:
+    - name: alloy 서비스 현재 상태 확인
+      ansible.builtin.command:
+        cmd: systemctl is-active alloy
+      register: alloy_before
+      changed_when: false
+      failed_when: false
+
+    - name: alloy 서비스 정지
+      ansible.builtin.systemd:
+        name: alloy
+        state: stopped
+      when: alloy_before.stdout == "active"
+      ignore_errors: true
+
+    - name: Collector 로컬 RPM 탐색 (Coordinator)
+      ansible.builtin.find:
+        paths: "{{ local_rpm_dir | default('/opt/whpg-rpms') }}"
+        patterns: "edb-whpg-observability-collector*.rpm"
+      register: _collector_rpm
+
+    - name: Collector 로컬 RPM 다운로드 (로컬 없을 때 → dnf download)
+      ansible.builtin.shell:
+        cmd: >
+          export EDB_SUBSCRIPTION_TOKEN={{ edb_subscription_token }} &&
+          export EDB_REPO={{ edb_repo }} &&
+          cd {{ gpadmin_home }} &&
+          sudo dnf download edb-whpg-observability-collector -y 2>&1
+      when:
+        - _collector_rpm.files | length == 0
+        - edb_subscription_token is defined
+        - edb_subscription_token != ""
+      changed_when: true
+
+    - name: 로컬 RPM으로 Collector 업그레이드
+      ansible.builtin.yum:
+        name: "{{ _collector_rpm.files | map(attribute='path') | sort | last }}"
+        state: latest
+        disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
+      when: _collector_rpm.files | length > 0
+
+    - name: gpssh로 전체 노드 Collector 업그레이드 (로컬 RPM 사용 시)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpssh -f {{ gpadmin_home }}/hostfile_all -u gpadmin -e
+          "scp gpadmin@$(hostname):{{ _collector_rpm.files | map(attribute='path') | sort | last }} /tmp/
+           && sudo dnf install -y /tmp/$(basename {{ _collector_rpm.files | map(attribute='path') | sort | last }})" 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      when: _collector_rpm.files | length > 0
+      changed_when: true
+
+    - name: collector.conf 재배포 (설정 유지)
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/wem/templates/collector.conf.j2"
+        dest: /var/lib/whpg-observability-collector/collector.conf
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0640'
+
+    - name: deploy-observability 재실행
+      ansible.builtin.shell:
+        cmd: >
+          cd /var/lib/whpg-observability-collector &&
+          ./deploy-observability 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      changed_when: true
+
+    - name: alloy 서비스 상태 확인 (업그레이드 후)
+      ansible.builtin.command:
+        cmd: systemctl status alloy
+      register: alloy_after
+      changed_when: false
+      failed_when: false
+
+    - name: alloy 상태 출력
+      ansible.builtin.debug:
+        var: alloy_after.stdout_lines
+
+# -------- Part 2: WEM Dashboard 업그레이드 (Standby Coordinator) --------
+- name: "WEM Upgrade - Dashboard (whpg-enterprise-manager)"
+  hosts: standby_coordinator
+  become: true
+  tags: [dashboard]
+  tasks:
+    - name: WEM 서비스 현재 버전 확인
+      ansible.builtin.shell:
+        cmd: /usr/local/greenplum-db/wem/wem --version 2>&1 || rpm -q whpg-enterprise-manager 2>&1
+      register: wem_before
+      changed_when: false
+      failed_when: false
+
+    - name: 현재 WEM 버전 출력
+      ansible.builtin.debug:
+        msg: "업그레이드 전 버전: {{ wem_before.stdout | trim }}"
+
+    - name: WEM 서비스 정지
+      ansible.builtin.systemd:
+        name: wem
+        state: stopped
+
+    - name: WEM 로컬 RPM 탐색
+      ansible.builtin.find:
+        paths: "{{ local_rpm_dir | default('/opt/whpg-rpms') }}"
+        patterns: "whpg-enterprise-manager*.rpm"
+      register: _wem_rpm
+
+    - name: WEM 로컬 RPM 업그레이드
+      ansible.builtin.yum:
+        name: "{{ _wem_rpm.files | map(attribute='path') | sort | last }}"
+        state: latest
+        disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
+      when: _wem_rpm.files | length > 0
+
+    - name: WEM dnf 업그레이드 (로컬 없을 때)
+      ansible.builtin.dnf:
+        name: whpg-enterprise-manager
+        state: latest
+        disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
+      when: _wem_rpm.files | length == 0
+
+    - name: wem.conf 재배포 (설정 유지)
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/wem/templates/wem.conf.j2"
+        dest: /etc/wem/wem.conf
+        owner: root
+        group: root
+        mode: '0640'
+
+    - name: WEM 서비스 재시작
+      ansible.builtin.systemd:
+        name: wem
+        state: started
+        daemon_reload: true
+
+    - name: WEM 서비스 기동 대기
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ wem_portal_port | default(8080) }}"
+        delay: 10
+        timeout: 120
+
+    - name: WEM 업그레이드 후 버전 확인
+      ansible.builtin.shell:
+        cmd: /usr/local/greenplum-db/wem/wem --version 2>&1 || rpm -q whpg-enterprise-manager 2>&1
+      register: wem_after
+      changed_when: false
+      failed_when: false
+
+    - name: 업그레이드 후 WEM 버전 출력
+      ansible.builtin.debug:
+        msg: "업그레이드 후 버전: {{ wem_after.stdout | trim }}"
+
+    - name: wem doctor 실행 (업그레이드 검증)
+      ansible.builtin.shell:
+        cmd: /usr/local/greenplum-db/wem/wem doctor 2>&1
+      register: wem_doctor
+      changed_when: false
+      failed_when: false
+
+    - name: wem doctor 결과 출력
+      ansible.builtin.debug:
+        var: wem_doctor.stdout_lines

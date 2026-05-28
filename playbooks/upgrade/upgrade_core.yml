@@ -1,0 +1,177 @@
+---
+# ======================================================
+# WarehousePG Core 업그레이드 플레이북
+#
+# 사용법:
+#   # 로컬 RPM으로 업그레이드 (local_rpm_dir에 새 RPM 배치 후)
+#   ansible-playbook playbooks/upgrade/upgrade_core.yml \
+#     -e "local_rpm_dir=/opt/whpg-rpms"
+#
+#   # 특정 RPM 파일 직접 지정
+#   ansible-playbook playbooks/upgrade/upgrade_core.yml \
+#     -e "whpg_rpm_name=warehouse-pg-7.4.1-rhel9-x86_64.rpm" \
+#     -e "local_rpm_dir=/opt/whpg-rpms"
+#
+# 업그레이드 절차:
+#   1. 현재 버전 확인
+#   2. 클러스터 정지 (gpstop)
+#   3. 모든 노드에 새 RPM 설치 (upgrade)
+#   4. 클러스터 시작 (gpstart)
+#   5. 업그레이드 후 버전 확인
+# ======================================================
+
+# -------- Phase 1: 업그레이드 전 검증 --------
+- name: "Core Upgrade - 사전 확인"
+  hosts: coordinator
+  become: true
+  gather_facts: false
+  tasks:
+    - name: 현재 WHPG 버전 확인
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          psql -d gpadmin -t -c "SELECT version();" 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      register: current_version
+      changed_when: false
+
+    - name: 현재 버전 출력
+      ansible.builtin.debug:
+        msg: "현재 버전: {{ current_version.stdout | trim }}"
+
+    - name: 클러스터 상태 확인
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstate -s 2>&1 | grep -E 'Up|Down|Status' | head -10
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: cluster_state
+      changed_when: false
+
+    - name: 클러스터 상태 출력
+      ansible.builtin.debug:
+        var: cluster_state.stdout_lines
+
+    - name: 업그레이드 대상 RPM 확인 (로컬)
+      ansible.builtin.find:
+        paths: "{{ local_rpm_dir | default('/opt/whpg-rpms') }}"
+        patterns: "{{ whpg_rpm_name | default('warehouse-pg-7*.rpm') }}"
+      register: upgrade_rpm_check
+      delegate_to: localhost
+      become: false
+
+    - name: 업그레이드 RPM 정보 출력
+      ansible.builtin.debug:
+        msg: >
+          업그레이드 RPM:
+          {{ upgrade_rpm_check.files | map(attribute='path') | list
+             if upgrade_rpm_check.files | length > 0
+             else '로컬 RPM 없음 → dnf 업그레이드 사용' }}
+
+# -------- Phase 2: 클러스터 정지 --------
+- name: "Core Upgrade - 클러스터 정지"
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: gpstop (클러스터 정지)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstop -af 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      changed_when: true
+
+# -------- Phase 3: 모든 노드에 새 RPM 설치 --------
+- name: "Core Upgrade - RPM 업그레이드 (모든 노드)"
+  hosts: whpg_cluster
+  become: true
+  tasks:
+    - name: 로컬 RPM 탐색
+      ansible.builtin.find:
+        paths: "{{ local_rpm_dir | default('/opt/whpg-rpms') }}"
+        patterns: "{{ whpg_rpm_name | default('warehouse-pg-7*.rpm') }}"
+      register: _upgrade_rpm
+      ignore_errors: true
+
+    - name: 로컬 RPM 업그레이드 설치
+      ansible.builtin.yum:
+        name: "{{ _upgrade_rpm.files | map(attribute='path') | sort | last }}"
+        state: latest
+        disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
+      when: _upgrade_rpm.files | length > 0
+
+    - name: dnf 업그레이드 (로컬 RPM 없을 때)
+      ansible.builtin.dnf:
+        name: "warehouse-pg-7"
+        state: latest
+        disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
+      when: _upgrade_rpm.files | length == 0
+
+    - name: 설치 디렉토리 소유권 재정비
+      ansible.builtin.find:
+        paths: /usr/local
+        patterns: 'warehousepg*,greenplum*'
+        file_type: directory
+      register: _new_dirs
+
+    - name: 소유권 gpadmin으로 변경
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        recurse: true
+      loop: "{{ _new_dirs.files }}"
+
+# -------- Phase 4: 클러스터 재시작 및 검증 --------
+- name: "Core Upgrade - 클러스터 재시작 및 검증"
+  hosts: coordinator
+  become: true
+  tasks:
+    - name: gpstart (클러스터 시작)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstart -a 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: gpstart_result
+      changed_when: true
+
+    - name: 업그레이드 후 버전 확인
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          psql -d gpadmin -t -c "SELECT version();" 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      register: new_version
+      changed_when: false
+
+    - name: 업그레이드 결과 출력
+      ansible.builtin.debug:
+        msg: "업그레이드 완료. 새 버전: {{ new_version.stdout | trim }}"
+
+    - name: gpstate로 세그먼트 상태 확인
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpstate -s 2>&1 | tail -20
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment:
+        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      register: post_state
+      changed_when: false
+
+    - name: 업그레이드 후 클러스터 상태
+      ansible.builtin.debug:
+        var: post_state.stdout_lines

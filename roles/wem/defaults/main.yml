@@ -1,9 +1,27 @@
 ---
 wem_enabled: true
-prometheus_version: "2.51.2"
-loki_version: "2.9.6"
-wem_dashboard_port: 3000
-prometheus_port: 9090
-loki_port: 3100
+
+# EDB 구독 토큰 (EDB 계정에서 발급)
+edb_subscription_token: ""   # vault로 관리 권장: {{ vault_edb_subscription_token }}
+edb_repo: "gpsupp"
+
+# WEM 대시보드 (scdw)
+wem_portal_port: 8080
+wem_admin_password: "{{ vault_wem_admin_password | default('changeme_wem') }}"
+
+# WEM이 연결할 WHPG 클러스터 정보
+wem_whpg_host: "{{ coordinator_host }}"
+wem_whpg_port: 5432
+wem_whpg_database: "gpadmin"
+wem_whpg_user: "gpadmin"
+wem_whpg_password: "{{ vault_gpadmin_password | default('changeme') }}"
+
+# Prometheus / Loki 엔드포인트
+# (사전에 별도 설치된 Prometheus/Loki 주소를 지정)
+prometheus_url: "http://{{ hostvars[groups['standby_coordinator'][0]]['ansible_host'] }}:9090"
+loki_url: "http://{{ hostvars[groups['standby_coordinator'][0]]['ansible_host'] }}:3100"
+prometheus_remote_write_url: "{{ prometheus_url }}/api/v1/write"
+loki_push_url: "{{ loki_url }}/loki/api/v1/push"
+
+# WEM Collector (alloy)
 wem_collector_install_all: true
-postgres_exporter_version: "0.15.0"

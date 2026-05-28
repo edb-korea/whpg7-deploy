@@ -1,9 +1,14 @@
 ---
 whpg_version: "7.4.0"
-whpg_rpm_name: "warehousepg-db-{{ whpg_version }}-rhel8-x86_64.rpm"
+whpg_rpm_name: "warehouse-pg-7-{{ whpg_version }}-rhel9-x86_64.rpm"
 whpg_install_dir: "/usr/local/warehousepg-db"
 whpg_rpm_local_path: "/tmp/{{ whpg_rpm_name }}"
 whpg_run_checkperf: false
+
+# RPM 설치 설정 (rpm_install role과 공유)
+local_rpm_dir: "/opt/whpg-rpms"
+rpm_dnf_fallback: true
+rpm_disable_gpg_check: true
 
 coordinator_data_dir: /data/coordinator/gpseg-1
 standby_data_dir: /data/coordinator/gpseg-1

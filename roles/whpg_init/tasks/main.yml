@@ -160,16 +160,15 @@
   failed_when: false
   when: inventory_hostname == coordinator_host
 
-- name: gpconfig resource_manager 설정
+- name: gpconfig resource_manager 설정 (cgroup v2 → group-v2)
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpconfig -c gp_resource_manager -v 'group' 2>&1
+      gpconfig -c gp_resource_manager -v 'group-v2' 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
   environment:
     COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
   when:
     - inventory_hostname == coordinator_host
-    - cgroup_mount.stdout | length > 0
   changed_when: true

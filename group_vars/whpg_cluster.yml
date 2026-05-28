@@ -15,9 +15,17 @@ ansible_python_interpreter: /usr/bin/python3
 # WarehousePG 버전 및 설치 경로
 # ------------------------------------------
 whpg_version: "7.4.0"
-whpg_rpm_name: "warehousepg-db-{{ whpg_version }}-rhel8-x86_64.rpm"
+whpg_rpm_name: "warehouse-pg-7-{{ whpg_version }}-rhel9-x86_64.rpm"
 whpg_install_dir: "/usr/local/warehousepg-db"
 whpg_rpm_local_path: "/tmp/{{ whpg_rpm_name }}"   # 로컬 RPM 위치 (control node)
+
+# ------------------------------------------
+# RPM 설치/업그레이드 공통 설정
+# 로컬 디렉토리 우선 탐색 → 없으면 dnf fallback
+# ------------------------------------------
+local_rpm_dir: "/opt/whpg-rpms"     # 각 노드의 로컬 RPM 저장 경로
+rpm_dnf_fallback: true              # 로컬 RPM 없을 때 dnf 사용 여부
+rpm_disable_gpg_check: true         # GPG 검사 비활성화 (내부 레포 시 true)
 
 # ------------------------------------------
 # gpadmin 사용자 설정
@@ -136,12 +144,20 @@ install_flowserver: false
 # WEM 설정 (Standby Coordinator 노드에 설치)
 # ------------------------------------------
 wem_enabled: true
-prometheus_version: "2.51.2"
-loki_version: "2.9.6"
-wem_dashboard_port: 3000
-prometheus_port: 9090
-loki_port: 3100
-wem_collector_install_all: true
+wem_portal_port: 8080
+wem_admin_password: "{{ vault_wem_admin_password | default('changeme_wem') }}"
+wem_cookie_secret: "{{ vault_wem_cookie_secret | default('CHANGE_ME') }}"
+
+# EDB 구독 토큰 (WEM Collector RPM 다운로드에 필요)
+edb_subscription_token: "{{ vault_edb_subscription_token | default('') }}"
+edb_repo: "gpsupp"
+
+# Prometheus / Loki는 사전에 별도 구성 필요
+# (WEM이 연결할 엔드포인트 지정)
+prometheus_url: "http://{{ hostvars[groups['standby_coordinator'][0]]['ansible_host'] }}:9090"
+loki_url: "http://{{ hostvars[groups['standby_coordinator'][0]]['ansible_host'] }}:3100"
+prometheus_remote_write_url: "{{ prometheus_url }}/api/v1/write"
+loki_push_url: "{{ loki_url }}/loki/api/v1/push"
 
 # ------------------------------------------
 # pgBouncer 설정 (Coordinator 노드)

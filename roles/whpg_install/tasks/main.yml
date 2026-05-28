@@ -1,38 +1,29 @@
 ---
 # ======================================================
 # Role: whpg_install
-# WarehousePG RPM 설치 (모든 클러스터 노드)
+# WarehousePG core RPM 설치 (모든 클러스터 노드)
+# - 로컬 RPM 디렉토리(local_rpm_dir) 우선 탐색
+# - 없으면 dnf fallback
 # ======================================================
 
-# ---------- 1. RPM 전송 및 설치 ----------
-- name: RPM 패키지를 모든 호스트에 복사
-  ansible.builtin.copy:
-    src: "{{ whpg_rpm_local_path }}"
-    dest: "/tmp/{{ whpg_rpm_name }}"
-    owner: root
-    group: root
-    mode: '0644'
-
-- name: WarehousePG RPM 설치
-  ansible.builtin.yum:
-    name: "/tmp/{{ whpg_rpm_name }}"
-    state: present
-    disable_gpg_check: true
-
-- name: 임시 RPM 파일 제거
-  ansible.builtin.file:
-    path: "/tmp/{{ whpg_rpm_name }}"
-    state: absent
+# ---------- 1. WHPG Core RPM 설치 ----------
+- name: "WHPG Core RPM 설치 ({{ whpg_rpm_name }})"
+  ansible.builtin.include_role:
+    name: rpm_install
+  vars:
+    rpm_pkg_name: "warehouse-pg-7"
+    rpm_pkg_pattern: "{{ whpg_rpm_name }}"
+    rpm_install_state: present
 
 # ---------- 2. 설치 디렉토리 소유권 변경 ----------
-- name: WHPG 설치 디렉토리 소유권 gpadmin으로 변경
+- name: WHPG 설치 디렉토리 탐색
   ansible.builtin.find:
     paths: /usr/local
     patterns: 'warehousepg*,greenplum*'
     file_type: directory
   register: installed_dirs
 
-- name: 소유권 변경 적용
+- name: 설치 디렉토리 소유권 gpadmin으로 변경
   ansible.builtin.file:
     path: "{{ item.path }}"
     owner: "{{ gpadmin_user }}"
@@ -41,14 +32,16 @@
   loop: "{{ installed_dirs.files }}"
 
 # ---------- 3. 데이터 디렉토리 생성 ----------
-- name: Coordinator 데이터 디렉토리 생성
+- name: Coordinator/Standby 데이터 디렉토리 생성
   ansible.builtin.file:
     path: "{{ coordinator_data_dir | dirname }}"
     state: directory
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0750'
-  when: inventory_hostname in groups['coordinator'] or inventory_hostname in groups['standby_coordinator']
+  when: >
+    inventory_hostname in groups['coordinator'] or
+    inventory_hostname in groups['standby_coordinator']
 
 - name: Segment Primary 데이터 디렉토리 생성
   ansible.builtin.file:
@@ -70,8 +63,8 @@
   loop: "{{ mirror_data_dirs }}"
   when: inventory_hostname in groups['segments']
 
-# ---------- 4. gpssh-exkeys 실행 (Coordinator에서) ----------
-- name: hostfile 생성 (gpssh-exkeys 용)
+# ---------- 4. hostfile 생성 및 gpssh-exkeys ----------
+- name: hostfile_all 생성 (gpssh-exkeys 용)
   ansible.builtin.template:
     src: hostfile_all.j2
     dest: "{{ gpadmin_home }}/hostfile_all"
@@ -91,7 +84,7 @@
   changed_when: true
 
 # ---------- 5. gpcheckperf (선택적 검증) ----------
-- name: 네트워크 성능 점검 (선택사항 - 시간 소요)
+- name: 네트워크 성능 점검 (선택사항)
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
