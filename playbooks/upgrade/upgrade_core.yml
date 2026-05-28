@@ -114,20 +114,20 @@
         disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
       when: _upgrade_rpm.files | length == 0
 
-    - name: 설치 디렉토리 소유권 재정비
-      ansible.builtin.find:
-        paths: /usr/local
-        patterns: 'warehousepg*,greenplum*'
-        file_type: directory
-      register: _new_dirs
-
-    - name: 소유권 gpadmin으로 변경
+    - name: 실제 설치 디렉토리 소유권 재정비
       ansible.builtin.file:
-        path: "{{ item.path }}"
+        path: "{{ whpg_real_install_dir }}"
         owner: "{{ gpadmin_user }}"
         group: "{{ gpadmin_group }}"
         recurse: true
-      loop: "{{ _new_dirs.files }}"
+
+    - name: /usr/local/greenplum-db symlink 재확인
+      ansible.builtin.file:
+        src: "{{ whpg_real_install_dir }}"
+        dest: "/usr/local/greenplum-db"
+        state: link
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
 
 # -------- Phase 4: 클러스터 재시작 및 검증 --------
 - name: "Core Upgrade - 클러스터 재시작 및 검증"

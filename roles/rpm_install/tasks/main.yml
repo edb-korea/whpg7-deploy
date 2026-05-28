@@ -1,65 +1,106 @@
 ---
 # ======================================================
 # Role: rpm_install
+# Ansible Controller Node의 /opt/whpg-rpms 에서 먼저 탐색
+# → 파일 있으면 대상 노드에 복사 후 yum localinstall
+# → 없으면 dnf install (fallback)
+#
 # 사용법:
-#   - name: pgaudit 설치
-#     include_role:
+#   - ansible.builtin.include_role:
 #       name: rpm_install
 #     vars:
 #       rpm_pkg_name: "edb-whpg7-pgaudit"
-#       rpm_pkg_pattern: "edb-whpg7-pgaudit*.rpm"   # 로컬 파일 glob (생략 시 pkg_name*.rpm)
-#
-# 동작:
-#   1. local_rpm_dir 에서 rpm_pkg_pattern glob 검색
-#   2. 파일이 있으면 → yum localinstall
-#   3. 파일이 없고 rpm_dnf_fallback=true → dnf install
-#   4. rpm_dnf_fallback=false → 에러
+#       rpm_pkg_pattern: "edb-whpg7-pgaudit*.rpm"  # 생략 시 pkg_name*.rpm
 # ======================================================
 
-- name: "{{ rpm_pkg_name }} - 로컬 RPM 디렉토리 탐색"
+# ---------- Step 1: Controller Node에서 로컬 RPM 탐색 ----------
+- name: "{{ rpm_pkg_name }} - Controller 로컬 RPM 탐색 ({{ local_rpm_dir }})"
   ansible.builtin.find:
     paths: "{{ local_rpm_dir }}"
     patterns: "{{ rpm_pkg_pattern | default(rpm_pkg_name + '*.rpm') }}"
     recurse: false
   register: _rpm_local_found
+  delegate_to: localhost
+  become: false
   ignore_errors: true
 
-- name: "{{ rpm_pkg_name }} - 로컬 RPM 설치 (파일 발견 시)"
+- name: "{{ rpm_pkg_name }} - 로컬 RPM 발견 여부 출력"
+  ansible.builtin.debug:
+    msg: >
+      [{{ rpm_pkg_name }}]
+      Controller 로컬 RPM:
+      {{ _rpm_local_found.files | map(attribute='path') | list
+         if _rpm_local_found.files | length > 0
+         else '없음 → dnf fallback' }}
+  run_once: false
+
+# ---------- Step 2: 로컬 RPM이 있으면 → 대상 노드에 복사 후 설치 ----------
+- name: "{{ rpm_pkg_name }} - 대상 노드 임시 디렉토리 생성"
+  ansible.builtin.file:
+    path: /tmp/whpg-rpms
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: _rpm_local_found.files | length > 0
+
+- name: "{{ rpm_pkg_name }} - Controller → 대상 노드로 RPM 복사"
+  ansible.builtin.copy:
+    src: "{{ _rpm_local_found.files | map(attribute='path') | sort | last }}"
+    dest: "/tmp/whpg-rpms/{{ _rpm_local_found.files | map(attribute='path') | sort | last | basename }}"
+    owner: root
+    group: root
+    mode: '0644'
+  when: _rpm_local_found.files | length > 0
+  register: _rpm_copy_result
+
+- name: "{{ rpm_pkg_name }} - 로컬 RPM으로 설치 (yum localinstall)"
   ansible.builtin.yum:
-    name: "{{ _rpm_local_found.files | map(attribute='path') | sort | last }}"
+    name: "/tmp/whpg-rpms/{{ _rpm_local_found.files | map(attribute='path') | sort | last | basename }}"
     state: "{{ rpm_install_state | default('present') }}"
-    disable_gpg_check: "{{ rpm_disable_gpg_check }}"
+    disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
   when: _rpm_local_found.files | length > 0
   register: _rpm_local_install
 
-- name: "{{ rpm_pkg_name }} - dnf fallback 설치 (로컬 파일 없을 때)"
+- name: "{{ rpm_pkg_name }} - 복사된 임시 RPM 파일 정리"
+  ansible.builtin.file:
+    path: "/tmp/whpg-rpms/{{ _rpm_local_found.files | map(attribute='path') | sort | last | basename }}"
+    state: absent
+  when:
+    - _rpm_local_found.files | length > 0
+    - _rpm_copy_result is defined
+
+# ---------- Step 3: 로컬 RPM 없으면 → dnf fallback ----------
+- name: "{{ rpm_pkg_name }} - dnf 설치 (fallback)"
   ansible.builtin.dnf:
     name: "{{ rpm_pkg_name }}"
     state: "{{ rpm_install_state | default('present') }}"
-    disable_gpg_check: "{{ rpm_disable_gpg_check }}"
+    disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
   when:
     - _rpm_local_found.files | length == 0
     - rpm_dnf_fallback | bool
   register: _rpm_dnf_install
 
+# ---------- Step 4: fallback도 불가 → 오류 ----------
 - name: "{{ rpm_pkg_name }} - 설치 불가 (로컬 없음 + fallback 비활성)"
   ansible.builtin.fail:
     msg: >
       패키지 '{{ rpm_pkg_name }}' 를 설치할 수 없습니다.
-      로컬 디렉토리 '{{ local_rpm_dir }}' 에 RPM 파일이 없고
+      Controller의 '{{ local_rpm_dir }}' 에 RPM 파일이 없고
       rpm_dnf_fallback=false 로 설정되어 있습니다.
+      RPM 파일을 {{ local_rpm_dir }} 에 배치하거나
+      rpm_dnf_fallback=true 로 설정하세요.
   when:
     - _rpm_local_found.files | length == 0
     - not (rpm_dnf_fallback | bool)
 
+# ---------- Step 5: 설치 결과 요약 ----------
 - name: "{{ rpm_pkg_name }} - 설치 결과 요약"
   ansible.builtin.debug:
     msg: >
-      [{{ rpm_pkg_name }}]
-      소스: {{ '로컬 RPM: ' + (_rpm_local_found.files | map(attribute='path') | sort | last | default('N/A'))
-               if _rpm_local_found.files | length > 0
-               else 'dnf (원격)' }}
-      상태: {{ 'changed' if (_rpm_local_install is defined and _rpm_local_install.changed)
-                         or (_rpm_dnf_install is defined and _rpm_dnf_install.changed)
-               else 'already installed' }}
+      ✓ [{{ rpm_pkg_name }}]
+      소스: {{ '로컬: ' + (_rpm_local_found.files | map(attribute='path') | sort | last | basename | default(''))
+               if _rpm_local_found.files | length > 0 else 'dnf (원격)' }}
+      변경: {{ _rpm_local_install.changed | default(false) or
+               _rpm_dnf_install.changed | default(false) }}
   when: not ansible_check_mode

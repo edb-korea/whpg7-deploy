@@ -15,21 +15,38 @@
     rpm_pkg_pattern: "{{ whpg_rpm_name }}"
     rpm_install_state: present
 
-# ---------- 2. 설치 디렉토리 소유권 변경 ----------
-- name: WHPG 설치 디렉토리 탐색
-  ansible.builtin.find:
-    paths: /usr/local
-    patterns: 'warehousepg*,greenplum*'
-    file_type: directory
-  register: installed_dirs
+# ---------- 2. 설치 경로 확인 및 symlink 생성 ----------
+# 실제 설치 경로: /usr/edb/whpg7
+# symlink:       /usr/local/greenplum-db → /usr/edb/whpg7
 
-- name: 설치 디렉토리 소유권 gpadmin으로 변경
+- name: 실제 설치 디렉토리 확인
+  ansible.builtin.stat:
+    path: "{{ whpg_real_install_dir }}"
+  register: _whpg_real_dir
+
+- name: 실제 설치 디렉토리가 없으면 경고
+  ansible.builtin.fail:
+    msg: >
+      WHPG 설치 디렉토리 {{ whpg_real_install_dir }} 가 존재하지 않습니다.
+      RPM 설치 결과를 확인하세요.
+  when: not _whpg_real_dir.stat.exists
+
+- name: /usr/local/greenplum-db symlink 생성 (없는 경우)
   ansible.builtin.file:
-    path: "{{ item.path }}"
+    src: "{{ whpg_real_install_dir }}"
+    dest: "/usr/local/greenplum-db"
+    state: link
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+  when: _whpg_real_dir.stat.exists
+
+- name: 실제 설치 디렉토리 소유권 gpadmin으로 변경
+  ansible.builtin.file:
+    path: "{{ whpg_real_install_dir }}"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     recurse: true
-  loop: "{{ installed_dirs.files }}"
+  when: _whpg_real_dir.stat.exists
 
 # ---------- 3. 데이터 디렉토리 생성 ----------
 - name: Coordinator/Standby 데이터 디렉토리 생성

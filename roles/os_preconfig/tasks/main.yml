@@ -96,87 +96,96 @@
     group: root
     mode: '0644'
 
-# ---------- 6. cgroup v2 설정 (RHEL 9 기본값 확인 및 유지) ----------
-# RHEL 9은 cgroup v2가 기본 → 별도 grub 수정 불필요
-# 혹시 v1로 설정된 경우(RHEL 8 업그레이드 환경 등) v2로 원복
+# ---------- 6. cgroup v2 설정 (모든 노드) ----------
+# 참고: https://github.com/unixfree/WarehousePG-Tip/blob/main/11.Resource%20Group%20v2.md
+# RHEL 9: cgroup v2 기본값이나 명시적으로 활성화 보장
+# RHEL 8: grub 파라미터로 cgroup v2 강제 활성화 필요
 
-- name: cgroup v1 강제 파라미터 제거 (혹시 남아있는 경우)
+- name: cgroup v2 현재 활성화 여부 확인
+  ansible.builtin.shell:
+    cmd: mount | grep cgroup2
+  register: _cgroup2_mount
+  changed_when: false
+  failed_when: false
+
+- name: cgroup v2 활성화 상태 출력
+  ansible.builtin.debug:
+    msg: "cgroup v2 상태: {{ 'active' if _cgroup2_mount.rc == 0 else 'inactive (grub 설정 필요)' }}"
+
+# RHEL 8 / cgroup v1 사용 중인 경우: grub 파라미터 추가 후 reboot 필요
+- name: grub에 cgroup v2 강제 활성화 파라미터 추가 (cgroup v2 미활성 시)
+  ansible.builtin.replace:
+    path: /etc/default/grub
+    regexp: '(GRUB_CMDLINE_LINUX=.*)"$'
+    replace: '\1 cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"'
+  when: _cgroup2_mount.rc != 0
+  notify: update_grub
+
+# cgroup v1 강제 파라미터가 남아 있으면 제거 (혹시 이전 설정)
+- name: cgroup v1 강제 파라미터 제거 (v2 활성 환경)
   ansible.builtin.replace:
     path: /etc/default/grub
     regexp: '\s*systemd\.unified_cgroup_hierarchy=0'
     replace: ''
-  notify: update_grub
+  when: _cgroup2_mount.rc == 0
 
-- name: cgroup v2 현재 마운트 상태 확인
-  ansible.builtin.command:
-    cmd: stat -f /sys/fs/cgroup
-  register: cgroup_stat
-  changed_when: false
-  failed_when: false
-
-- name: cgroup v2 활성화 여부 출력
-  ansible.builtin.debug:
-    msg: "cgroup v2 상태: {{ 'v2 (unified, OK)' if cgroup_stat.stdout is defined and 'cgroup2' in cgroup_stat.stdout else '확인 필요 - /sys/fs/cgroup 마운트 타입을 직접 확인하세요' }}"
-
-# WHPG gpdb cgroup 디렉토리 생성 (resource group-v2 용)
-# 경로: /sys/fs/cgroup/gpdb  (gpdb.service 아님)
-- name: gpdb cgroup v2 디렉토리 생성 스크립트 배포
+# ---------- 6-1. gpdb.service systemd 서비스 등록 (재부팅 후 cgroup 자동 구성) ----------
+# 문서 기준: /etc/systemd/system/gpdb.service 로 등록
+- name: gpdb.service systemd 서비스 파일 배포 (cgroup v2 자동 설정)
   ansible.builtin.copy:
-    dest: /usr/local/sbin/whpg-cgroup-setup.sh
-    owner: root
-    group: root
-    mode: '0755'
-    content: |
-      #!/bin/bash
-      # WarehousePG cgroup v2 초기화 스크립트
-      # 재부팅 시 systemd 서비스로 자동 실행
-      GPDB_CGROUP=/sys/fs/cgroup/gpdb
-
-      if [ ! -d "$GPDB_CGROUP" ]; then
-        mkdir -p "$GPDB_CGROUP"
-      fi
-
-      # 루트 cgroup에 필요 컨트롤러 활성화 (cpu, memory, io)
-      echo "+cpu +memory +io" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
-
-      # gpdb cgroup에 하위 컨트롤러 활성화
-      echo "+cpu +memory +io" > /sys/fs/cgroup/gpdb/cgroup.subtree_control 2>/dev/null || true
-
-      # gpadmin 사용자 소유권 부여
-      chown -R gpadmin:gpadmin "$GPDB_CGROUP" 2>/dev/null || true
-      echo "WarehousePG cgroup v2 setup complete: $GPDB_CGROUP"
-
-- name: whpg-cgroup systemd 서비스 등록 (부팅 시 cgroup 디렉토리 재생성)
-  ansible.builtin.copy:
-    dest: /etc/systemd/system/whpg-cgroup-setup.service
+    dest: /etc/systemd/system/gpdb.service
     owner: root
     group: root
     mode: '0644'
     content: |
       [Unit]
-      Description=WarehousePG cgroup v2 Setup
-      DefaultDependencies=no
-      After=systemd-tmpfiles-setup.service
-      Before=local-fs.target
+      Description=WarehousePG Cgroup v2 Configuration Service
+      After=local-fs.target systemd-tmpfiles-setup.service
 
       [Service]
+      # oneshot: cgroup 경로만 생성하고 종료 (WHPG 프로세스에 간섭 없음)
       Type=oneshot
-      ExecStart=/usr/local/sbin/whpg-cgroup-setup.sh
       RemainAfterExit=yes
+      Slice=-.slice
+      Delegate=yes
+
+      # cgroup2 파일시스템이 마운트된 경우에만 실행
+      ExecCondition=bash -c '[ xcgroup2fs = x$(stat -fc "%%T" /sys/fs/cgroup) ] || exit 1'
+
+      ExecStart=bash -ec '\
+        echo "+cpu +cpuset +io +memory" > /sys/fs/cgroup/cgroup.subtree_control; \
+        mkdir -p /sys/fs/cgroup/gpdb; \
+        chown -R gpadmin:gpadmin /sys/fs/cgroup/gpdb; \
+        echo "+cpu +cpuset +io +memory" > /sys/fs/cgroup/gpdb/cgroup.subtree_control; \
+        echo "WarehousePG cgroup v2 setup complete: /sys/fs/cgroup/gpdb"'
 
       [Install]
       WantedBy=multi-user.target
 
-- name: whpg-cgroup-setup 서비스 활성화
+- name: gpdb.service systemd 데몬 리로드 및 활성화
   ansible.builtin.systemd:
-    name: whpg-cgroup-setup
+    name: gpdb.service
     enabled: true
     daemon_reload: true
 
-- name: whpg-cgroup-setup 즉시 실행
-  ansible.builtin.command:
-    cmd: /usr/local/sbin/whpg-cgroup-setup.sh
-  changed_when: true
+- name: gpdb.service 즉시 실행 (현재 세션에 cgroup 적용)
+  ansible.builtin.systemd:
+    name: gpdb.service
+    state: started
+  register: _gpdb_service_start
+  failed_when: false  # cgroup2 미활성 환경에서는 ExecCondition 실패 허용
+
+- name: cgroup v2 gpdb 디렉토리 확인
+  ansible.builtin.stat:
+    path: /sys/fs/cgroup/gpdb
+  register: _gpdb_cgroup_dir
+
+- name: cgroup v2 gpdb 설정 결과 출력
+  ansible.builtin.debug:
+    msg: >
+      /sys/fs/cgroup/gpdb:
+      {{ '생성됨 ✓' if _gpdb_cgroup_dir.stat.exists else
+         '미생성 - cgroup v2가 활성화되지 않았습니다. reboot 후 재시도하세요.' }}
 
 # ---------- 7. gpadmin 사용자 / 그룹 생성 ----------
 - name: gpadmin 그룹 생성

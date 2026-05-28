@@ -1,8 +1,8 @@
 ---
 whpg_version: "7.4.0"
 whpg_rpm_name: "warehouse-pg-7-{{ whpg_version }}-rhel9-x86_64.rpm"
-whpg_install_dir: "/usr/local/warehousepg-db"
-whpg_rpm_local_path: "/tmp/{{ whpg_rpm_name }}"
+whpg_real_install_dir: "/usr/edb/whpg7"         # 실제 RPM 설치 경로
+whpg_install_dir: "/usr/local/greenplum-db"      # symlink 경로 (greenplum_path.sh 기준)
 whpg_run_checkperf: false
 
 # RPM 설치 설정 (rpm_install role과 공유)

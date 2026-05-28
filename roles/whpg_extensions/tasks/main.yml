@@ -10,7 +10,7 @@
 # ----------------------------------------
 - name: shared_preload_libraries 목록 초기화
   ansible.builtin.set_fact:
-    whpg_preload_libs: []
+    whpg_preload_libs: ['pg_stat_statements']   # 항상 포함
   when: inventory_hostname == coordinator_host
 
 - name: pgaudit → preload 목록 추가

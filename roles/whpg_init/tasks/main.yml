@@ -102,15 +102,25 @@
   environment:
     COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
   loop:
-    - { param: "max_connections",    value: "{{ whpg_max_connections }}" }
-    - { param: "shared_buffers",     value: "{{ whpg_shared_buffers }}" }
-    - { param: "effective_cache_size", value: "{{ whpg_effective_cache_size }}" }
-    - { param: "gp_resource_manager",  value: "group" }
-    - { param: "statement_mem",        value: "256MB" }
-    - { param: "max_statement_mem",    value: "2GB" }
-    - { param: "wal_level",            value: "replica" }
-    - { param: "logging_collector",    value: "on" }
+    - { param: "max_connections",           value: "{{ whpg_max_connections }}" }
+    - { param: "shared_buffers",            value: "{{ whpg_shared_buffers }}" }
+    - { param: "effective_cache_size",      value: "{{ whpg_effective_cache_size }}" }
+    - { param: "statement_mem",             value: "256MB" }
+    - { param: "max_statement_mem",         value: "2GB" }
+    - { param: "wal_level",                 value: "replica" }
+    - { param: "logging_collector",         value: "on" }
     - { param: "log_min_duration_statement", value: "1000" }
+    - { param: "shared_preload_libraries",  value: "pg_stat_statements" }
+  when: inventory_hostname == coordinator_host
+  changed_when: true
+
+- name: pg_stat_statements CREATE EXTENSION
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
   when: inventory_hostname == coordinator_host
   changed_when: true
 
@@ -169,6 +179,5 @@
   become_user: "{{ gpadmin_user }}"
   environment:
     COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
-  when:
-    - inventory_hostname == coordinator_host
+  when: inventory_hostname == coordinator_host
   changed_when: true

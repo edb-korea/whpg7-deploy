@@ -10,3 +10,7 @@ whpg_mirror_segments_per_host: 2
 coordinator_host: cdw
 standby_coordinator_host: scdw
 segment_hosts: []
+
+# 설치 경로
+whpg_real_install_dir: "/usr/edb/whpg7"
+whpg_install_dir: "/usr/local/greenplum-db"  # symlink 경로
