@@ -1,0 +1,88 @@
+---
+# ======================================================
+# 증설 계획 (coordinator 에서 실행)
+#   - gp_segment_configuration 과 inventory [segments] 를 비교해 새 호스트를 찾는다
+#   - 새 호스트는 [segments] 끝에 whpg_mirror_group_size(4)대 단위로 추가되어 있어야 한다
+#   - 새 호스트를 expand_new_hosts 그룹에 등록 (이후 play 에서 사용)
+# ======================================================
+
+- name: 현재 segment 구성 조회
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -F '|' -c
+      "SELECT role, content, dbid, address, port, datadir FROM gp_segment_configuration ORDER BY content, role"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _segcfg
+  changed_when: false
+
+- name: gpexpand 진행 상태 조회 (postgres DB 의 gpexpand.status)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -c
+      "SELECT CASE WHEN to_regclass('gpexpand.status') IS NULL THEN 'NONE'
+              ELSE coalesce((SELECT status FROM gpexpand.status ORDER BY updated DESC LIMIT 1), 'NONE') END"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _expand_status_q
+  changed_when: false
+
+- name: 증설 계획 계산
+  ansible.builtin.set_fact:
+    _segs: "{{ _seg_rows }}"
+    _expand_status: "{{ _expand_status_q.stdout | trim }}"
+    _existing_hosts: "{{ _seg_rows | selectattr('content', 'ge', 0) | map(attribute='address') | unique | list }}"
+    _expand_max_content: "{{ _seg_rows | map(attribute='content') | max }}"
+    _expand_max_dbid: "{{ _seg_rows | map(attribute='dbid') | max }}"
+    _expand_has_mirrors: "{{ _seg_rows | selectattr('content', 'ge', 0) | selectattr('role', 'equalto', 'm') | list | length > 0 }}"
+  vars:
+    _seg_rows: >-
+      {%- set out = [] -%}
+      {%- for l in _segcfg.stdout_lines -%}
+      {%-   set f = l.split('|') -%}
+      {%-   set _ = out.append({'role': f[0], 'content': f[1] | int, 'dbid': f[2] | int,
+                               'address': f[3], 'port': f[4] | int, 'datadir': f[5]}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: 새 호스트 결정
+  ansible.builtin.set_fact:
+    _expand_new_hosts: "{{ segment_hosts | reject('in', _existing_hosts) | list }}"
+
+- name: 증설 조건 확인
+  ansible.builtin.assert:
+    that:
+      # 기존 호스트는 [segments] 앞부분에 그대로 있어야 한다 (순서 = mirror 그룹)
+      - _existing_hosts | reject('in', segment_hosts) | list | length == 0
+      - segment_hosts[:_existing_hosts | length] | sort == _existing_hosts | sort
+      - _expand_new_hosts | length % (whpg_mirror_group_size | int) == 0
+      # 포트 규칙이 기존 클러스터와 같아야 한다 (primary: port_base + k, mirror: mirror_port_base + k)
+      - _segs | selectattr('content', 'ge', 0) | selectattr('role', 'equalto', 'p') | map(attribute='port') | unique | sort
+        == range(whpg_port_base | int, whpg_port_base | int + primary_data_dirs | length) | list
+      - (not _expand_has_mirrors | bool) or
+        (_segs | selectattr('content', 'ge', 0) | selectattr('role', 'equalto', 'm') | map(attribute='port') | unique | sort
+         == range(whpg_mirror_port_base | int, whpg_mirror_port_base | int + mirror_data_dirs | length) | list)
+    fail_msg: >-
+      증설 조건이 맞지 않습니다.
+      기존 segment 호스트 {{ _existing_hosts }} 는 inventory [segments] 앞부분에 그대로 있어야 하고,
+      새 호스트 {{ _expand_new_hosts }} 는 끝에 {{ whpg_mirror_group_size }}대 단위로 추가해야 합니다.
+      (또는 기존 segment 포트가 whpg_port_base / whpg_mirror_port_base 규칙과 다름)
+    quiet: true
+
+- name: 새 호스트를 expand_new_hosts 그룹에 등록
+  ansible.builtin.add_host:
+    name: "{{ item }}"
+    groups: expand_new_hosts
+  loop: "{{ _expand_new_hosts }}"
+
+- name: 증설 계획 출력
+  ansible.builtin.debug:
+    msg:
+      - "기존 segment 호스트 ({{ _existing_hosts | length }}): {{ _existing_hosts | join(', ') }}"
+      - "새 segment 호스트 ({{ _expand_new_hosts | length }}): {{ _expand_new_hosts | join(', ') or '없음' }}"
+      - "새 primary {{ (_expand_new_hosts | length) * (primary_data_dirs | length) }}개 (content {{ _expand_max_content | int + 1 }}~), mirror {{ 'O' if _expand_has_mirrors | bool else 'X' }}"
+      - "gpexpand 상태: {{ _expand_status }}"

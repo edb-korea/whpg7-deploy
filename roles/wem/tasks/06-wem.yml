@@ -1,0 +1,87 @@
+---
+# WEM 1.4 설치와 wem.conf (WEM host)
+# tag: wem
+- name: Install and configure WEM 1.4
+  when: inventory_hostname == wem_host
+  block:
+    # Controller 의 local_rpm_dir 우선 → dnf fallback. wem_version 과 일치하는 RPM 만 사용
+    - name: Install WEM 1.4 package
+      ansible.builtin.include_role:
+        name: rpm_install
+      vars:
+        rpm_pkg_name: "{{ wem_pkg_name }}"
+        rpm_pkg_version: "{{ wem_version }}"
+
+    - name: Remember whether the WEM package changed
+      ansible.builtin.set_fact:
+        _wem_pkg_changed: "{{ (_rpm_local_install.changed | default(false)) or (_rpm_dnf_install.changed | default(false)) }}"
+
+    # 다시 실행할 때는 기존 wem.conf 의 secret 을 그대로 쓴다.
+    # (새로 만들면 WEM 재시작 + 모든 Host Agent 의 join-token 교체가 필요해진다)
+    - name: Read existing wem.conf
+      ansible.builtin.slurp:
+        src: "{{ wem_config_file }}"
+      register: _wem_conf_old
+      failed_when: false
+      no_log: true
+
+    - name: Generate WEM_COOKIE_SECRET / WEM_AGENT_JOIN_SECRET (없을 때만)
+      ansible.builtin.command: openssl rand -hex 32
+      register: _new_secret
+      loop: [cookie, join]
+      changed_when: false
+      no_log: true
+
+    # Host Agent 자동 승인용 공유 비밀(join secret)은 07-host-agent 에서 join-token 으로 쓴다
+    - name: Keep secrets as facts
+      ansible.builtin.set_fact:
+        wem_cookie_secret_value: "{{ _old.WEM_COOKIE_SECRET | default(_new_secret.results[0].stdout | trim, true) }}"
+        wem_join_secret_value: "{{ _old.WEM_AGENT_JOIN_SECRET | default(_new_secret.results[1].stdout | trim, true) }}"
+      vars:
+        _old_text: "{{ (_wem_conf_old.content | b64decode) if _wem_conf_old.content is defined else '' }}"
+        _old:
+          WEM_COOKIE_SECRET: "{{ _old_text | regex_search(\"(?m)^WEM_COOKIE_SECRET='?([0-9a-f]+)'?$\", '\\1') | default([''], true) | first }}"
+          WEM_AGENT_JOIN_SECRET: "{{ _old_text | regex_search(\"(?m)^WEM_AGENT_JOIN_SECRET='?([0-9a-f]+)'?$\", '\\1') | default([''], true) | first }}"
+      no_log: true
+
+    - name: Write /etc/wem/wem.conf
+      ansible.builtin.template:
+        src: wem.conf.j2
+        dest: "{{ wem_config_file }}"
+        owner: root
+        group: "{{ wem_unix_group }}"
+        mode: "0640"
+      register: _wem_conf
+      no_log: true
+
+    - name: Open WEM / ClickHouse ports in firewalld (실행 중인 경우만)
+      ansible.builtin.shell:
+        cmd: |
+          if systemctl is-active --quiet firewalld; then
+            for p in {{ wem_port }} {{ wem_agent_port }} {{ clickhouse_native_port }}; do
+              firewall-cmd --permanent --add-port=${p}/tcp
+            done
+            firewall-cmd --reload
+            echo opened
+          fi
+        executable: /bin/bash
+      register: _fw
+      changed_when: "'opened' in _fw.stdout"
+      when: wem_manage_firewall | bool
+
+    # 패키지나 wem.conf 가 바뀐 경우에만 재시작 (처음 시작 시 WEM 이 상태 DB 를 setup)
+    - name: Enable and start WEM
+      ansible.builtin.systemd:
+        name: wem
+        enabled: true
+        state: "{{ 'restarted' if (_wem_conf is changed or _wem_pkg_changed | bool) else 'started' }}"
+        daemon_reload: true
+
+    - name: Wait for WEM web / agent relay ports
+      ansible.builtin.wait_for:
+        host: "{{ wem_host_ip }}"
+        port: "{{ item }}"
+        timeout: 180
+      loop:
+        - "{{ wem_port }}"
+        - "{{ wem_agent_port }}"

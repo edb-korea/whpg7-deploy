@@ -11,8 +11,7 @@
           gpstop -af 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: gpstop_result
       changed_when: true
 

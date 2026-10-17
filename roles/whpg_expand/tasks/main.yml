@@ -1,0 +1,173 @@
+---
+# ======================================================
+# Role: whpg_expand (coordinator 에서 실행)
+#   tasks/plan.yml 로 계획을 세운 뒤 실행된다 (playbooks/ops/expand_segments.yml)
+#   1. hostfile 갱신 + gpssh-exkeys (새 호스트 포함)
+#   2. gpexpand -i  : 새 segment 추가 (phase 1)       ← 새 호스트가 있고 진행 중인 증설이 없을 때
+#   3. PXF 새 호스트 등록
+#   4. gpexpand     : 테이블 재분배 (phase 2)          ← expand_redistribute
+#   5. gpexpand -c  : gpexpand 스키마 정리             ← expand_cleanup, EXPANSION COMPLETE 일 때
+#   중간에 끊겨도 다시 실행하면 gpexpand.status 를 보고 이어서 진행한다
+# ======================================================
+
+# ---------- 1. hostfile / SSH 키 ----------
+- name: hostfile_all / seg_hosts 갱신 (새 호스트 포함)
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0644'
+  loop:
+    - { src: "{{ role_path }}/../whpg_install/templates/hostfile_all.j2", dest: "{{ whpg_hostfile_all }}" }
+    - { src: "{{ role_path }}/../whpg_init/templates/seg_hosts.j2", dest: "{{ whpg_hostfile_segments }}" }
+  loop_control:
+    label: "{{ item.dest }}"
+
+- name: gpssh-exkeys (새 호스트 포함)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpssh-exkeys -f {{ whpg_hostfile_all }}
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  when: _expand_new_hosts | length > 0
+  changed_when: true
+
+# ---------- 2. 새 segment 추가 (gpexpand phase 1) ----------
+- name: 새 segment 추가
+  when:
+    - _expand_new_hosts | length > 0
+    - _expand_status in ['NONE', 'EXPANSION COMPLETE']
+  block:
+    - name: 이전 증설의 gpexpand 스키마가 남아 있으면 중단
+      ansible.builtin.assert:
+        that: _expand_status == 'NONE'
+        fail_msg: >-
+          이전 증설의 gpexpand 스키마(EXPANSION COMPLETE)가 남아 있습니다.
+          expand_cleanup=true 로 다시 실행하거나 gpexpand -c 로 정리한 뒤 실행하세요.
+        quiet: true
+
+    - name: gpexpand 입력 파일 생성
+      ansible.builtin.template:
+        src: gpexpand_input.j2
+        dest: "{{ whpg_gpexpand_input }}"
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0644'
+
+    - name: gpexpand 입력 내용 (hostname|address|port|datadir|dbid|content|role)
+      ansible.builtin.debug:
+        msg: "{{ lookup('template', 'gpexpand_input.j2').splitlines() | reject('equalto', '') | list }}"
+
+    - name: gpexpand phase 1 (segment 추가)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpexpand -s -i {{ whpg_gpexpand_input }} 2>&1
+        chdir: "{{ gpadmin_home }}"
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      register: _expand_phase1
+
+    - name: gpexpand phase 1 결과
+      ansible.builtin.debug:
+        var: _expand_phase1.stdout_lines
+
+    - name: 진행 상태 갱신
+      ansible.builtin.set_fact:
+        _expand_status: "SETUP DONE"
+
+# ---------- 3. PXF 새 호스트 등록 ----------
+- name: PXF 새 호스트 등록 / 설정 동기화 / 시작
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      pxf cluster register && pxf cluster sync && pxf cluster start 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  when:
+    - _expand_new_hosts | length > 0
+    - whpg_extension_catalog | selectattr('name', 'equalto', 'pxf') | selectattr('enabled') | list | length > 0
+  changed_when: true
+
+# ---------- 4. 테이블 재분배 (gpexpand phase 2) ----------
+- name: 테이블 재분배 (gpexpand)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      gpexpand -s -n {{ expand_parallel }}
+      {{ '-d ' ~ expand_duration if expand_duration | length > 0 else '' }}
+      {{ '-a' if expand_analyze | bool else '' }} 2>&1
+    chdir: "{{ gpadmin_home }}"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  async: "{{ expand_async_timeout }}"
+  poll: 60
+  register: _expand_phase2
+  when:
+    - expand_redistribute | bool
+    - _expand_status in ['SETUP DONE', 'EXPANSION STARTED', 'EXPANSION STOPPED']
+
+- name: 재분배 결과
+  ansible.builtin.debug:
+    msg: "{{ _expand_phase2.stdout_lines | default([]) | select('search', 'EXPANSION|ERROR|WARN|stopped|completed', ignorecase=true) | list }}"
+  when: _expand_phase2 is not skipped
+
+- name: 재분배 후 상태 / 남은 테이블 조회
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -c
+      "SELECT CASE WHEN to_regclass('gpexpand.status') IS NULL THEN 'NONE'
+              ELSE (SELECT status FROM gpexpand.status ORDER BY updated DESC LIMIT 1)
+                   || ' (재분배 남은 테이블: '
+                   || (SELECT count(*) FROM gpexpand.status_detail WHERE status <> 'COMPLETED') || ')' END"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _expand_after
+  changed_when: false
+
+# ---------- 5. gpexpand 스키마 정리 ----------
+# gpexpand -c 는 "status_detail 을 파일로 덤프할지" 를 묻는다 → y (coordinator 데이터 디렉토리에 저장)
+- name: gpexpand 스키마 정리 (gpexpand -c)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      echo y | gpexpand -c 2>&1
+    chdir: "{{ gpadmin_home }}"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _expand_clean
+  when:
+    - expand_cleanup | bool
+    - _expand_after.stdout is match('EXPANSION COMPLETE')
+
+# ---------- 결과 ----------
+- name: 호스트 / 디스크별 primary · mirror 배치 조회
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -F '|' -c
+      "SELECT address, regexp_replace(datadir, '/[^/]+/[^/]+$', ''),
+              string_agg(CASE WHEN preferred_role = 'p' THEN 'P' ELSE 'M' END || content, ' ' ORDER BY preferred_role DESC, content)
+       FROM gp_segment_configuration WHERE content >= 0
+       GROUP BY 1, 2 ORDER BY 1, 2"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _layout
+  changed_when: false
+
+- name: 증설 결과
+  ansible.builtin.debug:
+    msg:
+      - "gpexpand 상태: {{ _expand_after.stdout | trim }}{{ ' → 정리 완료' if _expand_clean is not skipped else '' }}"
+      - "{{ '재분배가 남아 있으면 같은 playbook 을 다시 실행하면 이어서 진행합니다.' if 'COMPLETE' not in _expand_after.stdout and _expand_after.stdout != 'NONE' else '' }}"
+      - "호스트 / 디스크별 배치 (P=primary, M=mirror, 숫자=content):"
+      - "{{ _layout.stdout_lines }}"

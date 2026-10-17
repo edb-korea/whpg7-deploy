@@ -15,8 +15,7 @@
           gpstate -s 2>&1 | grep -i 'down\|not synchronized' || echo "모든 세그먼트 정상"
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: seg_status
       changed_when: false
 
@@ -31,8 +30,7 @@
           gprecoverseg -a 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: recover_result
       changed_when: true
       when: "'모든 세그먼트 정상' not in seg_status.stdout"
@@ -49,8 +47,7 @@
           gprecoverseg -ra 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: rebalance_result
       changed_when: true
       when:

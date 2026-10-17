@@ -1,0 +1,19 @@
+---
+# ======================================================
+# WEM 1.4 설치 (단독 실행)
+#   WEM / ClickHouse      : wem_node 그룹 (기본 standby)
+#   Host Agent / otelcol  : 모든 노드
+#   WEM 1.2(Prometheus / Loki / Alloy) 가 있으면 먼저 삭제
+#
+#   ansible-playbook playbooks/07_wem.yml
+#   ansible-playbook playbooks/07_wem.yml -e wem_use_vip=false  # VIP 대신 coordinator 실 IP 로 접속
+#
+#   coordinator_ha_enabled=true 면 VIP(coordinator_vip)로 접속하므로 06_coordinator_ha.yml 이후에 실행
+#   ansible-playbook playbooks/07_wem.yml -t tune,querylogs     # 일부 단계만 (README WEM 절의 tag 표)
+# ======================================================
+- name: WEM 1.4 설치
+  hosts: whpg_cluster
+  become: true
+  any_errors_fatal: true
+  roles:
+    - wem

@@ -1,0 +1,53 @@
+---
+# ======================================================
+# 새 segment 호스트 준비 (expand_new_hosts 그룹에서 실행)
+#   os_preconfig → (필요 시) 재부팅 → whpg_install → whpg_extensions(RPM)
+#   기존 클러스터와 같은 role / 변수를 쓰므로 같은 버전·설정으로 구성된다
+# ======================================================
+
+- name: OS 사전 구성 (os_preconfig)
+  ansible.builtin.include_role:
+    name: os_preconfig
+
+- name: os_preconfig handler 실행
+  ansible.builtin.meta: flush_handlers
+
+- name: SELinux / cgroup v2 상태 확인
+  ansible.builtin.shell:
+    cmd: "getenforce; stat -fc %T /sys/fs/cgroup"
+  register: _boot_state
+  changed_when: false
+
+# SELinux disabled, cgroup v2 는 재부팅해야 적용된다 (Phase 1 과 동일)
+- name: 새 호스트 재부팅 (SELinux 미비활성 또는 cgroup v2 비활성)
+  ansible.builtin.reboot:
+    reboot_timeout: 900
+  when:
+    - expand_reboot_if_needed | bool
+    - _boot_state.stdout_lines[0] != 'Disabled' or _boot_state.stdout_lines[1] != 'cgroup2fs'
+
+- name: 재부팅 없이 진행 시 경고
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: SELinux={{ _boot_state.stdout_lines[0] }}, cgroup={{ _boot_state.stdout_lines[1] }} → 재부팅이 필요하지만 expand_reboot_if_needed=false 라 건너뜀"
+  when:
+    - not (expand_reboot_if_needed | bool)
+    - _boot_state.stdout_lines[0] != 'Disabled' or _boot_state.stdout_lines[1] != 'cgroup2fs'
+
+- name: WHPG Core 설치 / 데이터 디렉토리 (whpg_install)
+  ansible.builtin.include_role:
+    name: whpg_install
+
+# coordinator 전용 작업(CREATE EXTENSION, gpconfig, 재시작)은 role 안에서 건너뛰고 RPM 만 설치된다
+- name: Extension RPM 설치 (whpg_extensions)
+  ansible.builtin.include_role:
+    name: whpg_extensions
+
+# gpexpand 입력 파일의 hostname 열 (gp_segment_configuration.hostname 과 같은 실제 hostname)
+- name: 실제 hostname 조회
+  ansible.builtin.command: hostname
+  register: _hostname
+  changed_when: false
+
+- name: hostname 저장
+  ansible.builtin.set_fact:
+    _expand_hostname: "{{ _hostname.stdout | trim }}"

@@ -2,7 +2,7 @@
 # ======================================================
 # Ansible Vault 민감 변수 파일
 # 실제 사용 시 반드시 vault로 암호화하세요:
-#   ansible-vault encrypt group_vars/vault.yml
+#   ansible-vault encrypt inventory/vault.yml
 #
 # site.yml 실행 시:
 #   ansible-playbook playbooks/site.yml --ask-vault-pass
@@ -17,14 +17,11 @@ vault_keepalived_auth_pass: "changeme_ha_pass"
 # pgBouncer auth (선택)
 vault_pgbouncer_auth_password: "changeme_bouncer"
 
-# Grafana admin 비밀번호
-vault_grafana_admin_password: "changeme_grafana"
-
-# EDB 구독 토큰 (EDB 계정 → Downloads 페이지에서 확인)
-vault_edb_subscription_token: ""
-
-# WEM admin 비밀번호
+# WEM admin 비밀번호 (최초 설치 시에만 적용)
 vault_wem_admin_password: "changeme_wem"
 
-# WEM Cookie Secret (openssl rand -base64 32 로 생성)
-vault_wem_cookie_secret: "CHANGE_ME_run_openssl_rand_base64_32"
+# WEM 이 WHPG 에 접속하는 계정(wemon) 비밀번호 (상태 DB 계정도 같은 값)
+vault_wem_whpg_password: "changeme_wemon"
+
+# ClickHouse default 사용자 비밀번호
+vault_clickhouse_password: "changeme_clickhouse"

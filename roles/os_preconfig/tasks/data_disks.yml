@@ -1,0 +1,154 @@
+---
+# ======================================================
+# 데이터 디스크 구성 (whpg_data_mounts)
+#  - device 지정 : 빈 디스크면 mkfs.xfs → UUID 로 /etc/fstab 등록 및 마운트
+#                  이미 xfs 면 포맷 없이 마운트, xfs 외 데이터가 있으면 중단
+#  - device 비움 : 기존 파일시스템(/ 아래 디렉토리, 또는 이미 마운트된 /data1 등)을 그대로 사용
+#  - 공통        : 대상 서버에서 각 path 가 실제로 올라가 있는 물리 디스크를 조회
+#                  (파티션/LVM/MD 역추적) → whpg_data_disks 로 I/O 튜닝 대상에 사용
+# ======================================================
+
+- name: 데이터 경로 분류 (별도 디바이스 / 기존 파일시스템)
+  ansible.builtin.set_fact:
+    _data_mounts_dev: "{{ whpg_data_mounts | selectattr('device', 'defined') | selectattr('device') | list }}"
+
+# ---------- 1. 별도 디바이스: 검증 → (빈 디스크면) 포맷 → 마운트 ----------
+- name: 지정된 데이터 디바이스 존재 확인
+  ansible.builtin.stat:
+    path: "{{ item.device }}"
+    follow: true          # /dev/disk/by-id/... 심볼릭 링크 허용
+  loop: "{{ _data_mounts_dev }}"
+  loop_control:
+    label: "{{ item.path }} ← {{ item.device }}"
+  register: _data_dev_stat
+
+- name: 지정된 데이터 디바이스가 블럭 디바이스인지 검증
+  ansible.builtin.assert:
+    that: item.stat.exists and item.stat.isblk
+    fail_msg: "{{ item.item.path }}: {{ item.item.device }} 블럭 디바이스가 없습니다."
+    quiet: true
+  loop: "{{ _data_dev_stat.results }}"
+  loop_control:
+    label: "{{ item.item.device }}"
+
+# -p(low-level probe): 파일시스템(TYPE) 뿐 아니라 파티션 테이블(PTTYPE), LVM PV 등도 감지
+- name: 지정된 데이터 디바이스 기존 서명 확인
+  ansible.builtin.command:
+    cmd: "blkid -p -o export {{ item.device }}"
+  loop: "{{ _data_mounts_dev }}"
+  loop_control:
+    label: "{{ item.device }}"
+  register: _data_dev_probe
+  changed_when: false
+  check_mode: false
+  failed_when: _data_dev_probe.rc not in [0, 2]   # 2: 아무 서명 없음 (빈 디스크)
+
+- name: 지정된 데이터 디바이스 검증 (빈 디스크 또는 xfs 만 허용)
+  ansible.builtin.assert:
+    that: item.stdout | length == 0 or item.stdout is search('(?m)^TYPE=xfs$')
+    fail_msg: >-
+      {{ item.item.path }}: {{ item.item.device }} 에 xfs 가 아닌 데이터가 있습니다
+      ({{ item.stdout_lines | select('match', '^(TYPE|PTTYPE)=') | join(', ') }}).
+      데이터 보호를 위해 중단합니다. 디스크를 직접 확인/정리한 뒤 다시 실행하세요.
+    quiet: true
+  loop: "{{ _data_dev_probe.results }}"
+  loop_control:
+    label: "{{ item.item.device }}"
+
+- name: 빈 데이터 디바이스 XFS 포맷
+  ansible.builtin.command:
+    cmd: "mkfs.xfs {{ item.item.device }}"
+  loop: "{{ _data_dev_probe.results }}"
+  loop_control:
+    label: "{{ item.item.device }}"
+  when: item.stdout | length == 0
+
+- name: 데이터 디바이스 UUID 조회
+  ansible.builtin.command:
+    cmd: "blkid -o value -s UUID {{ item.device }}"
+  loop: "{{ _data_mounts_dev }}"
+  loop_control:
+    label: "{{ item.device }}"
+  register: _data_dev_uuid
+  changed_when: false
+  check_mode: false
+
+# /dev/sdX 이름은 재부팅 시 바뀔 수 있으므로 fstab 에는 UUID 로 등록
+- name: 데이터 디바이스 마운트 (/etc/fstab 등록)
+  ansible.posix.mount:
+    path: "{{ item.item.path }}"
+    src: "UUID={{ item.stdout }}"
+    fstype: xfs
+    opts: "{{ xfs_mount_options }}"
+    state: mounted
+  loop: "{{ _data_dev_uuid.results }}"
+  loop_control:
+    label: "{{ item.item.path }} ← UUID={{ item.stdout }}"
+
+# ---------- 2. 데이터 루트 디렉토리 (기존 파일시스템 경로 포함) ----------
+- name: 데이터 루트 디렉토리 생성 및 소유자 설정
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0755'
+  loop: "{{ whpg_data_mounts }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# ---------- 3. 각 경로의 실제 블럭 디바이스 조회 ----------
+# -v(--nofsroot): btrfs subvolume 등의 [/sub] 접미어 제거
+- name: 데이터 경로의 마운트 정보 조회 (findmnt)
+  ansible.builtin.command:
+    cmd: "findmnt -n -r -v -o SOURCE,TARGET,FSTYPE --target {{ item.path }}"
+  loop: "{{ whpg_data_mounts }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: _data_findmnt
+  changed_when: false
+  check_mode: false
+
+# lsblk -s: 디바이스에서 상위로 역추적 (LV → 파티션 → 디스크, md → 멤버 디스크)
+- name: 데이터 경로의 물리 디스크 조회 (lsblk)
+  ansible.builtin.shell:
+    cmd: "lsblk -n -r -s -p -o NAME,TYPE {{ item.stdout.split()[0] }} | awk '$2 == \"disk\" { print $1 }' | sort -u"
+  loop: "{{ _data_findmnt.results }}"
+  loop_control:
+    label: "{{ item.item.path }} → {{ item.stdout.split()[0] }}"
+  register: _data_lsblk
+  changed_when: false
+  check_mode: false
+
+- name: 데이터 디스크 정보 초기화
+  ansible.builtin.set_fact:
+    whpg_data_disk_info: []
+
+- name: 데이터 디스크 정보 수집
+  ansible.builtin.set_fact:
+    whpg_data_disk_info: >-
+      {{ whpg_data_disk_info + [{
+           'path':       item.item.item.path,
+           'source':     item.item.stdout.split()[0],
+           'mountpoint': item.item.stdout.split()[1],
+           'fstype':     item.item.stdout.split()[2],
+           'disks':      item.stdout_lines
+         }] }}
+  loop: "{{ _data_lsblk.results }}"
+  loop_control:
+    label: "{{ item.item.item.path }}"
+
+# I/O 스케쥴러/read-ahead udev 규칙 대상 (커널 디바이스명: sda, nvme0n1 ...)
+- name: 데이터 디스크 목록 확정
+  ansible.builtin.set_fact:
+    whpg_data_disks: "{{ whpg_data_disk_info | map(attribute='disks') | flatten | map('basename') | unique | list }}"
+
+- name: 데이터 디스크 조회 결과
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.path }}: {{ item.source }} (mount {{ item.mountpoint }}, {{ item.fstype }})
+      → disk {{ item.disks | join(', ') }}
+      {{ '' if item.fstype == 'xfs' else '※ WARNING: xfs 가 아닙니다. WarehousePG 데이터는 xfs 권장' }}
+  loop: "{{ whpg_data_disk_info }}"
+  loop_control:
+    label: "{{ item.path }}"

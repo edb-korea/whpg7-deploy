@@ -3,43 +3,39 @@
 # Role: whpg_extensions
 # 기본 + Optional Extension 설치
 # rpm_install role을 통해: 로컬 RPM 우선 → dnf fallback
+#
+# 설치 대상/패키지명/CREATE EXTENSION 이름/preload 여부는
+# inventory/whpg_cluster.yml 의 whpg_extension_catalog 에서 관리합니다.
 # ======================================================
 
-# ----------------------------------------
-# shared_preload_libraries 목록 동적 구성
-# ----------------------------------------
-- name: shared_preload_libraries 목록 초기화
+- name: 설치 대상 Extension 목록 구성
   ansible.builtin.set_fact:
-    whpg_preload_libs: ['pg_stat_statements']   # 항상 포함
+    _enabled_extensions: "{{ whpg_extension_catalog | selectattr('enabled') | list }}"
+    _enabled_extension_names: "{{ whpg_extension_catalog | selectattr('enabled') | map(attribute='name') | list }}"
+
+- name: shared_preload_libraries 목록 구성
+  ansible.builtin.set_fact:
+    whpg_preload_libs: >-
+      {{ whpg_base_preload_libs
+         + (_enabled_extensions | selectattr('preload', 'defined') | map(attribute='preload') | list) }}
   when: inventory_hostname == coordinator_host
 
-- name: pgaudit → preload 목록 추가
-  ansible.builtin.set_fact:
-    whpg_preload_libs: "{{ whpg_preload_libs + ['pgaudit'] }}"
-  when: install_pgaudit and inventory_hostname == coordinator_host
-
-- name: diskquota → preload 목록 추가
-  ansible.builtin.set_fact:
-    whpg_preload_libs: "{{ whpg_preload_libs + ['diskquota'] }}"
-  when: install_diskquota and inventory_hostname == coordinator_host
-
-- name: user_profile → preload 목록 추가
-  ansible.builtin.set_fact:
-    whpg_preload_libs: "{{ whpg_preload_libs + ['user_profile'] }}"
-  when: install_user_profile and inventory_hostname == coordinator_host
-
 # ==========================================
-# 기본 Extension (항상 설치)
+# RPM 설치 (모든 노드)
 # ==========================================
-
-# --- PXF ---
-- name: PXF 설치 (edb-whpg7-pxf)
+- name: Extension RPM 설치
   ansible.builtin.include_role:
     name: rpm_install
   vars:
-    rpm_pkg_name: "edb-whpg7-pxf"
-  when: install_pxf
+    rpm_pkg_name: "{{ _ext.pkg }}"
+  loop: "{{ _enabled_extensions }}"
+  loop_control:
+    loop_var: _ext
+    label: "{{ _ext.name }} ({{ _ext.pkg }})"
 
+# ==========================================
+# PXF 초기화 / 설정 / 시작 (Coordinator)
+# ==========================================
 - name: PXF 클러스터 초기화
   ansible.builtin.shell:
     cmd: >
@@ -47,17 +43,18 @@
       pxf cluster init 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  when: install_pxf and inventory_hostname == coordinator_host
+  environment: "{{ whpg_env }}"
+  when: "'pxf' in _enabled_extension_names and inventory_hostname == coordinator_host"
   changed_when: true
 
 - name: PXF Hadoop core-site.xml 설정
   ansible.builtin.template:
     src: pxf-core-site.xml.j2
-    dest: "{{ gpadmin_home }}/pxf/conf/core-site.xml"
+    dest: "{{ pxf_base_dir }}/conf/core-site.xml"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0644'
-  when: install_pxf and pxf_hadoop_enabled and inventory_hostname == coordinator_host
+  when: "'pxf' in _enabled_extension_names and pxf_hadoop_enabled | bool and inventory_hostname == coordinator_host"
 
 - name: PXF 클러스터 시작
   ansible.builtin.shell:
@@ -66,150 +63,9 @@
       pxf cluster start 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  when: install_pxf and inventory_hostname == coordinator_host
+  environment: "{{ whpg_env }}"
+  when: "'pxf' in _enabled_extension_names and inventory_hostname == coordinator_host"
   changed_when: true
-
-# --- pgaudit ---
-- name: pgaudit 설치 (edb-whpg7-pgaudit)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-pgaudit"
-  when: install_pgaudit
-
-- name: pgaudit CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pgaudit;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_pgaudit and inventory_hostname == coordinator_host
-  changed_when: true
-
-# --- user_profile ---
-- name: user_profile 설치 (edb-whpg7-user_profile)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-user_profile"
-  when: install_user_profile
-
-# --- anonymizer ---
-- name: anonymizer 설치 (edb-whpg7-anonymizer)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-anonymizer"
-  when: install_anonymizer
-
-- name: anonymizer CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS anon CASCADE;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_anonymizer and inventory_hostname == coordinator_host
-  changed_when: true
-
-# --- whpg_fdw ---
-- name: whpg_fdw 설치 (edb-whpg7-whpg_fdw)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-whpg_fdw"
-  when: install_whpg_fdw
-
-- name: whpg_fdw CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS whpg_fdw;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_whpg_fdw and inventory_hostname == coordinator_host
-  changed_when: true
-
-# --- diskquota ---
-- name: diskquota 설치 (edb-whpg7-diskquota)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-diskquota"
-  when: install_diskquota
-
-# --- Data Science Pack (Python) ---
-- name: Data Science Python 패키지 설치 (edb-whpg7-python3-ds-pkgs)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-python3-ds-pkgs"
-  when: install_datascience_python
-
-# --- MADlib ---
-- name: MADlib 설치 (edb-whpg7-madlib)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-madlib"
-  when: install_madlib
-
-- name: MADlib 설치 스크립트 실행
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      $GPHOME/madlib/bin/madpack -s madlib install
-      -p warehousepg -c gpadmin@localhost:5432/gpadmin 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_madlib and inventory_hostname == coordinator_host
-  changed_when: true
-  ignore_errors: true
-
-# --- PLR ---
-- name: PLR 설치 (edb-whpg7-plr)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-plr"
-  when: install_plr
-
-- name: PLR CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS plr;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_plr and inventory_hostname == coordinator_host
-  changed_when: true
-
-# --- PL/Java ---
-- name: PL/Java 설치 (edb-whpg7-pljava)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-pljava"
-  when: install_pljava
-
-- name: PL/Java CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pljava;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_pljava and inventory_hostname == coordinator_host
-  changed_when: true
-
-# --- whpg-backup ---
-- name: whpg-backup 설치
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "whpg-backup"
-  when: install_whpg_backup
 
 # ==========================================
 # shared_preload_libraries 한 번에 적용
@@ -222,135 +78,33 @@
       -v '{{ whpg_preload_libs | join(",") }}' 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   when:
     - inventory_hostname == coordinator_host
     - whpg_preload_libs | length > 0
   changed_when: true
 
 # ==========================================
-# Optional Extension
+# Extension 별 추가 GUC (카탈로그 gucs 항목, 예: pg_cron 의 cron.database_name)
+# 라이브러리가 아직 로드되지 않은 상태라 --skipvalidation 필요
 # ==========================================
-
-- name: PostGIS 설치 (edb-whpg7-postgis)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-postgis"
-  when: install_postgis
-
-- name: PostGIS CREATE EXTENSION
+- name: Extension 추가 GUC 설정
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1
+      gpconfig -c {{ item.name }} -v '{{ item.value }}' --skipvalidation 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  when: install_postgis and inventory_hostname == coordinator_host
+  environment: "{{ whpg_env }}"
+  loop: "{{ _enabled_extensions | selectattr('gucs', 'defined') | map(attribute='gucs') | flatten }}"
+  loop_control:
+    label: "{{ item.name }}={{ item.value }}"
+  when: inventory_hostname == coordinator_host
   changed_when: true
-
-- name: HLL 설치 (edb-whpg7-hll)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-hll"
-  when: install_hll
-
-- name: HLL CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS hll;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_hll and inventory_hostname == coordinator_host
-  changed_when: true
-
-- name: q3c 설치 (edb-whpg7-q3c)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-q3c"
-  when: install_q3c
-
-- name: q3c CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS q3c;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_q3c and inventory_hostname == coordinator_host
-  changed_when: true
-
-- name: pgSphere 설치 (edb-whpg7-pgsphere)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-pgsphere"
-  when: install_pgsphere
-
-- name: pgSphere CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pgsphere;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_pgsphere and inventory_hostname == coordinator_host
-  changed_when: true
-
-- name: pgvector 설치 (edb-whpg7-pgvector)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-pgvector"
-  when: install_pgvector
-
-- name: pgvector CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_pgvector and inventory_hostname == coordinator_host
-  changed_when: true
-
-- name: pgfs 설치 (edb-whpg7-pgfs)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-pgfs"
-  when: install_pgfs
-
-- name: pgaa 설치 (edb-whpg7-pgaa)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "edb-whpg7-pgaa"
-  when: install_pgaa
-
-- name: pgaa CREATE EXTENSION
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pgaa;" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: install_pgaa and inventory_hostname == coordinator_host
-  changed_when: true
-
-- name: flowserver 설치 (whpg7-flow-server)
-  ansible.builtin.include_role:
-    name: rpm_install
-  vars:
-    rpm_pkg_name: "whpg7-flow-server"
-  when: install_flowserver
 
 # ==========================================
 # WHPG 재시작 (shared_preload_libraries 적용)
+# CREATE EXTENSION 보다 먼저 수행 (pg_cron, diskquota 등은 preload 된 상태에서만 생성 가능)
 # ==========================================
 - name: WHPG 재시작 (extension preload 적용)
   ansible.builtin.shell:
@@ -359,7 +113,41 @@
       gpstop -ra -a 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   when: inventory_hostname == coordinator_host
   changed_when: true
+
+# ==========================================
+# CREATE EXTENSION (Coordinator)
+# ==========================================
+- name: CREATE EXTENSION
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d {{ whpg_database }} -c
+      "CREATE EXTENSION IF NOT EXISTS {{ item.sql_ext }}{{ ' CASCADE' if item.cascade | default(false) else '' }};" 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  loop: "{{ _enabled_extensions | selectattr('sql_ext', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.sql_ext }}"
+  when: inventory_hostname == coordinator_host
+  changed_when: true
+
+# ==========================================
+# MADlib 설치 스크립트 (Coordinator)
+# ==========================================
+- name: MADlib 설치 스크립트 실행
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      $GPHOME/madlib/bin/madpack -s {{ madlib_schema }} install
+      -p {{ madlib_platform }}
+      -c {{ gpadmin_user }}@localhost:{{ whpg_coordinator_port }}/{{ whpg_database }} 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  when: "'madlib' in _enabled_extension_names and inventory_hostname == coordinator_host"
+  changed_when: true
+  ignore_errors: true

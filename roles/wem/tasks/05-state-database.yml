@@ -1,0 +1,251 @@
+---
+# WEM 상태용 PostgreSQL 설치 (WEM host)
+# tag: statedb
+- name: Install WEM state PostgreSQL
+  when:
+    - inventory_hostname == wem_host
+    - wem_state_install | bool
+  block:
+    - name: Install PostgreSQL server packages
+      ansible.builtin.dnf:
+        name:
+          - postgresql-server
+          - postgresql-contrib
+        state: present
+
+    - name: Create PostgreSQL data directory
+      ansible.builtin.file:
+        path: "{{ wem_state_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
+
+    - name: Initialize PostgreSQL (빈 디렉터리에서 한 번만)
+      ansible.builtin.command:
+        cmd: >-
+          runuser -u postgres -- /usr/bin/initdb -D {{ wem_state_data_dir }}
+          --auth-local=peer --auth-host=scram-sha-256
+        creates: "{{ wem_state_data_dir }}/PG_VERSION"
+
+    - name: Configure PostgreSQL listen address / port
+      ansible.builtin.blockinfile:
+        path: "{{ wem_state_data_dir }}/postgresql.conf"
+        marker: "# {mark} ANSIBLE MANAGED: WEM state DB"
+        block: |
+          listen_addresses = '127.0.0.1'
+          port = {{ wem_state_port }}
+          password_encryption = 'scram-sha-256'
+
+    - name: Register dedicated PostgreSQL service
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ wem_state_service }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=PostgreSQL for WEM state
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=postgres
+          Group=postgres
+          ExecStart=/usr/bin/postgres -D {{ wem_state_data_dir }}
+          KillSignal=SIGINT
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+
+    # SELinux 가 enforcing 이면 postgresql_port_t(기본 5432, 9898) 밖의 포트는 bind 가 거부된다
+    - name: Install SELinux policy tools
+      ansible.builtin.dnf:
+        name: policycoreutils-python-utils
+        state: present
+
+    - name: Allow WEM state PostgreSQL port in SELinux
+      ansible.builtin.shell:
+        cmd: |
+          if [ "$(getenforce)" != "Disabled" ]; then
+            if ! semanage port -l | grep -E '^postgresql_port_t' | grep -qw '{{ wem_state_port }}'; then
+              semanage port -a -t postgresql_port_t -p tcp {{ wem_state_port }} && echo changed
+            fi
+          fi
+        executable: /bin/bash
+      register: _state_selinux_port
+      changed_when: "'changed' in _state_selinux_port.stdout"
+
+    - name: Reset failed state of WEM state PostgreSQL unit (이전 실패 이력 정리)
+      ansible.builtin.command: "systemctl reset-failed {{ wem_state_service }}.service"
+      changed_when: false
+      failed_when: false
+
+    - name: Enable and start WEM state PostgreSQL
+      ansible.builtin.systemd:
+        name: "{{ wem_state_service }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait for WEM state PostgreSQL
+      ansible.builtin.wait_for:
+        host: "{{ wem_state_host }}"
+        port: "{{ wem_state_port }}"
+        timeout: 60
+
+    - name: Check whether WEM state role exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - /usr/bin/psql
+          - -p
+          - "{{ wem_state_port }}"
+          - -d
+          - postgres
+          - -tAc
+          - "SELECT 1 FROM pg_roles WHERE rolname = '{{ wem_state_user }}'"
+      register: _state_role
+      changed_when: false
+
+    - name: Create WEM state role
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - /usr/bin/psql
+          - -p
+          - "{{ wem_state_port }}"
+          - -d
+          - postgres
+          - -c
+          - "CREATE ROLE {{ wem_state_user }} LOGIN CREATEDB"
+      when: _state_role.stdout | trim != '1'
+      changed_when: true
+
+    - name: Set WEM state role password
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - /usr/bin/psql
+          - -p
+          - "{{ wem_state_port }}"
+          - -d
+          - postgres
+          - -c
+          - "ALTER ROLE {{ wem_state_user }} PASSWORD '{{ wem_state_password }}'"
+      changed_when: true
+      no_log: true
+
+# wem_state_install=false 일 때 기존 WHPG(coordinator)에 WEM 접속용 DB / 계정 생성
+#   wem_whpg_user (비밀번호 wem_whpg_password) 와 그 계정 소유의 wem_whpg_database 를 만든다.
+#   이미 있으면 비밀번호만 다시 설정한다.
+- name: Create WEM database / role in WHPG
+  ansible.builtin.shell:
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export PGPORT={{ whpg_coordinator_port }}
+      psql -d postgres -v ON_ERROR_STOP=1 -v u="$WEM_WHPG_USER" -v pw="$WEM_WHPG_PASSWORD" -v db="$WEM_WHPG_DATABASE" <<'SQL'
+      SELECT format('CREATE ROLE %I LOGIN', :'u')
+       WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'u') \gexec
+      -- pg_hba 가 scram-sha-256 이므로 서버 기본값(md5)과 상관없이 SCRAM 으로 저장
+      SET password_encryption = 'scram-sha-256';
+      -- 비밀번호가 서버 로그(log_statement)에 남지 않게 이 세션에서만 SQL 기록을 끈다
+      SET log_statement = 'none';
+      SET log_min_duration_statement = -1;
+      SELECT format('ALTER ROLE %I {{ "SUPERUSER" if wem_whpg_user_superuser | bool else "NOSUPERUSER" }} PASSWORD %L', :'u', :'pw') \gexec
+      SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'u')
+       WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'db') \gexec
+      SQL
+    executable: /bin/bash
+  environment:
+    WEM_WHPG_USER: "{{ wem_whpg_user }}"
+    WEM_WHPG_PASSWORD: "{{ wem_whpg_password }}"
+    WEM_WHPG_DATABASE: "{{ wem_whpg_database }}"
+  become_user: "{{ gpadmin_user }}"
+  register: _whpg_wem_db
+  changed_when: "'CREATE' in _whpg_wem_db.stdout"
+  no_log: true
+  when:
+    - inventory_hostname == coordinator_host
+    - wem_whpg_create | bool
+
+# wem_whpg_user 의 resource group (wem_whpg_resource_group). 없으면 만들고, 값이 다른 설정만 ALTER 한 뒤 계정에 지정한다
+- name: Check gp_resource_manager for WEM resource group
+  ansible.builtin.shell:
+    cmd: |
+      cd /tmp
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export PGPORT={{ whpg_coordinator_port }}
+      psql -d postgres -Atc 'SHOW gp_resource_manager'
+    executable: /bin/bash
+  become_user: "{{ gpadmin_user }}"
+  register: _whpg_resmgr
+  changed_when: false
+  when:
+    - inventory_hostname == coordinator_host
+    - wem_whpg_create | bool
+    - wem_whpg_resource_group | length > 0
+
+- name: Warn when resource groups are not enabled
+  ansible.builtin.debug:
+    msg: "gp_resource_manager 가 '{{ _whpg_resmgr.stdout | trim }}' 이라 resource group({{ wem_whpg_resource_group }}) 을 만들지 않았습니다 (group / group-v2 에서만 사용 가능)."
+  when:
+    - _whpg_resmgr is not skipped
+    - not (_whpg_resmgr.stdout | trim) is match('^group')
+
+- name: Create WEM resource group and assign it to the WEM role
+  ansible.builtin.shell:
+    cmd: |
+      cd /tmp
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export PGPORT={{ whpg_coordinator_port }}
+      psql -d postgres -v ON_ERROR_STOP=1 -v rg="$WEM_RG" -v rgwith="$WEM_RG_WITH" -v u="$WEM_WHPG_USER" <<'SQL'
+      SELECT format('CREATE RESOURCE GROUP %I WITH (%s)', :'rg', :'rgwith')
+       WHERE NOT EXISTS (SELECT 1 FROM pg_resgroup WHERE rsgname = :'rg') \gexec
+      SELECT format('ALTER RESOURCE GROUP %I SET %s %s', :'rg', o.k, o.v)
+        FROM (VALUES {{ _rg_values }}) AS o(k, v, cur)
+        JOIN gp_toolkit.gp_resgroup_config c ON c.groupname = :'rg'
+       WHERE trim(both '''' from o.v) IS DISTINCT FROM
+             CASE o.cur {% for k in wem_whpg_resource_group_options %}WHEN '{{ k | lower }}' THEN c.{{ k | lower }}::text {% endfor %}END \gexec
+      SELECT format('ALTER ROLE %I RESOURCE GROUP %I', :'u', :'rg')
+       WHERE (SELECT rolresgroup FROM pg_roles WHERE rolname = :'u')
+             IS DISTINCT FROM (SELECT oid FROM pg_resgroup WHERE rsgname = :'rg') \gexec
+      SELECT 'RESGROUP ' || r.rolname || ' -> ' || g.rsgname
+        FROM pg_roles r JOIN pg_resgroup g ON g.oid = r.rolresgroup WHERE r.rolname = :'u';
+      SQL
+    executable: /bin/bash
+  environment:
+    WEM_RG: "{{ wem_whpg_resource_group }}"
+    WEM_RG_WITH: "{{ _rg_with }}"
+    WEM_WHPG_USER: "{{ wem_whpg_user }}"
+  vars:
+    # 숫자는 그대로, 그 외(IO_LIMIT 'max', CPUSET '0-1' 등)는 따옴표로 감싼다
+    _rg_with: >-
+      {%- for k, v in wem_whpg_resource_group_options.items() -%}
+      {{ k }}={{ v if (v | string) is match('^-?[0-9]+$') else "'" ~ v ~ "'" }}{{ ', ' if not loop.last }}
+      {%- endfor -%}
+    _rg_values: >-
+      {%- for k, v in wem_whpg_resource_group_options.items() -%}
+      ('{{ k }}', $${{ v if (v | string) is match('^-?[0-9]+$') else "'" ~ v ~ "'" }}$$, '{{ k | lower }}'){{ ', ' if not loop.last }}
+      {%- endfor -%}
+  become_user: "{{ gpadmin_user }}"
+  register: _whpg_rg
+  changed_when: "'CREATE RESOURCE GROUP' in _whpg_rg.stdout or 'ALTER' in _whpg_rg.stdout"
+  when:
+    - _whpg_resmgr is not skipped
+    - (_whpg_resmgr.stdout | trim) is match('^group')
+
+- name: Show WEM resource group assignment
+  ansible.builtin.debug:
+    msg: "{{ _whpg_rg.stdout_lines | select('match', '^(RESGROUP|CREATE|ALTER)') | list }}"
+  when: _whpg_rg is not skipped

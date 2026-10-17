@@ -1,0 +1,30 @@
+---
+# otelcol override 파일(config_local.yaml)과 edb-otelcol.conf 적용 (07-host-agent, 08-otelcol-tune 에서 호출)
+#   _otel_prestage=true : acp-host-agent 시작 전. WEM 의 config.yaml 이 아직 없으므로 validate 하지 않고,
+#                         sqlquery 추가(add)는 쿼리 파일이 없어 08 단계로 미룬다
+#   _otel_prestage=false: WEM 이 config.yaml 을 배포한 뒤. config.yaml 과 병합한 결과를 validate 한 뒤에만 파일을 바꾼다
+- name: Write otelcol override file (config_local.yaml)
+  ansible.builtin.template:
+    src: otelcol_config_local.yaml.j2
+    dest: "{{ otelcol_local_config }}"
+    owner: edb-otelcol
+    group: edb-otelcol
+    mode: "0600"
+    validate: "{{ omit if (_otel_prestage | bool) else (otelcol_bin ~ ' validate --config=file:' ~ otelcol_config ~ ' --config=file:%s') }}"
+  vars:
+    # standby 의 sqlquery 추가(add)는 쿼리 정의 파일(주의 2-1)이 복사된 뒤(08)에만 넣는다
+    _otel_sqlquery_effective: >-
+      {{ 'keep' if (_otel_sqlquery_mode == 'add' and ((_otel_prestage | bool) or (_otel_queries is not defined) or (_otel_queries is skipped)))
+         else _otel_sqlquery_mode }}
+  register: _otel_local
+  no_log: true
+
+- name: Load override file in edb-otelcol.conf
+  ansible.builtin.lineinfile:
+    path: "{{ otelcol_options_file }}"
+    regexp: "^OTELCOL_OPTIONS="
+    line: 'OTELCOL_OPTIONS="--config {{ otelcol_config }} --config {{ otelcol_local_config }}"'
+    owner: edb-otelcol
+    group: edb-otelcol
+    mode: "0640"
+  register: _otel_options

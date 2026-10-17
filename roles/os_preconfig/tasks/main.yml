@@ -24,17 +24,9 @@
     enabled: false
   ignore_errors: true
 
-# ---------- 3. /etc/hosts 구성 ----------
-- name: /etc/hosts 클러스터 호스트 항목 추가
-  ansible.builtin.blockinfile:
-    path: /etc/hosts
-    marker: "# {mark} WarehousePG Cluster Hosts"
-    block: |
-      {{ hostvars['cdw']['ansible_host'] }} cdw
-      {{ hostvars['scdw']['ansible_host'] }} scdw
-      {% for host in segment_hosts %}
-      {{ hostvars[host]['ansible_host'] }} {{ host }}
-      {% endfor %}
+# ---------- 3. /etc/hosts 구성 (증설 시 기존 노드에도 이 파일만 실행) ----------
+- name: /etc/hosts 구성
+  ansible.builtin.import_tasks: hosts.yml
 
 # ---------- 4. sysctl OS 파라미터 ----------
 - name: sysctl 파라미터 설정 (kernel/vm/net)
@@ -42,56 +34,19 @@
     name: "{{ item.key }}"
     value: "{{ item.value }}"
     state: present
-    sysctl_file: /etc/sysctl.d/95-whpg.conf
+    sysctl_file: "{{ whpg_sysctl_file }}"
     reload: true
-  loop:
-    # Shared Memory
-    - { key: "kernel.shmmax",        value: "500000000" }
-    - { key: "kernel.shmmni",        value: "4096" }
-    - { key: "kernel.shmall",        value: "4000000000" }
-    - { key: "kernel.sem",           value: "500 2048000 200 4096" }
-    - { key: "kernel.sysrq",         value: "1" }
-    - { key: "kernel.core_uses_pid", value: "1" }
-    - { key: "kernel.msgmnb",        value: "65536" }
-    - { key: "kernel.msgmax",        value: "65536" }
-    - { key: "kernel.msgmni",        value: "2048" }
-    # Virtual Memory
-    - { key: "vm.overcommit_memory", value: "2" }
-    - { key: "vm.overcommit_ratio",  value: "95" }
-    - { key: "vm.swappiness",        value: "10" }
-    - { key: "vm.dirty_expire_centisecs",    value: "500" }
-    - { key: "vm.dirty_writeback_centisecs", value: "100" }
-    - { key: "vm.dirty_background_ratio",    value: "0" }
-    - { key: "vm.dirty_ratio",               value: "0" }
-    - { key: "vm.dirty_background_bytes",    value: "1610612736" }
-    - { key: "vm.dirty_bytes",               value: "4294967296" }
-    # Network
-    - { key: "net.ipv4.tcp_tw_reuse",          value: "1" }
-    - { key: "net.ipv4.conf.all.arp_filter",   value: "1" }
-    - { key: "net.ipv4.ip_local_port_range",   value: "10000 65535" }
-    - { key: "net.core.netdev_max_backlog",    value: "2000" }
-    - { key: "net.core.rmem_max",              value: "4194304" }
-    - { key: "net.core.wmem_max",              value: "4194304" }
-    - { key: "net.core.rmem_default",          value: "4194304" }
-    - { key: "net.core.wmem_default",          value: "4194304" }
-    - { key: "net.core.optmem_max",            value: "4194304" }
-    - { key: "net.ipv4.tcp_mem",               value: "4194304 4194304 4194304" }
-    - { key: "net.ipv4.tcp_rmem",              value: "4096 4194304 4194304" }
-    - { key: "net.ipv4.tcp_wmem",              value: "4096 4194304 4194304" }
+  loop: "{{ os_sysctl_params | combine(os_sysctl_params_extra) | dict2items }}"
 
 # ---------- 5. PAM / Ulimits ----------
 - name: gpadmin 사용자 ulimits 설정 (/etc/security/limits.d)
   ansible.builtin.copy:
-    dest: /etc/security/limits.d/95-gpadmin.conf
+    dest: "{{ gpadmin_limits_file }}"
     content: |
-      gpadmin soft nofile 524288
-      gpadmin hard nofile 524288
-      gpadmin soft nproc  131072
-      gpadmin hard nproc  131072
-      gpadmin soft core   unlimited
-      gpadmin hard core   unlimited
-      gpadmin soft memlock unlimited
-      gpadmin hard memlock unlimited
+      {% for item, value in gpadmin_limits.items() %}
+      {{ gpadmin_user }} soft {{ item }} {{ value }}
+      {{ gpadmin_user }} hard {{ item }} {{ value }}
+      {% endfor %}
     owner: root
     group: root
     mode: '0644'
@@ -131,9 +86,9 @@
 
 # ---------- 6-1. gpdb.service systemd 서비스 등록 (재부팅 후 cgroup 자동 구성) ----------
 # 문서 기준: /etc/systemd/system/gpdb.service 로 등록
-- name: gpdb.service systemd 서비스 파일 배포 (cgroup v2 자동 설정)
+- name: "{{ whpg_cgroup_service_name }}.service systemd 서비스 파일 배포 (cgroup v2 자동 설정)"
   ansible.builtin.copy:
-    dest: /etc/systemd/system/gpdb.service
+    dest: "/etc/systemd/system/{{ whpg_cgroup_service_name }}.service"
     owner: root
     group: root
     mode: '0644'
@@ -153,37 +108,37 @@
       ExecCondition=bash -c '[ xcgroup2fs = x$(stat -fc "%%T" /sys/fs/cgroup) ] || exit 1'
 
       ExecStart=bash -ec '\
-        echo "+cpu +cpuset +io +memory" > /sys/fs/cgroup/cgroup.subtree_control; \
-        mkdir -p /sys/fs/cgroup/gpdb; \
-        chown -R gpadmin:gpadmin /sys/fs/cgroup/gpdb; \
-        echo "+cpu +cpuset +io +memory" > /sys/fs/cgroup/gpdb/cgroup.subtree_control; \
-        echo "WarehousePG cgroup v2 setup complete: /sys/fs/cgroup/gpdb"'
+        echo "{{ whpg_cgroup_controllers }}" > /sys/fs/cgroup/cgroup.subtree_control; \
+        mkdir -p {{ whpg_cgroup_dir }}; \
+        chown -R {{ gpadmin_user }}:{{ gpadmin_group }} {{ whpg_cgroup_dir }}; \
+        echo "{{ whpg_cgroup_controllers }}" > {{ whpg_cgroup_dir }}/cgroup.subtree_control; \
+        echo "WarehousePG cgroup v2 setup complete: {{ whpg_cgroup_dir }}"'
 
       [Install]
       WantedBy=multi-user.target
 
-- name: gpdb.service systemd 데몬 리로드 및 활성화
+- name: "{{ whpg_cgroup_service_name }}.service systemd 데몬 리로드 및 활성화"
   ansible.builtin.systemd:
-    name: gpdb.service
+    name: "{{ whpg_cgroup_service_name }}.service"
     enabled: true
     daemon_reload: true
 
-- name: gpdb.service 즉시 실행 (현재 세션에 cgroup 적용)
+- name: "{{ whpg_cgroup_service_name }}.service 즉시 실행 (현재 세션에 cgroup 적용)"
   ansible.builtin.systemd:
-    name: gpdb.service
+    name: "{{ whpg_cgroup_service_name }}.service"
     state: started
   register: _gpdb_service_start
   failed_when: false  # cgroup2 미활성 환경에서는 ExecCondition 실패 허용
 
 - name: cgroup v2 gpdb 디렉토리 확인
   ansible.builtin.stat:
-    path: /sys/fs/cgroup/gpdb
+    path: "{{ whpg_cgroup_dir }}"
   register: _gpdb_cgroup_dir
 
 - name: cgroup v2 gpdb 설정 결과 출력
   ansible.builtin.debug:
     msg: >
-      /sys/fs/cgroup/gpdb:
+      {{ whpg_cgroup_dir }}:
       {{ '생성됨 ✓' if _gpdb_cgroup_dir.stat.exists else
          '미생성 - cgroup v2가 활성화되지 않았습니다. reboot 후 재시도하세요.' }}
 
@@ -215,8 +170,8 @@
     block: |
       source {{ whpg_install_dir }}/greenplum_path.sh
       export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
-      export PGPORT=5432
-      export PGDATABASE=gpadmin
+      export PGPORT={{ whpg_coordinator_port }}
+      export PGDATABASE={{ whpg_database }}
 
 # ---------- 8. gpadmin SSH 키 생성 및 무암호 로그인 ----------
 - name: gpadmin .ssh 디렉토리 생성
@@ -231,14 +186,14 @@
   ansible.builtin.user:
     name: "{{ gpadmin_user }}"
     generate_ssh_key: true
-    ssh_key_bits: 4096
-    ssh_key_type: rsa
-    ssh_key_file: "{{ gpadmin_home }}/.ssh/id_rsa"
+    ssh_key_bits: "{{ gpadmin_ssh_key_bits }}"
+    ssh_key_type: "{{ gpadmin_ssh_key_type }}"
+    ssh_key_file: "{{ gpadmin_ssh_key_file }}"
   when: inventory_hostname == coordinator_host
 
 - name: Coordinator의 gpadmin 공개키 가져오기
   ansible.builtin.slurp:
-    src: "{{ gpadmin_home }}/.ssh/id_rsa.pub"
+    src: "{{ gpadmin_ssh_key_file }}.pub"
   register: gpadmin_pubkey
   delegate_to: "{{ coordinator_host }}"
   run_once: true
@@ -270,40 +225,21 @@
     mode: '0644'
   when: whpg_local_repo_enabled
 
-# ---------- 10. XFS 마운트 옵션 ----------
-- name: XFS 데이터 파티션 포맷 (이미 포맷된 경우 skip)
-  ansible.builtin.command:
-    cmd: "mkfs.xfs -f {{ xfs_data_device }}"
-  args:
-    creates: /proc/mounts  # idempotent trick - 실제 운영 시 별도 체크 권장
-  ignore_errors: true
-  when: xfs_data_device is defined
-
-- name: /data 마운트 포인트 생성
-  ansible.builtin.file:
-    path: "{{ xfs_mount_point }}"
-    state: directory
-    owner: "{{ gpadmin_user }}"
-    group: "{{ gpadmin_group }}"
-    mode: '0755'
-
-- name: /etc/fstab에 XFS 마운트 항목 추가
-  ansible.posix.mount:
-    path: "{{ xfs_mount_point }}"
-    src: "{{ xfs_data_device }}"
-    fstype: xfs
-    opts: "{{ xfs_mount_options }}"
-    state: mounted
-  when: xfs_data_device is defined
+# ---------- 10. 데이터 디스크 (XFS 포맷/마운트 + 블럭 디바이스 조회) ----------
+- name: 데이터 디스크 구성
+  ansible.builtin.import_tasks: data_disks.yml
 
 # ---------- 11. I/O 스케쥴러 udev 규칙 ----------
+# 대상: 10단계에서 조회한 데이터 경로의 물리 디스크 (조회 결과가 없으면 io_udev_pattern)
 - name: I/O 스케쥴러 udev 규칙 설정 (VMware/SSD용 none)
   ansible.builtin.copy:
-    dest: /etc/udev/rules.d/99-vmware-db-scheduler.rules
+    dest: "{{ io_udev_rules_file }}"
     content: |
       # WarehousePG I/O Scheduler Tuning
-      ACTION=="add|change", KERNEL=="{{ io_udev_pattern }}", ATTR{queue/scheduler}="{{ io_scheduler }}"
-      ACTION=="add|change", KERNEL=="{{ io_udev_pattern }}", ATTR{bdi/read_ahead_kb}="16"
+      {% for dev in (whpg_data_disks | default([])) or [io_udev_pattern] %}
+      ACTION=="add|change", KERNEL=="{{ dev }}", ATTR{queue/scheduler}="{{ io_scheduler }}"
+      ACTION=="add|change", KERNEL=="{{ dev }}", ATTR{bdi/read_ahead_kb}="{{ io_read_ahead_kb }}"
+      {% endfor %}
     owner: root
     group: root
     mode: '0644'
@@ -381,19 +317,5 @@
 # ---------- 15. 필수 패키지 설치 ----------
 - name: 필수 패키지 설치
   ansible.builtin.package:
-    name:
-      - rsync
-      - zip
-      - unzip
-      - net-tools
-      - bind-utils
-      - lsof
-      - sysstat
-      - perl
-      - python3
-      - python3-pip
-      - java-11-openjdk
-      - apr
-      - apr-util
-      - bash-completion
+    name: "{{ os_required_packages }}"
     state: present

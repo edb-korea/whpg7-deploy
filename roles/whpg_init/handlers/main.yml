@@ -6,6 +6,5 @@
       gpstop -u -a
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   changed_when: true

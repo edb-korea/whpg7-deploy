@@ -11,7 +11,7 @@
 
 - name: pgBouncer 설정 디렉토리 생성
   ansible.builtin.file:
-    path: /etc/pgbouncer
+    path: "{{ pgbouncer_conf_dir }}"
     state: directory
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
@@ -20,27 +20,28 @@
 - name: pgbouncer.ini 설정파일 배포
   ansible.builtin.template:
     src: pgbouncer.ini.j2
-    dest: /etc/pgbouncer/pgbouncer.ini
+    dest: "{{ pgbouncer_conf_file }}"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0640'
   notify: restart_pgbouncer
 
-- name: userlist.txt 생성 (gpadmin 사용자)
+- name: userlist.txt 생성 (pgbouncer_auth_users)
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -t -A -c
+      psql -d {{ whpg_database }} -t -A -c
       "SELECT '\"' || usename || '\" \"' || passwd || '\"' FROM pg_shadow
-       WHERE usename = 'gpadmin';" > /etc/pgbouncer/userlist.txt
+       WHERE usename IN ('{{ pgbouncer_auth_users | join("','") }}');" > {{ pgbouncer_auth_file }}
   become: true
   become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
   changed_when: true
 
 - name: pgBouncer systemd 서비스 등록
   ansible.builtin.template:
     src: pgbouncer.service.j2
-    dest: /etc/systemd/system/pgbouncer.service
+    dest: "/etc/systemd/system/{{ pgbouncer_service_name }}.service"
     owner: root
     group: root
     mode: '0644'
@@ -48,7 +49,7 @@
 
 - name: pgBouncer 서비스 시작 및 활성화
   ansible.builtin.systemd:
-    name: pgbouncer
+    name: "{{ pgbouncer_service_name }}"
     state: started
     enabled: true
     daemon_reload: true

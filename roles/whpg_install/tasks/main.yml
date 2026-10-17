@@ -7,17 +7,17 @@
 # ======================================================
 
 # ---------- 1. WHPG Core RPM 설치 ----------
-- name: "WHPG Core RPM 설치 ({{ whpg_rpm_name }})"
+- name: "WHPG Core RPM 설치 ({{ whpg_core_pkg_name }} {{ whpg_version }})"
   ansible.builtin.include_role:
     name: rpm_install
   vars:
-    rpm_pkg_name: "warehouse-pg-7"
-    rpm_pkg_pattern: "{{ whpg_rpm_name }}"
+    rpm_pkg_name: "{{ whpg_core_pkg_name }}"
+    rpm_pkg_version: "{{ whpg_version }}"
     rpm_install_state: present
 
 # ---------- 2. 설치 경로 확인 및 symlink 생성 ----------
-# 실제 설치 경로: /usr/edb/whpg7
-# symlink:       /usr/local/greenplum-db → /usr/edb/whpg7
+# 실제 설치 경로: whpg_real_install_dir (기본 /usr/edb/whpg7)
+# symlink:       whpg_install_dir (기본 /usr/local/greenplum-db) → whpg_real_install_dir
 
 - name: 실제 설치 디렉토리 확인
   ansible.builtin.stat:
@@ -31,10 +31,10 @@
       RPM 설치 결과를 확인하세요.
   when: not _whpg_real_dir.stat.exists
 
-- name: /usr/local/greenplum-db symlink 생성 (없는 경우)
+- name: "{{ whpg_install_dir }} symlink 생성 (없는 경우)"
   ansible.builtin.file:
     src: "{{ whpg_real_install_dir }}"
-    dest: "/usr/local/greenplum-db"
+    dest: "{{ whpg_install_dir }}"
     state: link
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
@@ -49,16 +49,23 @@
   when: _whpg_real_dir.stat.exists
 
 # ---------- 3. 데이터 디렉토리 생성 ----------
-- name: Coordinator/Standby 데이터 디렉토리 생성
+- name: Coordinator 데이터 디렉토리 생성
   ansible.builtin.file:
     path: "{{ coordinator_data_dir | dirname }}"
     state: directory
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0750'
-  when: >
-    inventory_hostname in groups['coordinator'] or
-    inventory_hostname in groups['standby_coordinator']
+  when: inventory_hostname in groups['coordinator']
+
+- name: Standby 데이터 디렉토리 생성
+  ansible.builtin.file:
+    path: "{{ standby_data_dir | dirname }}"
+    state: directory
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0750'
+  when: inventory_hostname in groups['standby_coordinator']
 
 - name: Segment Primary 데이터 디렉토리 생성
   ansible.builtin.file:
@@ -84,7 +91,7 @@
 - name: hostfile_all 생성 (gpssh-exkeys 용)
   ansible.builtin.template:
     src: hostfile_all.j2
-    dest: "{{ gpadmin_home }}/hostfile_all"
+    dest: "{{ whpg_hostfile_all }}"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0644'
@@ -94,7 +101,7 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpssh-exkeys -f {{ gpadmin_home }}/hostfile_all
+      gpssh-exkeys -f {{ whpg_hostfile_all }}
   become: true
   become_user: "{{ gpadmin_user }}"
   when: inventory_hostname == coordinator_host
@@ -105,12 +112,12 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpcheckperf -f {{ gpadmin_home }}/hostfile_all -r N -d /tmp 2>&1 | tail -20
+      gpcheckperf -f {{ whpg_hostfile_all }} -r N -d {{ whpg_checkperf_dir }} 2>&1 | tail -20
   become: true
   become_user: "{{ gpadmin_user }}"
   when:
     - inventory_hostname == coordinator_host
-    - whpg_run_checkperf | default(false)
+    - whpg_run_checkperf | bool
   register: checkperf_result
   changed_when: false
 
@@ -119,5 +126,5 @@
     var: checkperf_result.stdout_lines
   when:
     - inventory_hostname == coordinator_host
-    - whpg_run_checkperf | default(false)
+    - whpg_run_checkperf | bool
     - checkperf_result is defined

@@ -1,33 +1,40 @@
-# WarehousePG Enterprise Manager 설정
-# /etc/wem/wem.conf
-# 참고: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/wem/installing/wem/
+# Managed by Ansible (role: wem)
+# WEM 1.4
 
-# -------- 대상 WHPG 클러스터 --------
+# --- 모니터링 대상 WHPG ({{ 'coordinator VIP' if wem_use_vip | bool else 'coordinator 실 IP' }}) ---
 WHPG_HOST={{ wem_whpg_host }}
 WHPG_PORT={{ wem_whpg_port }}
 WHPG_DATABASE={{ wem_whpg_database }}
 WHPG_USER={{ wem_whpg_user }}
-WHPG_PASSWORD={{ wem_whpg_password }}
+WHPG_PASSWORD='{{ wem_whpg_password }}'
+WHPG_SSLMODE=disable
 
-# -------- Observability 엔드포인트 --------
-PROMETHEUS_URL={{ prometheus_url }}
-LOKI_URL={{ loki_url }}
+# --- WEM 상태 DB ({{ 'WEM host 의 별도 PostgreSQL' if wem_state_install | bool else 'WHPG 의 ' ~ wem_state_database ~ ' DB' }}) ---
+WEM_HOST={{ wem_state_host }}
+WEM_PORT={{ wem_state_port }}
+WEM_DATABASE={{ wem_state_database }}
+WEM_USER={{ wem_state_user }}
+WEM_PASSWORD='{{ wem_state_password }}'
+WEM_SSLMODE=disable
 
-# -------- WEM 포털 포트 --------
-PORT={{ wem_portal_port }}
+# --- ClickHouse (비밀번호는 URL 인코딩) ---
+CLICKHOUSE_URL='clickhouse://{{ clickhouse_user }}:{{ clickhouse_password | urlencode | replace('/', '%2F') }}@{{ wem_host_ip }}:{{ clickhouse_native_port }}'
 
-# -------- 세션 보안 --------
-# WEM_COOKIE_SECRET은 openssl rand -base64 32 로 생성한 값 사용
-WEM_COOKIE_SECRET={{ wem_cookie_secret | default('CHANGE_ME_openssl_rand_base64_32') }}
-WEM_INSECURE_COOKIES=1
+# --- Web ---
+PORT={{ wem_port }}
+WEM_COOKIE_SECRET='{{ wem_cookie_secret_value }}'
+# HTTPS가 아니므로 쿠키 허용 (HTTP 테스트 환경 전용)
+WEM_INSECURE_COOKIES={{ wem_insecure_cookies }}
+WEM_ADMIN_PASSWORD='{{ wem_admin_password }}'
 
-# -------- admin 비밀번호 파일 --------
-WEM_ADMIN_PASSWORD_FILE=/etc/wem/admin.pw
+# --- 외부 노출용 메트릭 endpoint ---
+OTEL_PROMETHEUS_SCRAPE_ENDPOINT={{ wem_otel_prometheus_scrape_endpoint }}
 
-# -------- 로그 / 수집 주기 --------
-WEM_EXPORTER_LOG_LEVEL=info
-WEM_EXPORTER_REMOTE_WRITE_INTERVAL=15s
-WEM_EXPORTER_REMOTE_WRITE_TIMEOUT=30s
-
-# -------- AI Assistant (선택) --------
-# ANTHROPIC_API_KEY=YOUR_API_KEY_HERE
+# Host Agent 자동 등록
+WEM_AGENT_JOIN_SECRET='{{ wem_join_secret_value }}'
+{% if wem_high_load_mode | length > 0 %}
+HIGH_LOAD_MODE={{ wem_high_load_mode }}
+{% endif %}
+{% for line in wem_extra_conf_lines %}
+{{ line }}
+{% endfor %}

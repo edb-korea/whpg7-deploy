@@ -1,0 +1,37 @@
+---
+# WHPG pg_hba.conf 에 클러스터 노드 접속 허용
+# tag: pghba
+- name: Allow cluster nodes in pg_hba.conf (coordinator / standby)
+  ansible.builtin.blockinfile:
+    path: "{{ standby_data_dir if _whpg_role == 'standby' else coordinator_data_dir }}/pg_hba.conf"
+    marker: "# {mark} ANSIBLE MANAGED: WEM 1.4"
+    block: |
+      # coordinator 의 otelcol sqlquery/whpg 가 127.0.0.1 로 접속
+      host all {{ wem_whpg_user }} 127.0.0.1/32 scram-sha-256
+      {% for h in groups['whpg_cluster'] %}
+      host all {{ wem_whpg_user }} {{ hostvars[h].ansible_host }}/32 scram-sha-256
+      {% endfor %}
+      {% if vip_addr | length > 0 %}
+      # VIP 를 가진 서버에서 VIP 로 접속하면 출발지 주소가 VIP 가 될 수 있음
+      host all {{ wem_whpg_user }} {{ vip_addr }}/32 scram-sha-256
+      {% endif %}
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+  register: _pg_hba
+  when:
+    - wem_manage_pg_hba | bool
+    - _whpg_role in ['coordinator', 'standby']
+
+- name: Reload coordinator configuration
+  ansible.builtin.shell:
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export PGPORT={{ whpg_coordinator_port }}
+      export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+      gpstop -u
+    executable: /bin/bash
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - inventory_hostname == coordinator_host
+    - wem_manage_pg_hba | bool
+    - _pg_hba is changed

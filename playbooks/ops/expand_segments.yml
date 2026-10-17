@@ -1,0 +1,72 @@
+---
+# ======================================================
+# Segment 호스트 증설 (gpexpand)
+#
+# 준비:
+#   1. 새 호스트 4대(whpg_mirror_group_size)를 inventory/hosts 의 [segments] 끝에 추가
+#      (기존 호스트 순서는 바꾸지 않음. 순서대로 4대씩 mirror 그룹이 된다)
+#   2. 새 호스트에 root SSH 접속 가능, 데이터 디스크 구성(whpg_data_mounts)이 기존과 같아야 함
+#
+# 실행:
+#   ansible-playbook playbooks/ops/expand_segments.yml                              # 추가 + 재분배 + 정리
+#   ansible-playbook playbooks/ops/expand_segments.yml -e expand_redistribute=false # segment 추가까지만
+#   ansible-playbook playbooks/ops/expand_segments.yml -e expand_duration=04:00:00  # 재분배 최대 4시간
+#   (중간에 멈추거나 시간이 지나면 같은 명령을 다시 실행 → gpexpand.status 를 보고 이어서 진행)
+#
+# 순서:
+#   1. 계획      : gp_segment_configuration 과 [segments] 비교 → 새 호스트 결정 / 조건 확인
+#   2. /etc/hosts: 전체 노드에 새 호스트 등록
+#   3. 새 호스트 : os_preconfig → (필요 시) 재부팅 → whpg_install → extension RPM
+#   4. gpexpand  : 새 primary + mirror 추가 (mirror 는 초기 구성과 같은 4대 그룹 spread 규칙)
+#                  → PXF 등록 → 테이블 재분배 → gpexpand 스키마 정리
+#   5. WEM       : 새 호스트에 Host Agent / otelcol, pg_hba 갱신 (wem_enabled 일 때 07_wem.yml)
+#
+# 변수: roles/whpg_expand/defaults/main.yml
+# ======================================================
+
+- name: "증설 1/5: 계획"
+  hosts: coordinator
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: 증설 계획
+      ansible.builtin.include_role:
+        name: whpg_expand
+        tasks_from: plan.yml
+
+- name: "증설 2/5: /etc/hosts 갱신 (전체 노드)"
+  hosts: whpg_cluster
+  become: true
+  gather_facts: false
+  tasks:
+    - name: /etc/hosts 갱신
+      ansible.builtin.include_role:
+        name: os_preconfig
+        tasks_from: hosts.yml
+
+- name: "증설 3/5: 새 호스트 준비"
+  hosts: expand_new_hosts
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: 새 호스트 준비
+      ansible.builtin.include_role:
+        name: whpg_expand
+        tasks_from: prepare.yml
+
+- name: "증설 4/5: gpexpand (segment 추가 / 재분배)"
+  hosts: coordinator
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: gpexpand
+      ansible.builtin.include_role:
+        name: whpg_expand
+
+- name: "증설 5/5: WEM (새 호스트 Host Agent / otelcol, pg_hba)"
+  ansible.builtin.import_playbook: ../07_wem.yml
+  when:
+    - wem_enabled | default(true) | bool
+    - hostvars[coordinator_host]._expand_new_hosts | default([]) | length > 0

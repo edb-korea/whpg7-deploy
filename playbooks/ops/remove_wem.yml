@@ -1,0 +1,27 @@
+---
+# ======================================================
+# WEM 1.4 삭제 (확인 질문 없이 바로 삭제)
+#
+#   ansible-playbook playbooks/ops/remove_wem.yml
+#
+# 삭제: WEM, ClickHouse, (설치한 경우) WEM 상태 DB, Host Agent, otelcol 과 설정 / 데이터,
+#       pg_hba.conf 의 WEM 블록, WHPG 의 wem DB / wemon 계정 / wem_group resource group
+# 보존: WHPG 본체, postgres / template0 / template1 / gpadmin / whpg_database (wem_protected_databases)
+# 변수: roles/wem/defaults/main.yml 의 "WEM 1.4 삭제" 구역
+# ======================================================
+- name: WEM 1.4 삭제
+  hosts: whpg_cluster
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Pre-checks and placement
+      ansible.builtin.import_role:
+        name: wem
+        tasks_from: 00-checks.yml
+      tags: [always]
+
+    - name: Remove WEM 1.4
+      ansible.builtin.import_role:
+        name: wem
+        tasks_from: remove-wem14.yml
+      tags: [remove]

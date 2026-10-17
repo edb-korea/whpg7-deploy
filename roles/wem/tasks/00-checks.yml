@@ -1,0 +1,51 @@
+---
+# 실행 전 확인 (OS, VIP 활성 여부, wem_use_vip 조건, 배치 출력)
+# tag: always
+- name: Check supported OS
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] == 'RedHat'
+    fail_msg: "Red Hat 계열 OS만 지원합니다."
+
+- name: Check whether the HA VIP is active on the coordinator
+  ansible.builtin.shell:
+    cmd: "ip -o addr show | grep -qwF '{{ vip_addr }}'"
+    executable: /bin/bash
+  register: _vip_check
+  changed_when: false
+  failed_when: false
+  when:
+    - inventory_hostname == coordinator_host
+    - vip_addr | length > 0
+
+- name: Remember whether the HA VIP is active
+  ansible.builtin.set_fact:
+    _vip_active: "{{ _vip_check.rc == 0 }}"
+  when:
+    - inventory_hostname == coordinator_host
+    - vip_addr | length > 0
+
+- name: Check prerequisites for wem_use_vip
+  ansible.builtin.assert:
+    that:
+      - vip_addr | length > 0
+      - _standby_hosts | length > 0
+      - hostvars[coordinator_host]['_vip_active'] | default(false) | bool
+    fail_msg: >-
+      wem_use_vip=true 인데 조건이 맞지 않습니다.
+      (1) inventory/whpg_cluster.yml 의 coordinator_vip 가 비어 있지 않아야 하고,
+      (2) standby coordinator 가 있어야 하며,
+      (3) VIP ({{ vip_addr | default('미지정', true) }}) 가 coordinator 에 실제로 올라와 있어야 합니다.
+      HA(VIP)를 구성한 뒤(playbooks/06_coordinator_ha.yml) 다시 실행하거나 -e wem_use_vip=false 로 실행하세요.
+  run_once: true
+  when: wem_use_vip | bool
+
+- name: Show resolved placement
+  ansible.builtin.debug:
+    msg:
+      - "coordinator = {{ coordinator_host }} ({{ coordinator_ip }})"
+      - "WEM host    = {{ wem_host }} ({{ wem_host_ip }})"
+      - "VIP         = {{ vip_addr | default('none', true) }} (coordinator에서 활성: {{ hostvars[coordinator_host]['_vip_active'] | default(false) }})"
+      - "DB 메트릭(sqlquery) 수집: {{ ('standby(' ~ (_standby_hosts | first) ~ ')에서 ' ~ otelcol_sqlquery_host ~ ' 로 접속') if (_otel_sqlquery_move | bool) else 'coordinator에서 127.0.0.1 로 접속' }}"
+      - "WEM → WHPG 접속: {{ wem_whpg_host }} ({{ 'VIP, wem_use_vip=true' if wem_use_vip | bool else 'coordinator 실 IP, wem_use_vip=false' }})"
+  run_once: true

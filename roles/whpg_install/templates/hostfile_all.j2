@@ -1,5 +1,3 @@
-{{ coordinator_host }}
-{{ standby_coordinator_host }}
-{% for host in segment_hosts %}
+{% for host in groups['whpg_cluster'] %}
 {{ host }}
 {% endfor %}

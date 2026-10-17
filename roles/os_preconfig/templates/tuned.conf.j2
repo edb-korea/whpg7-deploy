@@ -3,13 +3,13 @@
 
 [main]
 summary=WarehousePG Optimized Profile
-include=throughput-performance
+include={{ tuned_base_profile }}
 
 [cpu]
 force_latency=1
 
 [disk]
-readahead=16
+readahead={{ tuned_readahead }}
 
 [vm]
 transparent_hugepages=never

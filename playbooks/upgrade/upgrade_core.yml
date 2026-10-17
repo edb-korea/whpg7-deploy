@@ -3,14 +3,13 @@
 # WarehousePG Core 업그레이드 플레이북
 #
 # 사용법:
-#   # 로컬 RPM으로 업그레이드 (local_rpm_dir에 새 RPM 배치 후)
-#   ansible-playbook playbooks/upgrade/upgrade_core.yml \
-#     -e "local_rpm_dir=/opt/whpg-rpms"
+#   # local_rpm_dir 의 최신 버전으로 업그레이드 (없으면 dnf latest)
+#   ansible-playbook playbooks/upgrade/upgrade_core.yml
 #
-#   # 특정 RPM 파일 직접 지정
-#   ansible-playbook playbooks/upgrade/upgrade_core.yml \
-#     -e "whpg_rpm_name=warehouse-pg-7.4.1-rhel9-x86_64.rpm" \
-#     -e "local_rpm_dir=/opt/whpg-rpms"
+#   # 특정 버전으로 업그레이드 (local_rpm_dir 에 여러 버전이 있을 때)
+#   ansible-playbook playbooks/upgrade/upgrade_core.yml -e "whpg_upgrade_version=7.6.0"
+#
+#   ※ 업그레이드 후 inventory/whpg_cluster.yml 의 whpg_version 도 새 버전으로 맞춰 두세요.
 #
 # 업그레이드 절차:
 #   1. 현재 버전 확인
@@ -30,9 +29,10 @@
       ansible.builtin.shell:
         cmd: >
           source {{ whpg_install_dir }}/greenplum_path.sh &&
-          psql -d gpadmin -t -c "SELECT version();" 2>&1
+          psql -d {{ whpg_database }} -t -c "SELECT version();" 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
       register: current_version
       changed_when: false
 
@@ -47,8 +47,7 @@
           gpstate -s 2>&1 | grep -E 'Up|Down|Status' | head -10
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: cluster_state
       changed_when: false
 
@@ -56,21 +55,19 @@
       ansible.builtin.debug:
         var: cluster_state.stdout_lines
 
-    - name: 업그레이드 대상 RPM 확인 (로컬)
-      ansible.builtin.find:
-        paths: "{{ local_rpm_dir | default('/opt/whpg-rpms') }}"
-        patterns: "{{ whpg_rpm_name | default('warehouse-pg-7*.rpm') }}"
-      register: upgrade_rpm_check
-      delegate_to: localhost
-      become: false
+    - name: 업그레이드 대상 RPM 확인 (Controller 로컬)
+      ansible.builtin.include_role:
+        name: rpm_install
+        tasks_from: select
+      vars:
+        rpm_pkg_name: "{{ whpg_core_pkg_name }}"
+        rpm_pkg_version: "{{ whpg_upgrade_version | default('') }}"
 
     - name: 업그레이드 RPM 정보 출력
       ansible.builtin.debug:
         msg: >
           업그레이드 RPM:
-          {{ upgrade_rpm_check.files | map(attribute='path') | list
-             if upgrade_rpm_check.files | length > 0
-             else '로컬 RPM 없음 → dnf 업그레이드 사용' }}
+          {{ _rpm_selected if _rpm_selected else '로컬 RPM 없음 → dnf 업그레이드 사용' }}
 
 # -------- Phase 2: 클러스터 정지 --------
 - name: "Core Upgrade - 클러스터 정지"
@@ -84,8 +81,7 @@
           gpstop -af 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       changed_when: true
 
 # -------- Phase 3: 모든 노드에 새 RPM 설치 --------
@@ -93,26 +89,13 @@
   hosts: whpg_cluster
   become: true
   tasks:
-    - name: 로컬 RPM 탐색
-      ansible.builtin.find:
-        paths: "{{ local_rpm_dir | default('/opt/whpg-rpms') }}"
-        patterns: "{{ whpg_rpm_name | default('warehouse-pg-7*.rpm') }}"
-      register: _upgrade_rpm
-      ignore_errors: true
-
-    - name: 로컬 RPM 업그레이드 설치
-      ansible.builtin.yum:
-        name: "{{ _upgrade_rpm.files | map(attribute='path') | sort | last }}"
-        state: latest
-        disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
-      when: _upgrade_rpm.files | length > 0
-
-    - name: dnf 업그레이드 (로컬 RPM 없을 때)
-      ansible.builtin.dnf:
-        name: "warehouse-pg-7"
-        state: latest
-        disable_gpg_check: "{{ rpm_disable_gpg_check | default(true) }}"
-      when: _upgrade_rpm.files | length == 0
+    - name: Core RPM 업그레이드 (Controller 로컬 RPM 우선 → dnf fallback)
+      ansible.builtin.include_role:
+        name: rpm_install
+      vars:
+        rpm_pkg_name: "{{ whpg_core_pkg_name }}"
+        rpm_pkg_version: "{{ whpg_upgrade_version | default('') }}"
+        rpm_install_state: latest
 
     - name: 실제 설치 디렉토리 소유권 재정비
       ansible.builtin.file:
@@ -121,10 +104,10 @@
         group: "{{ gpadmin_group }}"
         recurse: true
 
-    - name: /usr/local/greenplum-db symlink 재확인
+    - name: "{{ whpg_install_dir }} symlink 재확인"
       ansible.builtin.file:
         src: "{{ whpg_real_install_dir }}"
-        dest: "/usr/local/greenplum-db"
+        dest: "{{ whpg_install_dir }}"
         state: link
         owner: "{{ gpadmin_user }}"
         group: "{{ gpadmin_group }}"
@@ -141,8 +124,7 @@
           gpstart -a 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: gpstart_result
       changed_when: true
 
@@ -150,9 +132,10 @@
       ansible.builtin.shell:
         cmd: >
           source {{ whpg_install_dir }}/greenplum_path.sh &&
-          psql -d gpadmin -t -c "SELECT version();" 2>&1
+          psql -d {{ whpg_database }} -t -c "SELECT version();" 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
       register: new_version
       changed_when: false
 
@@ -167,8 +150,7 @@
           gpstate -s 2>&1 | tail -20
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: post_state
       changed_when: false
 

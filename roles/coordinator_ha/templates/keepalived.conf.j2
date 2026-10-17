@@ -1,0 +1,34 @@
+{% set _is_master = inventory_hostname in groups['coordinator'] %}
+! keepalived config - WarehousePG {{ 'Coordinator (MASTER)' if _is_master else 'Standby Coordinator (BACKUP)' }}
+
+global_defs {
+   router_id {{ 'WHPG_COORDINATOR' if _is_master else 'WHPG_STANDBY' }}
+}
+
+vrrp_script chk_whpg {
+    script "{{ ha_script_dir }}/whpg_healthcheck.sh"
+    interval {{ keepalived_check_interval }}
+    weight {{ keepalived_check_weight }}
+    fall {{ keepalived_check_fall }}
+    rise {{ keepalived_check_rise }}
+}
+
+vrrp_instance WHPG_VIP {
+    state {{ 'MASTER' if _is_master else 'BACKUP' }}
+    interface {{ coordinator_vip_interface }}
+    virtual_router_id {{ keepalived_virtual_router_id }}
+    priority {{ keepalived_master_priority if _is_master else keepalived_backup_priority }}
+    advert_int {{ keepalived_advert_int }}
+    authentication {
+        auth_type PASS
+        auth_pass {{ keepalived_auth_pass }}
+    }
+    virtual_ipaddress {
+        {{ coordinator_vip }}
+    }
+    track_script {
+        chk_whpg
+    }
+    notify_master "{{ ha_script_dir }}/whpg_promote.sh MASTER"
+    notify_fault  "{{ ha_script_dir }}/whpg_demote.sh FAULT"
+}

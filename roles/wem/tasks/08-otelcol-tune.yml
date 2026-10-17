@@ -1,0 +1,141 @@
+---
+# otelcol 설정 조정 (CPU 절감, DB 메트릭 수집 위치)
+# tag: tune
+#
+# WEM 이 배포한 config.yaml 은 acp-host-agent 를 재시작하면 다시 렌더링되어 직접 수정한 값이 원복된다.
+# 그래서 config.yaml 은 건드리지 않고 override 파일(config_local.yaml)을 만들어
+# edb-otelcol.conf 의 OTELCOL_OPTIONS 에 --config 로 함께 읽게 한다.
+#   - 모든 노드: file_log(start_at=end, poll_interval), batch 값 조정
+#   - wem_use_vip=true (coordinator failover 대비):
+#       coordinator : metrics 파이프라인에서 sqlquery/whpg 제거
+#       standby     : whpg_db_metrics.yaml 을 복사하고 sqlquery/whpg(VIP 접속)를 추가
+#
+# 순서: 07-host-agent 가 acp-host-agent 를 시작하기 전에 config_local.yaml / edb-otelcol.conf 를 미리 넣어 두므로
+#       agent 가 otelcol 을 처음 띄울 때부터 조정 값이 적용된다. 이 단계는 WEM 이 config.yaml 을 배포한 뒤
+#       병합 결과를 validate 하고, 바뀐 내용(VIP 모드의 sqlquery 추가 등)이 있을 때만 otelcol 을 재시작한다.
+
+# 승인 후 WEM이 otelcol 설정을 배포한다. 배포될 때까지 대기.
+# otelcol RPM 이 기본 config.yaml 을 설치하므로 파일 존재만으로는 부족하다.
+# 승인 후 WEM 이 배포한 설정에는 file_log / failover (모든 노드), sqlquery / clickhouse (일부 노드) 가 들어 있다.
+- name: Wait until WEM deploys otelcol config (자동 승인 후)
+  ansible.builtin.wait_for:
+    path: "{{ otelcol_config }}"
+    search_regex: "file_log|filelog|failover|sqlquery|clickhouse"
+    timeout: "{{ agent_approval_wait_seconds }}"
+  register: _otel_cfg_wait
+  ignore_errors: true
+
+- name: Warn when otelcol config was not deployed
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: WEM 이 배포한 otelcol 설정이 {{ agent_approval_wait_seconds }}초 안에 들어오지 않았습니다. Host Agent 가 승인되지 않았을 수 있습니다 (agent 로그: awaiting TLS material). WEM UI 에서 승인 후 -t tune,querylogs 로 다시 실행하세요."
+  when: _otel_cfg_wait is failed
+
+# 가이드 주의 2-1: coordinator 의 whpg_db_metrics.yaml 을 standby 로 복사
+- name: Read WHPG metrics query definition from the coordinator (주의 2-1)
+  ansible.builtin.slurp:
+    src: "{{ otelcol_whpg_queries_file }}"
+  register: _sqlq_queries
+  failed_when: false
+  when:
+    - _otel_sqlquery_move | bool
+    - inventory_hostname == coordinator_host
+    - _otel_cfg_wait is not failed
+
+- name: Tune otelcol configuration
+  when: _otel_cfg_wait is not failed
+  block:
+    - name: Copy WHPG metrics query definition to the standby (주의 2-1)
+      ansible.builtin.copy:
+        dest: "{{ otelcol_whpg_queries_file }}"
+        content: "{{ hostvars[coordinator_host]['_sqlq_queries'].content | b64decode }}"
+        owner: edb-otelcol
+        group: edb-otelcol
+        mode: "0644"
+      register: _otel_queries
+      when:
+        - _otel_sqlquery_mode == 'add'
+        - hostvars[coordinator_host]['_sqlq_queries'].content is defined
+
+    - name: Warn when the query definition could not be copied
+      ansible.builtin.debug:
+        msg: "coordinator 의 {{ otelcol_whpg_queries_file }} 를 읽지 못해 standby 에 sqlquery/whpg 를 추가하지 않았습니다. 확인 후 -t tune 으로 다시 실행하세요."
+      when:
+        - _otel_sqlquery_mode == 'add'
+        - hostvars[coordinator_host]['_sqlq_queries'].content is not defined
+
+    # 07 에서 미리 넣은 파일을 config.yaml 과 병합해 검사하고, 바뀐 내용(주의 2-3 sqlquery 추가 등)이 있으면 반영
+    - name: Apply otelcol override (validate with WEM config.yaml)
+      ansible.builtin.include_tasks:
+        file: otelcol-local-config.yml
+        apply:
+          tags: [tune]
+      vars:
+        _otel_prestage: false
+
+    # print-config 결과는 controller 에서 파싱한다 (대상 서버에 PyYAML 이 없어도 되도록). 비밀번호가 있으므로 no_log
+    - name: Read merged otelcol config (print-config)
+      ansible.builtin.command:
+        argv:
+          - "{{ otelcol_bin }}"
+          - print-config
+          - "--config=file:{{ otelcol_config }}"
+          - "--config=file:{{ otelcol_local_config }}"
+      register: _otel_merged_raw
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Show otelcol tuning result
+      ansible.builtin.debug:
+        msg: >-
+          {%- set c = (_otel_merged_raw.stdout | default('') | from_yaml) if (_otel_merged_raw.rc | default(1)) == 0 else {} -%}
+          {%- set b = ((c.processors | default({})).batch | default({})) -%}
+          {%- set f = ((c.receivers | default({})).file_log | default({})) -%}
+          {%- set q = (c.receivers | default({}))['sqlquery/whpg'] | default({}) -%}
+          {%- set out = [inventory_hostname ~ ' (' ~ _whpg_role ~ ', sqlquery=' ~ _otel_sqlquery_mode ~ ', changed=' ~ ((_otel_local is changed) or (_otel_options is changed)) ~ ')',
+                         'batch: send_batch_size=' ~ b.send_batch_size | default('?') ~ ' send_batch_max_size=' ~ b.send_batch_max_size | default('?') ~ ' timeout=' ~ b.timeout | default('?'),
+                         'file_log: start_at=' ~ f.start_at | default('?') ~ ' poll_interval=' ~ f.poll_interval | default('?'),
+                         'metrics receivers: ' ~ (((c.service | default({})).pipelines | default({})).metrics | default({})).receivers | default('?')] -%}
+          {%- if q -%}
+          {%- set used = 'sqlquery/whpg' in ((((c.service | default({})).pipelines | default({})).metrics | default({})).receivers | default([])) -%}
+          {%- set _ = out.append('sqlquery/whpg: ' ~ (q.datasource | default('') | regex_search('host=\\S+')) ~ ' interval=' ~ q.collection_interval | default('?')
+                                 ~ ('' if used else '  (정의만 있고 metrics 파이프라인에서 제외 = 수집 안 함)')) -%}
+          {%- endif -%}
+          {{ out if c else [inventory_hostname ~ ': print-config 실패 (rc=' ~ (_otel_merged_raw.rc | default('?')) ~ ')'] }}
+
+    - name: Apply otelcol changes (한 대씩)
+      when: _otel_local is changed or _otel_options is changed or _otel_queries is changed
+      throttle: 1
+      block:
+        - name: Stop otelcol
+          ansible.builtin.systemd:
+            name: edb-otelcol
+            state: stopped
+
+        - name: Reset otelcol checkpoint (otelcol_reset_checkpoint=true 일 때만)
+          ansible.builtin.shell:
+            cmd: |
+              d={{ otelcol_checkpoint_dir }}
+              if [ -d "$d" ]; then
+                ts=$(date +%Y%m%d%H%M%S)
+                mv "$d" "$d.bak_$ts"
+                mkdir "$d"
+                chown --reference="$d.bak_$ts" "$d"
+                chmod --reference="$d.bak_$ts" "$d"
+                echo reset
+              fi
+            executable: /bin/bash
+          register: _otel_ckpt
+          changed_when: "'reset' in _otel_ckpt.stdout"
+          when: otelcol_reset_checkpoint | bool
+
+        - name: Start otelcol
+          ansible.builtin.systemd:
+            name: edb-otelcol
+            state: started
+
+    - name: Make sure otelcol is enabled and running
+      ansible.builtin.systemd:
+        name: edb-otelcol
+        enabled: true
+        state: started

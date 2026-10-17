@@ -1,6 +1,0 @@
----
-- name: restart_wem
-  ansible.builtin.systemd:
-    name: wem
-    state: restarted
-    daemon_reload: true

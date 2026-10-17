@@ -1,0 +1,270 @@
+---
+# WEM 1.4 및 대응 구성요소 삭제. playbooks/ops/remove_wem.yml 이 tasks_from 으로 호출한다
+# tag: remove
+# =========================================================================
+# 0. 사전 확인
+# =========================================================================
+- name: Check installed WEM package version on WEM host
+  ansible.builtin.shell:
+    cmd: "rpm -q --qf '%{VERSION}' {{ wem_pkg_name }} 2>/dev/null || true"
+    executable: /bin/bash
+  register: _wem_ver
+  changed_when: false
+  when: inventory_hostname == wem_host
+
+- name: Decide whether the installed WEM is the 1.4 line
+  ansible.builtin.set_fact:
+    _remove_wem_pkg: "{{ (_wem_ver.stdout | trim) is match('^' ~ (wem_remove_version_prefix | regex_escape)) }}"
+  when: inventory_hostname == wem_host
+
+- name: Show WEM removal decision
+  ansible.builtin.debug:
+    msg:
+      - "WEM host = {{ wem_host }}"
+      - "설치된 whpg-enterprise-manager 버전 = '{{ _wem_ver.stdout | trim | default('없음', true) }}'"
+      - "WEM 패키지 삭제 = {{ _remove_wem_pkg }} ({{ wem_remove_version_prefix }}.x 일 때만 삭제)"
+  when: inventory_hostname == wem_host
+
+# =========================================================================
+# 1. 서비스 중지
+# =========================================================================
+- name: Stop WEM service (1.4 인 경우에만)
+  ansible.builtin.systemd:
+    name: wem
+    state: stopped
+    enabled: false
+  failed_when: false
+  when:
+    - inventory_hostname == wem_host
+    - _remove_wem_pkg | bool
+
+- name: Stop and disable 1.4 related services (없는 서비스는 건너뜀)
+  ansible.builtin.shell:
+    cmd: |
+      for s in {{ remove_services | join(' ') }}; do
+        if systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "^$s.service"; then
+          systemctl disable --now "$s" && echo "stopped: $s"
+        fi
+      done
+    executable: /bin/bash
+  register: _stop_services
+  changed_when: _stop_services.stdout | length > 0
+
+- name: Check whether the WEM state PostgreSQL unit exists
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/{{ wem_state_service }}.service"
+  register: _state_unit
+  when: inventory_hostname == wem_host
+
+# =========================================================================
+# 2. 패키지 삭제
+# =========================================================================
+- name: Remove Host Agent / otelcol / ClickHouse packages
+  ansible.builtin.dnf:
+    name: "{{ remove_packages }}"
+    state: absent
+    autoremove: "{{ wem_remove_autoremove | bool }}"
+
+- name: Remove WEM package
+  ansible.builtin.dnf:
+    name: "{{ wem_pkg_name }}"
+    state: absent
+    autoremove: "{{ wem_remove_autoremove | bool }}"
+  when:
+    - inventory_hostname == wem_host
+    - _remove_wem_pkg | bool
+
+- name: Remove WEM state PostgreSQL (전용 서비스가 있었던 경우에만)
+  when:
+    - inventory_hostname == wem_host
+    - _state_unit.stat.exists
+  block:
+    - name: Remove WEM state PostgreSQL unit
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ wem_state_service }}.service"
+        state: absent
+
+    - name: Remove WEM state PostgreSQL data directory
+      ansible.builtin.file:
+        path: "{{ wem_state_data_dir }}"
+        state: absent
+
+    - name: Remove PostgreSQL server packages used for WEM state
+      ansible.builtin.dnf:
+        name:
+          - postgresql-server
+          - postgresql-contrib
+        state: absent
+
+# =========================================================================
+# 3. 파일 삭제 (/etc/edb/pgaa 는 건드리지 않음)
+# =========================================================================
+- name: Remove Host Agent / otelcol files (all hosts)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ remove_paths_all_hosts }}"
+
+- name: Remove WEM host files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ remove_paths_wem_host
+       + ([clickhouse_data_dir] if clickhouse_data_dir | length > 0 else [])
+       + ([clickhouse_log_dir] if clickhouse_log_dir | length > 0 else [])
+       + (remove_paths_wem14_only if (_remove_wem_pkg | default(false) | bool) else []) }}
+  when: inventory_hostname == wem_host
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# =========================================================================
+# 4. WHPG 쪽 정리 (pg_hba 블록, wem role)
+# =========================================================================
+- name: Remove WEM 1.4 block from pg_hba.conf (coordinator / standby)
+  ansible.builtin.blockinfile:
+    path: "{{ standby_data_dir if _whpg_role == 'standby' else coordinator_data_dir }}/pg_hba.conf"
+    marker: "# {mark} ANSIBLE MANAGED: WEM 1.4"
+    state: absent
+  register: _pg_hba
+  when:
+    - wem_remove_pg_hba_block | bool
+    - _whpg_role in ['coordinator', 'standby']
+
+- name: Reload coordinator configuration
+  ansible.builtin.shell:
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export PGPORT={{ whpg_coordinator_port }}
+      export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+      gpstop -u
+    executable: /bin/bash
+  become_user: "{{ gpadmin_user }}"
+  when:
+    - inventory_hostname == coordinator_host
+    - wem_remove_pg_hba_block | bool
+    - _pg_hba is changed
+
+- name: Drop WEM roles in WHPG
+  ansible.builtin.shell:
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export PGPORT={{ whpg_coordinator_port }}
+      {% for r in wem_whpg_roles %}
+      psql -d postgres -c "DROP ROLE IF EXISTS {{ r }};"
+      {% endfor %}
+    executable: /bin/bash
+  become_user: "{{ gpadmin_user }}"
+  register: _drop_roles
+  changed_when: "'DROP ROLE' in _drop_roles.stdout"
+  failed_when: false
+  when:
+    - inventory_hostname == coordinator_host
+    - wem_drop_whpg_roles | bool
+
+- name: Show result of dropping WEM roles
+  ansible.builtin.debug:
+    msg: "{{ (_drop_roles.stdout_lines | default([])) + (_drop_roles.stderr_lines | default([])) }}"
+  when: inventory_hostname == coordinator_host
+
+# 05-state-database 가 만든 WEM 접속용 DB / 계정 (wem_whpg_create=true 일 때)
+- name: Drop WEM database / role created in WHPG
+  ansible.builtin.shell:
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      export PGPORT={{ whpg_coordinator_port }}
+      cd /tmp
+      # 접속 중인 세션을 끊고 DB 를 지운다
+      drop_db() {
+        psql -d postgres -Atc "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$1' AND pid <> pg_backend_pid()" >/dev/null
+        psql -d postgres -c "DROP DATABASE \"$1\";"
+      }
+      # wem_remove_databases: 소유자와 관계없이 지운다 (보호 목록 제외)
+      for db in {{ _wem_drop_db_always | map('quote') | join(' ') }}; do
+        if [ "$(psql -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname = '$db'")" = "1" ]; then
+          drop_db "$db"
+        fi
+      done
+      # wem_whpg_database: WEM 계정 소유일 때만 지운다 (보호 목록 제외)
+      for db in {{ _wem_drop_db_owned | map('quote') | join(' ') }}; do
+        owner=$(psql -d postgres -Atc "SELECT datdba::regrole::text FROM pg_database WHERE datname = '$db'")
+        if [ -z "$owner" ]; then
+          continue
+        elif [ "$owner" = '{{ wem_whpg_user }}' ] || [ "$owner" = '"{{ wem_whpg_user }}"' ]; then
+          drop_db "$db"
+        else
+          echo "SKIP DROP DATABASE $db (owner=$owner, {{ wem_whpg_user }} 소유가 아님)"
+        fi
+      done
+      # WEM 이 DB 마다 만든 wem.v_* view 등 계정 소유 객체를 먼저 지운다
+      if [ "$(psql -d postgres -Atc "SELECT 1 FROM pg_roles WHERE rolname = '{{ wem_whpg_user }}'")" = "1" ]; then
+        for d in $(psql -d postgres -Atc "SELECT datname FROM pg_database WHERE datallowconn"); do
+          psql -d "$d" -c 'DROP OWNED BY "{{ wem_whpg_user }}";'
+        done
+      fi
+      psql -d postgres -c 'DROP ROLE IF EXISTS "{{ wem_whpg_user }}";'
+      # 05-state-database 가 만든 resource group (다른 계정이 쓰고 있으면 DROP 이 실패하고 남는다)
+      {% if wem_whpg_resource_group | length > 0 %}
+      if [ "$(psql -d postgres -Atc "SELECT 1 FROM pg_resgroup WHERE rsgname = '{{ wem_whpg_resource_group }}'")" = "1" ]; then
+        psql -d postgres -c 'DROP RESOURCE GROUP "{{ wem_whpg_resource_group }}";'
+      fi
+      {% endif %}
+    executable: /bin/bash
+  vars:
+    _wem_drop_db_always: "{{ wem_remove_databases | select | unique | reject('in', wem_protected_databases) | list }}"
+    _wem_drop_db_owned: "{{ [wem_whpg_database] | reject('in', wem_protected_databases + _wem_drop_db_always) | list }}"
+  become_user: "{{ gpadmin_user }}"
+  register: _drop_whpg_wem
+  changed_when: "'DROP' in _drop_whpg_wem.stdout"
+  failed_when: false
+  when:
+    - inventory_hostname == coordinator_host
+    - wem_drop_whpg_roles | bool
+    - wem_whpg_create | bool
+
+- name: Show result of dropping WEM database / role
+  ansible.builtin.debug:
+    msg: "{{ (_drop_whpg_wem.stdout_lines | default([])) + (_drop_whpg_wem.stderr_lines | default([])) }}"
+  when:
+    - inventory_hostname == coordinator_host
+    - _drop_whpg_wem is not skipped
+
+# =========================================================================
+# 5. 확인
+# =========================================================================
+- name: Verify nothing is left
+  ansible.builtin.shell:
+    cmd: |
+      echo "[rpm]";  rpm -qa | grep -iE "edb-acp|edb-otelcol|clickhouse" || true
+      echo "[wem]";  rpm -q {{ wem_pkg_name }} 2>&1 || true
+      echo "[unit]"; systemctl list-unit-files 2>/dev/null | grep -iE "^(clickhouse-server|{{ wem_state_service }}|acp-host-agent|edb-otelcol)" || true
+      echo "[port]"; ss -lntp | grep -E ":({{ wem_agent_port }}|{{ clickhouse_native_port }}|8123{{ '|' ~ wem_state_port if wem_state_install | bool else '' }})\b" || true
+    executable: /bin/bash
+  register: _verify
+  changed_when: false
+
+- name: Verify WEM databases / role / resource group are gone in WHPG
+  ansible.builtin.shell:
+    cmd: |
+      cd /tmp
+      source {{ whpg_install_dir }}/greenplum_path.sh 2>/dev/null
+      export PGPORT={{ whpg_coordinator_port }}
+      psql -d postgres -At -v u="{{ wem_whpg_user }}" -v rg="{{ wem_whpg_resource_group }}" -v dbs="{{ _dbs | join(',') }}" <<'SQL'
+      SELECT 'database: ' || datname FROM pg_database WHERE datname = ANY (string_to_array(:'dbs', ','));
+      SELECT 'role: ' || rolname FROM pg_roles WHERE rolname = :'u';
+      SELECT 'resource group: ' || rsgname FROM pg_resgroup WHERE rsgname = :'rg';
+      SQL
+    executable: /bin/bash
+  vars:
+    _dbs: "{{ (wem_remove_databases + [wem_whpg_database]) | select | unique | reject('in', wem_protected_databases) | list }}"
+  become_user: "{{ gpadmin_user }}"
+  register: _verify_db
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == coordinator_host
+
+- name: Show verification
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ _verify.stdout_lines + (['[whpg]'] + _verify_db.stdout_lines if _verify_db.stdout_lines is defined else []) }}"

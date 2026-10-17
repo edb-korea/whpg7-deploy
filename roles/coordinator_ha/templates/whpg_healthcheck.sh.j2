@@ -3,5 +3,5 @@
 source {{ whpg_install_dir }}/greenplum_path.sh
 export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
 
-psql -h 127.0.0.1 -p 5432 -U {{ gpadmin_user }} -d gpadmin -c "SELECT 1" -q -t 2>/dev/null | grep -q 1
+psql -h {{ ha_healthcheck_host }} -p {{ whpg_coordinator_port }} -U {{ gpadmin_user }} -d {{ whpg_database }} -c "SELECT 1" -q -t 2>/dev/null | grep -q 1
 exit $?

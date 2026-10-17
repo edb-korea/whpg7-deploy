@@ -2,16 +2,18 @@
 # 호스트명 및 IP를 환경에 맞게 수정하세요
 
 [coordinator]
-cdw ansible_host=192.168.10.10
+cdw ansible_host=10.0.15.112
 
 [standby_coordinator]
-scdw ansible_host=192.168.10.11
+scdw ansible_host=10.0.8.209
 
+# segment 호스트는 4대(whpg_mirror_group_size) 단위로 적는다. 적힌 순서대로 4대씩 mirror 그룹이 된다.
+# 증설 시 기존 순서는 그대로 두고 끝에 4대씩 추가한다.
 [segments]
-sdw1 ansible_host=192.168.10.21
-sdw2 ansible_host=192.168.10.22
-sdw3 ansible_host=192.168.10.23
-sdw4 ansible_host=192.168.10.24
+sdw1 ansible_host=10.0.3.219
+sdw2 ansible_host=10.0.14.73
+#sdw3 ansible_host=192.168.10.23
+#sdw4 ansible_host=192.168.10.24
 
 [whpg_cluster:children]
 coordinator

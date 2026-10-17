@@ -1,27 +1,316 @@
 ---
-wem_enabled: true
+# =============================================================================
+# wem role 변수 (WEM 1.4: ClickHouse + Host Agent + otelcol). 단계별로 구역을 나눠 두었다.
+# 참고: https://github.com/edb-korea/wem_ansible (roles/warehouse-pg-wem)
+#
+# 값을 바꾸는 방법 (우선순위가 높은 순)
+#   1) 실행할 때:  ansible-playbook playbooks/07_wem.yml -e wem_port=8090
+#   2) inventory/whpg_cluster.yml 에 같은 이름으로 추가
+#   3) 비밀번호는 inventory/vault.yml 의 vault_* 변수
+# =============================================================================
 
-# EDB 구독 토큰 (EDB 계정에서 발급)
-edb_subscription_token: ""   # vault로 관리 권장: {{ vault_edb_subscription_token }}
-edb_repo: "gpsupp"
+# ----------------------------------------------------------------------------
+# 공통 (모든 단계에서 사용)
+# ----------------------------------------------------------------------------
+# ---- 배치 (inventory 그룹 기준으로 자동 계산, 보통 수정하지 않음) -------
+#   coordinator_host : coordinator 그룹의 첫 호스트       (inventory/whpg_cluster.yml)
+#   wem_host         : wem_node 그룹의 첫 호스트          (inventory/whpg_cluster.yml, 기본 standby)
+#                      WEM / ClickHouse / (선택) 상태 DB 를 설치
+_standby_hosts: "{{ groups['standby_coordinator'] | default([]) }}"
+coordinator_ip: "{{ hostvars[coordinator_host].ansible_host }}"
+wem_host_ip: "{{ hostvars[wem_host].ansible_host }}"
+# 노드 역할 (메시지 / config_local.yaml 주석용)
+_whpg_role: >-
+  {{ 'coordinator' if inventory_hostname in groups['coordinator']
+     else ('standby' if inventory_hostname in groups['standby_coordinator'] else 'segment') }}
+# coordinator VIP (coordinator_ha 의 coordinator_vip, "/24" 가 붙어 있으면 뗌. 없으면 빈 값)
+vip_addr: "{{ (coordinator_vip | default('')) | regex_replace('/.*$', '') }}"
+# VIP 가 coordinator 에 실제로 올라와 있으면 VIP, 아니면 coordinator IP
+standby_db_host: "{{ vip_addr if (vip_addr | length > 0 and (hostvars[coordinator_host]['_vip_active'] | default(false) | bool)) else coordinator_ip }}"
 
-# WEM 대시보드 (scdw)
-wem_portal_port: 8080
+# ---- DB 메트릭(sqlquery) 수집 위치 (가이드 "주의 2": coordinator failover 대비) ----------
+# wem_sqlquery_on_standby
+#   true(기본): standby 가 있으면 sqlquery/whpg 를 coordinator 의 otelcol 에서 빼고 standby 의 otelcol 로 옮긴다
+#               (2-1 whpg_db_metrics.yaml 복사, 2-2 coordinator 에서 제거, 2-3 standby 에 추가). standby 가 없으면 그대로
+#   false     : coordinator 의 otelcol 이 127.0.0.1 로 접속 (WEM 이 배포한 그대로)
+wem_sqlquery_on_standby: true
+# wem_use_vip (기본: coordinator_ha_enabled 와 같은 값)
+#   true : WEM 이 coordinator_vip 로 WHPG 에 접속 (failover 후 승격된 standby 로 자동 연결)
+#            - wem.conf 의 WHPG_HOST, WEM_HOST(상태 DB 를 WHPG 에 둘 때)
+#            - standby otelcol 의 DB 메트릭(sqlquery) 수집
+#          VIP 가 coordinator 에 실제로 올라와 있어야 하며, 아니면 시작 전에 중단된다
+#          (site.yml 은 Phase 6 HA 구성 후 Phase 7 에서 WEM 을 설치)
+#   false: coordinator 실 IP 로 접속
+wem_use_vip: "{{ coordinator_ha_enabled | default(false) | bool }}"
+
+# ---- WHPG (모니터링 대상) ------------------------------------------------------
+# WEM 이 접속하는 WHPG 주소 (wem_use_vip 면 VIP, 아니면 coordinator 실 IP)
+wem_whpg_host: "{{ vip_addr if (wem_use_vip | bool) else coordinator_ip }}"
+wem_whpg_port: "{{ whpg_coordinator_port }}"
+# Host Agent 의 WEM_DATABASE 와 같은 값이어야 한다
+wem_whpg_database: "{{ whpg_database }}"
+wem_whpg_user: "wemon"
+wem_whpg_password: "{{ vault_wem_whpg_password | default('changeme') }}"
+# true: coordinator 에 wem_whpg_user 계정과 그 계정 소유의 wem_whpg_database 를 만든다 [05-state-database]
+#   기본값은 wem_state_install 의 반대 (상태 DB 를 설치하지 않을 때 생성)
+wem_whpg_create: "{{ not (wem_state_install | bool) }}"
+# wem_whpg_user 를 superuser 로 만든다 (WEM 이 WHPG 모니터링에 superuser 권한을 요구)
+wem_whpg_user_superuser: true
+# wem_whpg_user 에 지정할 resource group (없으면 만든다). 비워두면 resource group 을 건드리지 않는다
+#   gp_resource_manager 가 group / group-v2 일 때만 적용 (queue 면 건너뜀)
+wem_whpg_resource_group: "wem_group"
+# resource group 설정 (CREATE RESOURCE GROUP ... WITH (...) 의 항목. 이미 있으면 값이 다른 항목만 ALTER)
+#   CONCURRENCY 0-1000, CPU_MAX_PERCENT -1 또는 1-100 (CPUSET 과 함께 쓸 수 없음), CPU_WEIGHT 1-500,
+#   MEMORY_QUOTA -1 또는 MB, MIN_COST >= 0, IO_LIMIT "<tablespace>:rbps=<MB/s>,wbps=<MB/s>" (문자열은 자동으로 따옴표 처리)
+wem_whpg_resource_group_options:
+  CONCURRENCY: 20
+  CPU_MAX_PERCENT: 10
+  CPU_WEIGHT: 100
+  MEMORY_QUOTA: -1
+
+# ---- WEM 상태 DB (WEM host 의 별도 PostgreSQL) -------------------------------
+# false 로 두면 상태 DB 를 설치하지 않는다 (직접 준비한 DB 를 wem_state_* 로 지정)
+wem_state_install: false
+# wem_state_install=true 면 WEM host 의 로컬 PostgreSQL, false 면 WHPG 의 상태 DB (wem_whpg_host = VIP 또는 coordinator 실 IP)
+wem_state_host: "{{ '127.0.0.1' if (wem_state_install | bool) else wem_whpg_host }}"
+# wem_state_install=true 면 5433 (WEM host 의 WHPG 5432 와 겹치지 않게), false 면 5432 (기존 WHPG)
+wem_state_port: "{{ 5433 if (wem_state_install | bool) else 5432 }}"
+wem_state_database: "wem"
+wem_state_user: "wemon"
+wem_state_password: "{{ vault_wem_state_password | default(wem_whpg_password) }}"
+wem_state_data_dir: "/var/lib/pgsql/data"
+# 상태 DB systemd 서비스 이름 (wem_state_install=true 일 때 등록)
+wem_state_service: "postgresql-wem14"
+
+# ---- ClickHouse -----------------------------------------------------------------
+clickhouse_user: "default"
+clickhouse_password: "{{ vault_clickhouse_password | default('changeme') }}"
+clickhouse_native_port: 9000
+# 비워두면 기본 경로(/var/lib/clickhouse). 지정하면 data-path.xml / log-path.xml 을 만든다
+clickhouse_data_dir: ""
+clickhouse_log_dir: ""
+
+# ---- WEM ------------------------------------------------------------------------
+wem_port: 8080
+# Host Agent 가 접속하는 포트 (WEM 포트 + 1)
+wem_agent_port: "{{ wem_port | int + 1 }}"
 wem_admin_password: "{{ vault_wem_admin_password | default('changeme_wem') }}"
 
-# WEM이 연결할 WHPG 클러스터 정보
-wem_whpg_host: "{{ coordinator_host }}"
-wem_whpg_port: 5432
-wem_whpg_database: "gpadmin"
-wem_whpg_user: "gpadmin"
-wem_whpg_password: "{{ vault_gpadmin_password | default('changeme') }}"
 
-# Prometheus / Loki 엔드포인트
-# (사전에 별도 설치된 Prometheus/Loki 주소를 지정)
-prometheus_url: "http://{{ hostvars[groups['standby_coordinator'][0]]['ansible_host'] }}:9090"
-loki_url: "http://{{ hostvars[groups['standby_coordinator'][0]]['ansible_host'] }}:3100"
-prometheus_remote_write_url: "{{ prometheus_url }}/api/v1/write"
-loki_push_url: "{{ loki_url }}/loki/api/v1/push"
+# ----------------------------------------------------------------------------
+# WEM 1.2 삭제  [01-cleanup-wem12]
+# ----------------------------------------------------------------------------
+# 아래 cleanup_packages 중 하나라도 설치되어 있으면(whpg-enterprise-manager 는 wem_version 이 아닐 때) 실행한다.
+# 새로 설치하는 환경이나 이미 1.4 로 전환된 환경에서는 아무것도 지우지 않는다.
+#   always : 감지와 관계없이 실행 / never : 실행하지 않음 / auto(기본) : 감지된 경우만
+wem_cleanup_legacy: auto
 
-# WEM Collector (alloy)
-wem_collector_install_all: true
+# 1.2 상태 DB(WHPG 의 wem DB) 삭제 여부. 운영 데이터가 있으면 false 로 두거나 먼저 백업한다
+wem_drop_old_state_db_in_whpg: true
+
+# 어떤 경우에도 DROP 하지 않는 WHPG 데이터베이스 (wem_whpg_database / wem_state_database 를 이 이름으로 지정해도 보호)
+wem_protected_databases: "{{ ['postgres', 'template0', 'template1', gpadmin_user, whpg_database] | select | unique | list }}"
+
+cleanup_services:
+  - wem
+  - prometheus
+  - alertmanager
+  - loki
+  - alloy
+cleanup_packages:
+  - whpg-enterprise-manager
+  - prometheus
+  - alertmanager
+  - loki
+  - alloy
+  - edb-whpg-observability-collector
+  - edb-whpg7-observability-suite
+# 모든 노드에서 삭제하는 경로
+cleanup_paths_all_hosts:
+  - /etc/alloy
+  - /var/lib/alloy
+  - /var/lib/whpg-observability-collector
+# WEM host 에서만 삭제하는 경로
+cleanup_paths_wem_host:
+  - /etc/wem
+  - /var/log/wem
+  - /etc/prometheus
+  - /var/lib/prometheus
+  - /usr/local/prometheus
+  - /usr/local/bin/prometheus
+  - /usr/local/bin/promtool
+  - /data1/prometheus
+  - /etc/alertmanager
+  - /var/lib/alertmanager
+  - /etc/loki
+  - /var/lib/loki
+  - /data1/loki
+  - /usr/local/bin/loki
+  - /etc/systemd/system/prometheus.service
+  - /etc/systemd/system/alertmanager.service
+  - /etc/systemd/system/loki.service
+  - /etc/systemd/system/wem.service.d
+cleanup_users:
+  - prometheus
+  - alertmanager
+  - loki
+
+
+# ----------------------------------------------------------------------------
+# WHPG pg_hba.conf  [03-pg-hba]
+# ----------------------------------------------------------------------------
+# true: coordinator / standby 의 pg_hba.conf 에 클러스터 노드 접속 허용 블록을 추가하고 gpstop -u 로 반영
+wem_manage_pg_hba: true
+
+
+# ----------------------------------------------------------------------------
+# ClickHouse 패키지  [04-clickhouse]
+# ----------------------------------------------------------------------------
+# rpm_install role 로 순서대로 설치 (Controller local_rpm_dir 우선 → dnf). 의존성 순서 유지
+clickhouse_packages:
+  - edb-clickhouse-common-static
+  - edb-clickhouse-server
+  - edb-clickhouse-client
+
+
+# ----------------------------------------------------------------------------
+# WEM 1.4 설치  [06-wem]
+# ----------------------------------------------------------------------------
+# WEM 패키지 (버전 고정. local_rpm_dir 에 여러 버전이 있어도 이 버전을 설치)
+wem_pkg_name: "whpg-enterprise-manager"
+wem_version: "1.4.0"
+wem_config_file: "/etc/wem/wem.conf"
+# wem.conf 의 그룹 (WEM 서비스가 읽을 수 있어야 함)
+wem_unix_group: "{{ gpadmin_user }}"
+
+# 웹 포털을 HTTPS 로 제공하지 않으므로 쿠키 허용 (HTTP 테스트 환경 전용).
+# 공식 설정 참조에 웹 포털 HTTPS 파라미터가 없어 HTTPS 는 구성하지 않는다.
+wem_insecure_cookies: "1"
+# 대규모 환경이면 "true" (wem.conf 의 HIGH_LOAD_MODE)
+wem_high_load_mode: ""
+# 외부(Prometheus 등)에 메트릭을 노출하는 주소
+wem_otel_prometheus_scrape_endpoint: "0.0.0.0:8889"
+# wem.conf 에 그대로 추가할 줄 (예: ["LOG_SCAN_ENABLED=false", "WEM_CLUSTER_NAME=whpg"])
+wem_extra_conf_lines: []
+
+# firewalld 가 실행 중이면 WEM host 의 WEM / Agent / ClickHouse 포트를 연다
+wem_manage_firewall: true
+
+
+# ----------------------------------------------------------------------------
+# Host Agent / otelcol 설치  [07-host-agent]
+# ----------------------------------------------------------------------------
+# Host Agent / otelcol 패키지. 버전을 고정하려면 *_version 지정 (예: "1.1.0", "0.158.0"), 비우면 최신
+host_agent_package: "edb-acp-host-agent"
+host_agent_version: ""
+otelcol_package: "edb-otelcol"
+otelcol_version: ""
+
+host_agent_conf: "/etc/edb/acp-host-agent/acp-host-agent.conf"
+host_agent_join_token_file: "/etc/edb/acp-host-agent/join-token"
+# acp-host-agent 서비스 계정 (서비스가 join-token 을 이 계정 소유 0600 으로 만들고 이 계정으로 읽는다)
+host_agent_user: "acp-host-agent"
+
+
+# ----------------------------------------------------------------------------
+# otelcol 설정 조정  [08-otelcol-tune]
+# ----------------------------------------------------------------------------
+# WEM 이 배포하는 설정 (acp-host-agent 재시작 시 다시 렌더링되므로 직접 수정하지 않는다)
+otelcol_config: "/etc/edb/otelcol/config.yaml"
+# 조정 값을 넣는 override 파일 (config.yaml 위에 덮어씀)
+otelcol_local_config: "/etc/edb/otelcol/config_local.yaml"
+# edb-otelcol 서비스의 EnvironmentFile (OTELCOL_OPTIONS 에 override 파일을 추가)
+otelcol_options_file: "/etc/edb/otelcol/edb-otelcol.conf"
+otelcol_bin: "/usr/edb/otelcol/bin/edb-otelcol"
+otelcol_checkpoint_dir: "/var/lib/edb/otelcol/checkpoint"
+# true: 08 단계에서 otelcol 을 재시작할 때 checkpoint 를 초기화한다 (로그 읽기 위치를 버림).
+#   config_local.yaml 을 agent 시작 전에 넣어 처음부터 start_at: end 로 동작하므로 보통 필요 없다
+otelcol_reset_checkpoint: false
+# sqlquery/whpg 처리: add(standby 에 추가) / remove(coordinator 에서 제거) / keep(그대로)
+#   wem_sqlquery_on_standby(또는 wem_use_vip)가 true 이고 standby 가 있을 때만 add / remove
+_otel_sqlquery_move: "{{ (wem_sqlquery_on_standby | bool or wem_use_vip | bool) and (_standby_hosts | length > 0) }}"
+_otel_sqlquery_mode: >-
+  {{ ('remove' if inventory_hostname == coordinator_host else ('add' if inventory_hostname == (_standby_hosts | first) else 'keep'))
+     if (_otel_sqlquery_move | bool) else 'keep' }}
+# WEM 이 otelcol 설정을 배포할 때까지 기다리는 최대 시간(초)
+agent_approval_wait_seconds: 240
+
+# CPU 사용량 절감 튜닝 값
+otelcol_batch_send_batch_size: 8192
+otelcol_batch_send_batch_max_size: 16384
+otelcol_batch_timeout: "5s"
+otelcol_filelog_poll_interval: "1s"
+
+# standby 의 sqlquery/whpg (가이드 주의 2-3). 쿼리 정의는 coordinator 에서 복사한다 (주의 2-1)
+#   접속 계정은 wem_whpg_user / wem_whpg_password / wem_whpg_database / wem_whpg_port
+otelcol_whpg_queries_file: "/etc/edb/otelcol/whpg_db_metrics.yaml"
+# 접속 주소: wem_use_vip=true 면 VIP, 아니면 coordinator 실 IP
+otelcol_sqlquery_host: "{{ wem_whpg_host }}"
+otelcol_sqlquery_collection_interval: "30s"
+otelcol_sqlquery_sslmode: "prefer"
+
+
+# ----------------------------------------------------------------------------
+# Coordinator Query Logs  [09-query-logs]
+# ----------------------------------------------------------------------------
+# Coordinator Query Logs 객체(ClickHouse 상태 테이블, MV, View) 생성 여부
+coordinator_query_logs_enabled: true
+# true: 기존 객체를 삭제(DROP)하고 다시 생성. 수집된 데이터도 함께 삭제된다
+coordinator_query_logs_recreate: false
+# 상태 테이블 TTL(일)
+coordinator_query_logs_ttl_days: 90
+# acp_observability.otel_logs 테이블이 생길 때까지 기다리는 최대 시간(초).
+# 초과하면 건너뛴다 (-t querylogs 로 다시 실행)
+coordinator_query_logs_wait_seconds: 300
+
+
+# ----------------------------------------------------------------------------
+# WEM 1.4 삭제  [remove-wem14] (playbooks/ops/remove_wem.yml)
+# ----------------------------------------------------------------------------
+# WEM 1.4 삭제 (테스트 초기화용). 설치된 whpg-enterprise-manager 버전이 이 값으로 시작할 때만 패키지를 삭제한다
+#   ""  : 버전과 관계없이 삭제 (기본)
+#   "1.4": 1.4 일 때만 삭제 (1.2 가 설치되어 있으면 건드리지 않는다)
+wem_remove_version_prefix: ""
+# true: 삭제한 패키지와 함께 설치되었고 더 이상 쓰이지 않는 의존 패키지도 삭제 (dnf autoremove)
+wem_remove_autoremove: true
+
+# WHPG 에서 소유자와 관계없이 지우는 WEM 데이터베이스 (WEM 상태 DB 등. 접속 중인 세션은 끊고 지운다)
+#   wem_protected_databases 에 있는 이름은 여기에 있어도 지우지 않는다.
+#   wem_whpg_database 는 여기에 없어도 wem_whpg_user 소유일 때만 지운다.
+wem_remove_databases: ["{{ wem_state_database }}"]
+
+# WHPG 쪽 정리
+wem_remove_pg_hba_block: true
+wem_drop_whpg_roles: true
+wem_whpg_roles: ["wem", "wemadmin"]
+
+remove_services:
+  - clickhouse-server
+  - "{{ wem_state_service }}"
+  - edb-otelcol
+  - acp-host-agent
+remove_packages:
+  - edb-acp-host-agent
+  - edb-otelcol
+  - edb-clickhouse-server
+  - edb-clickhouse-client
+  - edb-clickhouse-common-static
+# 모든 노드에서 삭제하는 경로 (/etc/edb/pgaa 는 삭제하지 않는다)
+remove_paths_all_hosts:
+  - /etc/edb/acp-host-agent
+  - /etc/edb/otelcol
+  - /var/lib/edb/acp-host-agent
+  - /var/lib/edb/otelcol
+  - /var/log/edb/acp-host-agent
+  - /var/log/edb/otelcol
+# WEM host 에서만 삭제하는 경로
+remove_paths_wem_host:
+  - /var/lib/edb/wem
+  - /etc/clickhouse-server
+  - /var/lib/clickhouse
+  - /var/log/clickhouse-server
+  - /etc/sysctl.d/99-clickhouse.conf
+# WEM 1.4 패키지를 삭제하는 경우에만 같이 삭제하는 경로
+remove_paths_wem14_only:
+  - /etc/wem
+  - /var/log/wem

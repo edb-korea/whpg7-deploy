@@ -1,9 +1,22 @@
 ---
-pgbouncer_enabled: true
-pgbouncer_listen_port: 5433
-pgbouncer_max_client_conn: 5000
-pgbouncer_default_pool_size: 200
-pgbouncer_pool_mode: transaction
-pgbouncer_admin_users: "gpadmin"
-pgbouncer_target_db: "gpadmin"
-pgbouncer_target_port: 5432
+# pgbouncer role 기본값
+# 포트/풀 크기 등 주요 값은 inventory/whpg_cluster.yml 참고
+
+pgbouncer_service_name: pgbouncer
+pgbouncer_bin: /usr/bin/pgbouncer
+pgbouncer_conf_dir: /etc/pgbouncer
+pgbouncer_conf_file: "{{ pgbouncer_conf_dir }}/pgbouncer.ini"
+pgbouncer_auth_file: "{{ pgbouncer_conf_dir }}/userlist.txt"
+pgbouncer_log_dir: /var/log/pgbouncer
+pgbouncer_run_dir: /var/run/pgbouncer
+
+pgbouncer_listen_addr: "0.0.0.0"
+pgbouncer_auth_type: md5
+pgbouncer_target_host: "127.0.0.1"
+pgbouncer_min_pool_size: 10
+pgbouncer_reserve_pool_size: 50
+pgbouncer_reserve_pool_timeout: 5
+pgbouncer_server_idle_timeout: 600
+pgbouncer_client_idle_timeout: 0
+pgbouncer_server_reset_query: "DISCARD ALL"
+pgbouncer_ignore_startup_parameters: extra_float_digits

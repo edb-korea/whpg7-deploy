@@ -1,0 +1,44 @@
+---
+# ======================================================
+# Controller 의 local_rpm_dir 에서 설치할 RPM 1개 선택
+#  - 파일명 접두어가 아닌 RPM 내부 패키지명(%{NAME})이 rpm_pkg_name 과 정확히 일치하는 것만 대상
+#    (예: whpg-backup ↔ whpg-backup-ddboost-plugin, warehouse-pg-7 ↔ warehouse-pg-7-clients 구분)
+#  - 여러 개면 버전 비교(sort -V)로 최신 선택 (1.9.1 < 1.11.0)
+#  - rpm_pkg_version 지정 시 해당 버전만 대상 (예: "7.5.0" → 7.5.0_WHPG-1 일치, 7.5.01 불일치)
+#
+# 결과: _rpm_selected = 선택된 RPM 전체 경로 (없으면 '')
+#
+# 단독 사용:
+#   - ansible.builtin.include_role:
+#       name: rpm_install
+#       tasks_from: select
+#     vars:
+#       rpm_pkg_name: warehouse-pg-7
+# ======================================================
+
+- name: "{{ rpm_pkg_name }} - Controller 로컬 RPM 선택 ({{ local_rpm_dir }})"
+  ansible.builtin.shell:
+    cmd: |
+      shopt -s nullglob
+      for f in "$RPM_DIR"/"$RPM_NAME"*.rpm; do
+        read -r n v r < <(rpm -qp --nosignature --qf '%{NAME} %{VERSION} %{RELEASE}\n' "$f" 2>/dev/null) || continue
+        [ "$n" = "$RPM_NAME" ] || continue
+        if [ -n "$RPM_VER" ]; then
+          [[ "$v" =~ ^${RPM_VER//./\\.}([^0-9]|$) ]] || continue
+        fi
+        printf '%s-%s\t%s\n' "$v" "$r" "$f"
+      done | sort -t $'\t' -k1,1 -V | tail -n 1 | cut -f2
+    executable: /bin/bash
+  environment:
+    RPM_DIR: "{{ local_rpm_dir }}"
+    RPM_NAME: "{{ rpm_pkg_name }}"
+    RPM_VER: "{{ rpm_pkg_version | default('') }}"
+  delegate_to: localhost
+  become: false
+  register: _rpm_select
+  changed_when: false
+  check_mode: false
+
+- name: "{{ rpm_pkg_name }} - 선택 결과 저장"
+  ansible.builtin.set_fact:
+    _rpm_selected: "{{ _rpm_select.stdout | trim }}"

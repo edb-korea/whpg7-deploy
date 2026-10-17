@@ -2,74 +2,50 @@
 # ======================================================
 # WarehousePG Extension 업그레이드 플레이북
 #
+# 업그레이드 대상은 inventory/whpg_cluster.yml 의 whpg_extension_catalog 를 기준으로 결정됩니다.
+#
 # 사용법:
-#   # 설치된 모든 extension 업그레이드
+#   # 설치 플래그(install_*: true)가 켜진 모든 extension 업그레이드
 #   ansible-playbook playbooks/upgrade/upgrade_extensions.yml \
 #     -e "local_rpm_dir=/opt/whpg-rpms"
 #
-#   # 특정 extension만 업그레이드
+#   # 특정 extension만 업그레이드 (카탈로그 name 또는 패키지명)
 #   ansible-playbook playbooks/upgrade/upgrade_extensions.yml \
 #     -e "local_rpm_dir=/opt/whpg-rpms" \
 #     -e "upgrade_target=pgaudit"
 #
-#   # 업그레이드 대상 목록 지정
+#   # 업그레이드 대상 목록 지정 (카탈로그 name 또는 패키지명 혼용 가능)
 #   ansible-playbook playbooks/upgrade/upgrade_extensions.yml \
 #     -e "local_rpm_dir=/opt/whpg-rpms" \
-#     -e '{"upgrade_targets":["edb-whpg7-pgaudit","edb-whpg7-postgis"]}'
+#     -e '{"upgrade_targets":["pgaudit","edb-whpg7-postgis"]}'
 #
 # 주의:
 #   - WHPG를 정지하지 않고 RPM만 교체 후 ALTER EXTENSION UPDATE 실행
 #   - shared_preload_libraries 변경이 필요한 경우 gpstop -ra 필요
 # ======================================================
 
-# -------- 업그레이드 대상 패키지 목록 정의 --------
+# -------- RPM 업그레이드 (모든 노드) --------
 - name: "Extension Upgrade - 대상 목록 구성 및 업그레이드"
   hosts: whpg_cluster
   become: true
   vars:
-    # upgrade_targets가 지정되면 해당 패키지만, 없으면 전체 설치된 edb-whpg7-* 업그레이드
-    _default_ext_pkgs:
-      - { pkg: "edb-whpg7-pxf",              when_var: "install_pxf" }
-      - { pkg: "edb-whpg7-pgaudit",           when_var: "install_pgaudit" }
-      - { pkg: "edb-whpg7-user_profile",      when_var: "install_user_profile" }
-      - { pkg: "edb-whpg7-anonymizer",        when_var: "install_anonymizer" }
-      - { pkg: "edb-whpg7-whpg_fdw",          when_var: "install_whpg_fdw" }
-      - { pkg: "edb-whpg7-diskquota",         when_var: "install_diskquota" }
-      - { pkg: "edb-whpg7-python3-ds-pkgs",   when_var: "install_datascience_python" }
-      - { pkg: "edb-whpg7-madlib",            when_var: "install_madlib" }
-      - { pkg: "edb-whpg7-plr",               when_var: "install_plr" }
-      - { pkg: "edb-whpg7-pljava",            when_var: "install_pljava" }
-      - { pkg: "whpg-backup",                  when_var: "install_whpg_backup" }
-      - { pkg: "edb-whpg7-postgis",           when_var: "install_postgis" }
-      - { pkg: "edb-whpg7-hll",               when_var: "install_hll" }
-      - { pkg: "edb-whpg7-q3c",               when_var: "install_q3c" }
-      - { pkg: "edb-whpg7-pgsphere",          when_var: "install_pgsphere" }
-      - { pkg: "edb-whpg7-pgvector",          when_var: "install_pgvector" }
-      - { pkg: "edb-whpg7-pgfs",              when_var: "install_pgfs" }
-      - { pkg: "edb-whpg7-pgaa",              when_var: "install_pgaa" }
-      - { pkg: "whpg7-flow-server",            when_var: "install_flowserver" }
-
+    _targets: "{{ upgrade_targets | default([upgrade_target] if upgrade_target is defined else []) }}"
+    _catalog_ids: >-
+      {{ whpg_extension_catalog | map(attribute='name') | list
+         + whpg_extension_catalog | map(attribute='pkg') | list }}
+    # 대상 미지정: 활성화된 extension 전체 / 지정: name 또는 pkg 가 일치하는 항목
+    _upgrade_exts: >-
+      {{ whpg_extension_catalog | selectattr('enabled') | list
+         if _targets | length == 0 else
+         (whpg_extension_catalog | selectattr('name', 'in', _targets) | list
+          + whpg_extension_catalog | selectattr('pkg', 'in', _targets) | list) | unique | list }}
   tasks:
-    - name: 로컬 RPM 디렉토리 내 파일 목록 수집
-      ansible.builtin.find:
-        paths: "{{ local_rpm_dir | default('/opt/whpg-rpms') }}"
-        patterns: "*.rpm"
-        recurse: false
-      register: _local_rpm_all
-      ignore_errors: true
-
-    - name: 로컬 RPM 파일명 목록 생성 (basename)
-      ansible.builtin.set_fact:
-        _local_rpm_basenames: "{{ _local_rpm_all.files | map(attribute='path') | map('basename') | list }}"
-
     - name: 업그레이드 대상 패키지 목록 결정
       ansible.builtin.set_fact:
+        # 카탈로그에 없는 이름은 패키지명으로 간주하여 그대로 업그레이드
         _upgrade_pkg_list: >-
-          {{ upgrade_targets
-             if upgrade_targets is defined
-             else (_default_ext_pkgs
-                   | selectattr('when_var', 'in', hostvars[inventory_hostname] | dict2items | selectattr('value', 'equalto', true) | map(attribute='key') | list)
-                   | map(attribute='pkg') | list) }}
+          {{ (_upgrade_exts | map(attribute='pkg') | list
+              + _targets | reject('in', _catalog_ids) | list) | unique | list }}
 
     - name: 업그레이드 대상 패키지 출력
       ansible.builtin.debug:
@@ -77,8 +53,13 @@
       run_once: true
 
     # 각 패키지: 로컬 RPM 우선, 없으면 dnf latest
-    - name: 패키지별 로컬 RPM 탐색 및 업그레이드
-      ansible.builtin.include_tasks: _upgrade_single_pkg.yml
+    - name: 패키지별 로컬 RPM 탐색 및 업그레이드 (rpm_install role, state=latest)
+      ansible.builtin.include_role:
+        name: rpm_install
+      vars:
+        rpm_pkg_name: "{{ _pkg_name }}"
+        rpm_install_state: latest
+        rpm_ignore_dnf_errors: true     # 레포에 없는 패키지가 있어도 나머지는 계속 진행
       loop: "{{ _upgrade_pkg_list }}"
       loop_control:
         loop_var: _pkg_name
@@ -88,32 +69,27 @@
   hosts: coordinator
   become: true
   vars:
-    # CREATE EXTENSION 이 있는 패키지들만 ALTER 대상
-    _alter_ext_map:
-      edb-whpg7-pgaudit:       pgaudit
-      edb-whpg7-anonymizer:    anon
-      edb-whpg7-whpg_fdw:      whpg_fdw
-      edb-whpg7-postgis:       postgis
-      edb-whpg7-hll:           hll
-      edb-whpg7-q3c:           q3c
-      edb-whpg7-pgsphere:      pgsphere
-      edb-whpg7-pgvector:      vector
-      edb-whpg7-pgaa:          pgaa
-      edb-whpg7-plr:           plr
-      edb-whpg7-pljava:        pljava
+    _targets: "{{ upgrade_targets | default([upgrade_target] if upgrade_target is defined else []) }}"
+    # CREATE EXTENSION 이 있는 항목(sql_ext)만 ALTER 대상
+    _alter_exts: >-
+      {{ (whpg_extension_catalog | selectattr('enabled') | list
+          if _targets | length == 0 else
+          (whpg_extension_catalog | selectattr('name', 'in', _targets) | list
+           + whpg_extension_catalog | selectattr('pkg', 'in', _targets) | list) | unique | list)
+         | selectattr('sql_ext', 'defined') | list }}
   tasks:
     - name: 업그레이드된 extension DB 내 버전 갱신 (ALTER EXTENSION UPDATE)
       ansible.builtin.shell:
         cmd: >
           source {{ whpg_install_dir }}/greenplum_path.sh &&
-          psql -d gpadmin -c
-          "ALTER EXTENSION {{ item.value }} UPDATE;" 2>&1 || true
+          psql -d {{ whpg_database }} -c
+          "ALTER EXTENSION {{ item.sql_ext }} UPDATE;" 2>&1 || true
       become: true
       become_user: "{{ gpadmin_user }}"
-      loop: "{{ _alter_ext_map | dict2items }}"
-      when: >
-        upgrade_targets is not defined or
-        item.key in (upgrade_targets | default([]))
+      environment: "{{ whpg_env }}"
+      loop: "{{ _alter_exts }}"
+      loop_control:
+        label: "{{ item.sql_ext }}"
       changed_when: true
       ignore_errors: true
 
@@ -121,13 +97,14 @@
       ansible.builtin.shell:
         cmd: >
           source {{ whpg_install_dir }}/greenplum_path.sh &&
-          psql -d gpadmin -c
+          psql -d {{ whpg_database }} -c
           "SELECT name, default_version, installed_version
            FROM pg_available_extensions
            WHERE installed_version IS NOT NULL
            ORDER BY name;" 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
       register: ext_versions
       changed_when: false
 

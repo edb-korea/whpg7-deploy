@@ -6,10 +6,10 @@ After=network.target
 User={{ gpadmin_user }}
 Group={{ gpadmin_group }}
 Type=forking
-PIDFile=/var/run/pgbouncer/pgbouncer.pid
-ExecStartPre=/bin/mkdir -p /var/run/pgbouncer /var/log/pgbouncer
-ExecStartPre=/bin/chown {{ gpadmin_user }}:{{ gpadmin_group }} /var/run/pgbouncer /var/log/pgbouncer
-ExecStart=/usr/bin/pgbouncer -d /etc/pgbouncer/pgbouncer.ini
+PIDFile={{ pgbouncer_run_dir }}/pgbouncer.pid
+ExecStartPre=/bin/mkdir -p {{ pgbouncer_run_dir }} {{ pgbouncer_log_dir }}
+ExecStartPre=/bin/chown {{ gpadmin_user }}:{{ gpadmin_group }} {{ pgbouncer_run_dir }} {{ pgbouncer_log_dir }}
+ExecStart={{ pgbouncer_bin }} -d {{ pgbouncer_conf_file }}
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 

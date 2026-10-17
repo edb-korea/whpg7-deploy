@@ -16,8 +16,7 @@
           gpstate -s 2>&1 | head -30
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: pre_upgrade_state
       changed_when: false
 
@@ -32,29 +31,34 @@
           gpstop -af 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       changed_when: true
 
 - name: WHPG 마이너 업그레이드 - 새 RPM 설치
   hosts: whpg_cluster
   become: true
   tasks:
+    - name: 임시 디렉토리 생성
+      ansible.builtin.file:
+        path: "{{ rpm_remote_tmp_dir }}"
+        state: directory
+        mode: '0755'
+
     - name: 새 RPM 복사
       ansible.builtin.copy:
         src: "{{ new_rpm }}"
-        dest: "/tmp/{{ new_rpm | basename }}"
+        dest: "{{ rpm_remote_tmp_dir }}/{{ new_rpm | basename }}"
         mode: '0644'
 
     - name: 새 RPM 설치 (업그레이드)
       ansible.builtin.yum:
-        name: "/tmp/{{ new_rpm | basename }}"
+        name: "{{ rpm_remote_tmp_dir }}/{{ new_rpm | basename }}"
         state: present
-        disable_gpg_check: true
+        disable_gpg_check: "{{ rpm_disable_gpg_check }}"
 
     - name: 임시 파일 제거
       ansible.builtin.file:
-        path: "/tmp/{{ new_rpm | basename }}"
+        path: "{{ rpm_remote_tmp_dir }}/{{ new_rpm | basename }}"
         state: absent
 
 - name: WHPG 마이너 업그레이드 - 클러스터 재시작
@@ -68,8 +72,7 @@
           gpstart -a 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: gpstart_result
       changed_when: true
 
@@ -77,9 +80,10 @@
       ansible.builtin.shell:
         cmd: >
           source {{ whpg_install_dir }}/greenplum_path.sh &&
-          psql -d gpadmin -c "SELECT version();" 2>&1
+          psql -d {{ whpg_database }} -c "SELECT version();" 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
       register: version_check
       changed_when: false
 

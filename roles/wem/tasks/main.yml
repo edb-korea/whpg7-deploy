@@ -1,225 +1,54 @@
 ---
-# ======================================================
-# Role: wem
-# WarehousePG Enterprise Manager (WEM) 설치
-#
-# 아키텍처:
-#   [모든 WHPG 노드] edb-whpg-observability-collector
-#     └─ alloy 서비스 → metrics을 Prometheus로 push
-#                      → logs를 Loki로 push
-#
-#   [scdw - Standby Coordinator] whpg-enterprise-manager
-#     └─ WEM 대시보드 (포트 8080)
-#        Prometheus, Loki는 별도 배포 필요 (사전 설치 가정)
-#
-# 참고: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/wem/installing/
-# ======================================================
+# WEM 1.4 구성 (WEM 1.2 가 있으면 먼저 삭제). playbooks/07_wem.yml, site.yml Phase 5 가 실행한다.
+# 단계별 tag 로 일부만 실행할 수 있다 (예: -t tune). 자세한 내용은 README.md 의 WEM 절을 참고한다.
+# 참고: https://github.com/edb-korea/wem_ansible
 
-# ==========================================
-# Part 1: WEM Collector (모든 WHPG 노드)
-# edb-whpg-observability-collector 패키지 포함:
-#   - Grafana Alloy (metric/log collector → Prometheus push + Loki push)
-# ==========================================
+# 실행 전 확인 (OS, VIP 활성 여부, wem_use_vip 조건, 배치 출력)
+- name: "00-checks"
+  ansible.builtin.import_tasks: 00-checks.yml
+  tags: [always]
 
-# ---------- 1-1. EDB 레포 설정 (Coordinator에서만 download) ----------
-- name: EDB 레포 스크립트 실행 (Coordinator)
-  ansible.builtin.shell:
-    cmd: >
-      export EDB_SUBSCRIPTION_TOKEN={{ edb_subscription_token }} &&
-      export EDB_REPO={{ edb_repo }} &&
-      curl -1sSLf
-      "https://downloads.enterprisedb.com/${EDB_SUBSCRIPTION_TOKEN}/${EDB_REPO}/setup.rpm.sh"
-      | sudo -E bash
-  when:
-    - inventory_hostname == coordinator_host
-    - edb_subscription_token is defined
-    - edb_subscription_token != ""
-  changed_when: true
+# WEM 1.2 삭제 (Prometheus / Loki / Alertmanager / Alloy / collector) - 1.2 가 감지된 경우만
+- name: "01-cleanup-wem12"
+  ansible.builtin.import_tasks: 01-cleanup-wem12.yml
+  tags: [cleanup]
 
-# ---------- 1-2. collector RPM 다운로드 (Coordinator) ----------
-- name: WEM Collector RPM 다운로드 (Coordinator에서 dnf download)
-  ansible.builtin.shell:
-    cmd: >
-      cd {{ gpadmin_home }} &&
-      sudo dnf download edb-whpg-observability-collector -y 2>&1
-  when: inventory_hostname == coordinator_host
-  changed_when: true
+# WHPG pg_hba.conf 에 WEM 계정(wem_whpg_user) 접속 허용
+- name: "03-pg-hba"
+  ansible.builtin.import_tasks: 03-pg-hba.yml
+  tags: [pghba]
 
-- name: 다운로드된 collector RPM 파일명 확인
-  ansible.builtin.find:
-    paths: "{{ gpadmin_home }}"
-    patterns: "edb-whpg-observability-collector*.rpm"
-  register: collector_rpm_files
-  when: inventory_hostname == coordinator_host
+# ClickHouse 설치 (WEM host)
+- name: "04-clickhouse"
+  ansible.builtin.import_tasks: 04-clickhouse.yml
+  tags: [clickhouse]
 
-# ---------- 1-3. 전체 노드에 RPM 배포 및 설치 (gpssh 활용) ----------
-- name: WEM Collector를 전체 클러스터에 배포 및 설치 (gpssh)
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpssh -f {{ gpadmin_home }}/hostfile_all -u gpadmin -e
-      "scp gpadmin@$(hostname):{{ collector_rpm_files.files[0].path }} /tmp/
-       && sudo dnf install -y /tmp/$(basename {{ collector_rpm_files.files[0].path }})" 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when:
-    - inventory_hostname == coordinator_host
-    - collector_rpm_files.files | length > 0
-  changed_when: true
+# WEM 접속 계정 / DB / resource group (coordinator), (선택) 별도 상태 DB (WEM host)
+- name: "05-state-database"
+  ansible.builtin.import_tasks: 05-state-database.yml
+  tags: [statedb]
 
-# ---------- 1-4. collector.conf 설정 (Coordinator) ----------
-- name: WEM collector.conf 설정
-  ansible.builtin.template:
-    src: collector.conf.j2
-    dest: /var/lib/whpg-observability-collector/collector.conf
-    owner: "{{ gpadmin_user }}"
-    group: "{{ gpadmin_group }}"
-    mode: '0640'
-  when: inventory_hostname == coordinator_host
+# WEM 1.4 설치와 wem.conf (WEM host)
+- name: "06-wem"
+  ansible.builtin.import_tasks: 06-wem.yml
+  tags: [wem]
 
-# ---------- 1-5. deploy-observability 실행 (전체 노드 배포) ----------
-- name: WEM Collector deploy-observability 실행
-  ansible.builtin.shell:
-    cmd: >
-      cd /var/lib/whpg-observability-collector &&
-      ./deploy-observability 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  when: inventory_hostname == coordinator_host
-  changed_when: true
+# Host Agent + otelcol 설치, join-token 선등록 (전 노드)
+- name: "07-host-agent"
+  ansible.builtin.import_tasks: 07-host-agent.yml
+  tags: [agent]
 
-# ---------- 1-6. alloy 서비스 부팅 시 자동 시작 활성화 (모든 노드) ----------
-- name: alloy 서비스 활성화 (부팅 시 자동 시작)
-  ansible.builtin.systemd:
-    name: alloy
-    enabled: true
-    daemon_reload: true
-  ignore_errors: true  # 패키지 미설치 노드는 무시
+# otelcol 설정 조정 (CPU 절감, DB 메트릭 수집 위치)
+- name: "08-otelcol-tune"
+  ansible.builtin.import_tasks: 08-otelcol-tune.yml
+  tags: [tune]
 
-- name: alloy 서비스 상태 확인
-  ansible.builtin.command:
-    cmd: systemctl status alloy
-  register: alloy_status
-  changed_when: false
-  failed_when: false
+# ClickHouse Coordinator Query Logs 객체 (WEM host)
+- name: "09-query-logs"
+  ansible.builtin.import_tasks: 09-query-logs.yml
+  tags: [querylogs]
 
-- name: alloy 서비스 상태 출력
-  ansible.builtin.debug:
-    var: alloy_status.stdout_lines
-
-# ==========================================
-# Part 2: WEM Dashboard (Standby Coordinator 노드)
-# whpg-enterprise-manager 패키지
-# ==========================================
-
-# ---------- 2-1. EDB 레포 설정 (scdw) ----------
-- name: EDB 레포 설정 (scdw)
-  ansible.builtin.shell:
-    cmd: >
-      export EDB_SUBSCRIPTION_TOKEN={{ edb_subscription_token }} &&
-      export EDB_REPO={{ edb_repo }} &&
-      curl -1sSLf
-      "https://downloads.enterprisedb.com/${EDB_SUBSCRIPTION_TOKEN}/${EDB_REPO}/setup.rpm.sh"
-      | sudo -E bash
-  when:
-    - inventory_hostname in groups['standby_coordinator']
-    - edb_subscription_token is defined
-    - edb_subscription_token != ""
-  changed_when: true
-
-# ---------- 2-2. WEM 패키지 설치 (scdw) ----------
-- name: whpg-enterprise-manager 패키지 설치
-  ansible.builtin.package:
-    name: whpg-enterprise-manager
-    state: present
-  when: inventory_hostname in groups['standby_coordinator']
-
-# ---------- 2-3. WEM PATH 설정 ----------
-- name: WEM 바이너리 PATH 등록 (gpadmin .bashrc)
-  ansible.builtin.blockinfile:
-    path: "{{ gpadmin_home }}/.bashrc"
-    marker: "# {mark} WEM PATH"
-    block: |
-      export PATH=/usr/local/greenplum-db/wem:$PATH
-    owner: "{{ gpadmin_user }}"
-    group: "{{ gpadmin_group }}"
-  when: inventory_hostname in groups['standby_coordinator']
-
-# ---------- 2-4. wem.conf 설정 ----------
-- name: /etc/wem 디렉토리 확인
-  ansible.builtin.file:
-    path: /etc/wem
-    state: directory
-    owner: root
-    group: root
-    mode: '0755'
-  when: inventory_hostname in groups['standby_coordinator']
-
-- name: wem.conf 설정파일 배포
-  ansible.builtin.template:
-    src: wem.conf.j2
-    dest: /etc/wem/wem.conf
-    owner: root
-    group: root
-    mode: '0640'
-  when: inventory_hostname in groups['standby_coordinator']
-  notify: restart_wem
-
-# ---------- 2-5. WEM admin 비밀번호 파일 설정 ----------
-- name: WEM admin 비밀번호 파일 생성
-  ansible.builtin.copy:
-    dest: /etc/wem/admin.pw
-    content: "{{ wem_admin_password }}"
-    owner: root
-    group: root
-    mode: '0600'
-  when: inventory_hostname in groups['standby_coordinator']
-
-# ---------- 2-6. WEM 서비스 활성화 및 시작 (자동 setup 포함) ----------
-- name: WEM 서비스 활성화
-  ansible.builtin.systemd:
-    name: wem
-    enabled: true
-    daemon_reload: true
-  when: inventory_hostname in groups['standby_coordinator']
-
-- name: WEM 서비스 시작 (첫 시작 시 자동 setup 실행)
-  ansible.builtin.systemd:
-    name: wem
-    state: started
-  when: inventory_hostname in groups['standby_coordinator']
-
-# ---------- 2-7. WEM 서비스 상태 확인 ----------
-- name: WEM 서비스 시작 대기 (포트 응답 확인)
-  ansible.builtin.wait_for:
-    host: 127.0.0.1
-    port: "{{ wem_portal_port }}"
-    delay: 10
-    timeout: 120
-  when: inventory_hostname in groups['standby_coordinator']
-
-- name: WEM 서비스 상태 확인
-  ansible.builtin.command:
-    cmd: systemctl status wem
-  register: wem_status
-  changed_when: false
-  failed_when: false
-  when: inventory_hostname in groups['standby_coordinator']
-
-- name: WEM 서비스 상태 출력
-  ansible.builtin.debug:
-    var: wem_status.stdout_lines
-  when: inventory_hostname in groups['standby_coordinator']
-
-- name: WEM doctor 실행 (설치 검증)
-  ansible.builtin.shell:
-    cmd: /usr/local/greenplum-db/wem/wem doctor 2>&1
-  register: wem_doctor
-  changed_when: false
-  failed_when: false
-  when: inventory_hostname in groups['standby_coordinator']
-
-- name: WEM doctor 결과 출력
-  ansible.builtin.debug:
-    var: wem_doctor.stdout_lines
-  when: inventory_hostname in groups['standby_coordinator']
+# 서비스 상태 확인
+- name: "10-summary"
+  ansible.builtin.import_tasks: 10-summary.yml
+  tags: [always]

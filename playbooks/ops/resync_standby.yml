@@ -16,8 +16,7 @@
           gpinitstandby -r -a 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: remove_standby
       changed_when: true
       ignore_errors: true
@@ -45,11 +44,10 @@
       ansible.builtin.shell:
         cmd: >
           source {{ whpg_install_dir }}/greenplum_path.sh &&
-          gpinitstandby -s {{ standby_coordinator_host }} -a 2>&1
+          gpinitstandby -s {{ standby_coordinator_host }} -S {{ standby_data_dir }} -a 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: init_standby
       changed_when: true
 

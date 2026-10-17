@@ -1,16 +1,23 @@
 ---
-whpg_encoding: UTF8
-whpg_locale: ko_KR.UTF-8
-whpg_timezone: Asia/Seoul
-whpg_max_connections: 2000
-whpg_shared_buffers: 2GB
-whpg_effective_cache_size: 8GB
-whpg_primary_segments_per_host: 2
-whpg_mirror_segments_per_host: 2
-coordinator_host: cdw
-standby_coordinator_host: scdw
-segment_hosts: []
+# whpg_init role 기본값
+# DB 초기화 파라미터(포트, 인코딩, 메모리 등) 공통 값은 inventory/whpg_cluster.yml 참고
 
-# 설치 경로
-whpg_real_install_dir: "/usr/edb/whpg7"
-whpg_install_dir: "/usr/local/greenplum-db"  # symlink 경로
+whpg_gpinitsystem_config: "{{ gpadmin_home }}/gpinitsystem_config"
+whpg_gpaddmirrors_config: "{{ gpadmin_home }}/gpaddmirrors_config"   # mirror 배치 파일 (tasks/mirrors.yml)
+whpg_trusted_shell: ssh
+
+# gpconfig 로 설정할 파라미터
+#   value            : 전체(또는 세그먼트) 값
+#   coordinator_value: Coordinator 값이 다를 때 지정 (gpconfig -m)
+whpg_gpconfig_params:
+  - { name: max_connections,            value: "{{ whpg_seg_max_connections }}", coordinator_value: "{{ whpg_max_connections }}" }
+  - { name: shared_buffers,             value: "{{ whpg_shared_buffers }}" }
+  - { name: effective_cache_size,       value: "{{ whpg_effective_cache_size }}" }
+  - { name: statement_mem,              value: "256MB" }
+  - { name: max_statement_mem,          value: "2GB" }
+  - { name: wal_level,                  value: "replica" }
+  - { name: logging_collector,          value: "on" }
+  - { name: log_min_duration_statement, value: "1000" }
+  - { name: shared_preload_libraries,   value: "{{ whpg_base_preload_libs | join(',') }}" }
+# 추가 파라미터 (whpg_gpconfig_params 뒤에 적용)
+whpg_gpconfig_params_extra: []

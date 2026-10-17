@@ -15,7 +15,7 @@
 # ---------- 2. whpg failover 스크립트 배포 ----------
 - name: failover 스크립트 디렉토리 생성
   ansible.builtin.file:
-    path: /opt/whpg_ha
+    path: "{{ ha_script_dir }}"
     state: directory
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
@@ -24,7 +24,7 @@
 - name: keepalived WHPG 헬스체크 스크립트 배포
   ansible.builtin.template:
     src: whpg_healthcheck.sh.j2
-    dest: /opt/whpg_ha/whpg_healthcheck.sh
+    dest: "{{ ha_script_dir }}/whpg_healthcheck.sh"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0755'
@@ -32,7 +32,7 @@
 - name: keepalived MASTER 승격 스크립트 배포 (gpinitstandby -n)
   ansible.builtin.template:
     src: whpg_promote.sh.j2
-    dest: /opt/whpg_ha/whpg_promote.sh
+    dest: "{{ ha_script_dir }}/whpg_promote.sh"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0755'
@@ -40,30 +40,21 @@
 - name: keepalived FAULT 처리 스크립트 배포
   ansible.builtin.template:
     src: whpg_demote.sh.j2
-    dest: /opt/whpg_ha/whpg_demote.sh
+    dest: "{{ ha_script_dir }}/whpg_demote.sh"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0755'
 
 # ---------- 3. keepalived.conf 배포 ----------
-- name: keepalived.conf 배포 (Coordinator - MASTER)
+# Coordinator → MASTER, Standby → BACKUP (템플릿에서 그룹 기준으로 결정)
+- name: keepalived.conf 배포
   ansible.builtin.template:
-    src: keepalived-master.conf.j2
-    dest: /etc/keepalived/keepalived.conf
+    src: keepalived.conf.j2
+    dest: "{{ keepalived_conf_file }}"
     owner: root
     group: root
     mode: '0644'
-  when: inventory_hostname in groups['coordinator']
-  notify: restart_keepalived
-
-- name: keepalived.conf 배포 (Standby - BACKUP)
-  ansible.builtin.template:
-    src: keepalived-backup.conf.j2
-    dest: /etc/keepalived/keepalived.conf
-    owner: root
-    group: root
-    mode: '0644'
-  when: inventory_hostname in groups['standby_coordinator']
+  when: inventory_hostname in groups['coordinator'] or inventory_hostname in groups['standby_coordinator']
   notify: restart_keepalived
 
 # ---------- 4. keepalived 서비스 시작 ----------
@@ -82,7 +73,7 @@
     name: net.ipv4.ip_nonlocal_bind
     value: "1"
     state: present
-    sysctl_file: /etc/sysctl.d/95-whpg.conf
+    sysctl_file: "{{ whpg_sysctl_file }}"
     reload: true
   when:
     - inventory_hostname in groups['coordinator'] or inventory_hostname in groups['standby_coordinator']

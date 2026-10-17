@@ -1,0 +1,33 @@
+# config_local.yaml — Managed by Ansible (role: wem). Add values to override.
+# WEM 이 배포한 config.yaml 은 그대로 두고 이 파일로 덮어쓴다 (acp-host-agent 를 재시작해도 유지).
+# edb-otelcol.conf 의 OTELCOL_OPTIONS 에 --config {{ otelcol_local_config }} 로 추가되어 있다.
+# Host: {{ inventory_hostname }}  Role: {{ _whpg_role }}  sqlquery: {{ _otel_sqlquery_effective }}
+
+receivers:
+{% if _otel_sqlquery_effective == 'add' %}
+
+  # coordinator failover 대비: coordinator 대신 standby 에서 DB 메트릭 수집 ({{ 'VIP' if wem_use_vip | bool else 'coordinator IP' }})
+  sqlquery/whpg:
+    driver: postgres
+    datasource: {{ ("host=" ~ otelcol_sqlquery_host ~ " port=" ~ wem_whpg_port ~ " user=" ~ wem_whpg_user ~ " dbname=" ~ wem_whpg_database ~ " sslmode=" ~ otelcol_sqlquery_sslmode ~ " password='" ~ (wem_whpg_password | replace("\\", "\\\\") | replace("'", "\\'")) ~ "'") | to_json }}
+    collection_interval: {{ otelcol_sqlquery_collection_interval }}
+    queries: ${file:{{ otelcol_whpg_queries_file }}}
+{% endif %}
+
+  file_log:
+    start_at: end
+    poll_interval: {{ otelcol_filelog_poll_interval }}
+
+processors:
+
+  batch:
+    send_batch_size: {{ otelcol_batch_send_batch_size }}
+    send_batch_max_size: {{ otelcol_batch_send_batch_max_size }}
+    timeout: {{ otelcol_batch_timeout }}
+{% if _otel_sqlquery_effective in ['add', 'remove'] %}
+
+service:
+  pipelines:
+    metrics:
+      receivers: [{{ 'host_metrics, sqlquery/whpg' if _otel_sqlquery_effective == 'add' else 'host_metrics' }}]
+{% endif %}

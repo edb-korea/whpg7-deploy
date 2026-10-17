@@ -2,7 +2,7 @@
 # Standby → Active Coordinator 승격 스크립트
 # keepalived MASTER 상태 전환 시 호출됨
 ROLE=$1
-LOGFILE=/var/log/whpg_ha_promote.log
+LOGFILE={{ ha_log_dir }}/whpg_ha_promote.log
 
 echo "[$(date)] keepalived notify_master called (role=$ROLE)" >> $LOGFILE
 

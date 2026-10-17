@@ -8,28 +8,25 @@
 COORDINATOR_HOSTNAME={{ coordinator_host }}
 
 # Coordinator 포트
-COORDINATOR_PORT=5432
+COORDINATOR_PORT={{ whpg_coordinator_port }}
 
 # Coordinator 데이터 디렉토리
 COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
 
 # Array 이름
-ARRAY_NAME="WarehousePG Data Warehouse"
+ARRAY_NAME="{{ whpg_array_name }}"
 
 # 세그먼트 데이터 디렉토리 접두어
-SEG_PREFIX=gpseg
+SEG_PREFIX={{ whpg_seg_prefix }}
 
 # Primary 세그먼트 포트 시작 번호
-PORT_BASE=6000
+PORT_BASE={{ whpg_port_base }}
 
 # Primary 세그먼트 데이터 디렉토리 목록 (호스트당)
 declare -a DATA_DIRECTORY=({% for dir in primary_data_dirs %}{{ dir }} {% endfor %})
 
-# Mirror 세그먼트 포트 시작 번호
-MIRROR_PORT_BASE=7000
-
-# Mirror 세그먼트 데이터 디렉토리 목록 (호스트당)
-declare -a MIRROR_DATA_DIRECTORY=({% for dir in mirror_data_dirs %}{{ dir }} {% endfor %})
+# Mirror 는 여기서 만들지 않음 (MIRROR_* 미지정)
+# → gpinitsystem 후 gpaddmirrors -i 로 whpg_mirror_group_size(4)대 단위 spread 배치 (roles/whpg_init/tasks/mirrors.yml)
 
 # 기본 데이터베이스 인코딩
 ENCODING={{ whpg_encoding }}
@@ -38,10 +35,10 @@ ENCODING={{ whpg_encoding }}
 # LOCALE={{ whpg_locale }}
 
 # 초기 생성 데이터베이스 이름
-DATABASE_NAME=gpadmin
+DATABASE_NAME={{ whpg_database }}
 
 # Trusted Shell (ssh 권장)
-TRUSTED_SHELL=ssh
+TRUSTED_SHELL={{ whpg_trusted_shell }}
 
 # WAL 동기화 방식 (net 권장)
-MACHINE_LIST_FILE={{ gpadmin_home }}/seg_hosts
+MACHINE_LIST_FILE={{ whpg_hostfile_segments }}

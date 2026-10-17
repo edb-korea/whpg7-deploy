@@ -7,8 +7,6 @@
 - name: WarehousePG 클러스터 상태 확인
   hosts: coordinator
   become: true
-  vars_files:
-    - ../../group_vars/whpg_cluster.yml
   tasks:
     - name: gpstate 전체 상태 확인
       ansible.builtin.shell:
@@ -17,8 +15,7 @@
           gpstate -s 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: gpstate_result
       changed_when: false
 
@@ -31,6 +28,7 @@
         cmd: psql -h 127.0.0.1 -p {{ pgbouncer_listen_port }} -U {{ gpadmin_user }} pgbouncer -c "SHOW POOLS;" 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
       register: pgbouncer_status
       changed_when: false
       ignore_errors: true
@@ -46,8 +44,7 @@
           gpinitstandby -s {{ standby_coordinator_host }} -v 2>&1
       become: true
       become_user: "{{ gpadmin_user }}"
-      environment:
-        COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+      environment: "{{ whpg_env }}"
       register: standby_sync
       changed_when: false
       ignore_errors: true

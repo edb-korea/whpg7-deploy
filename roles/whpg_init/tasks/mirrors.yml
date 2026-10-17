@@ -1,0 +1,102 @@
+---
+# ======================================================
+# Mirror 추가 (coordinator 에서 실행)
+#   gpinitsystem 은 primary 만 만들고, 여기서 gpaddmirrors -i 로
+#   whpg_mirror_group_size(4)대 단위 spread 배치 mirror 를 만든다.
+#   배치 규칙: templates/gpaddmirrors_config.j2
+#   이미 mirror 가 있으면 아무것도 하지 않는다 (다시 실행해도 안전)
+# ======================================================
+
+- name: 현재 primary / mirror 구성 조회
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -F '|' -c
+      "SELECT role, content, address, port, datadir FROM gp_segment_configuration
+       WHERE content >= 0 ORDER BY role, content"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _segcfg
+  changed_when: false
+
+- name: primary 목록 정리
+  ansible.builtin.set_fact:
+    _primaries: >-
+      {%- set out = [] -%}
+      {%- for l in _segcfg.stdout_lines if l.startswith('p|') -%}
+      {%-   set f = l.split('|') -%}
+      {%-   set _ = out.append({'content': f[1] | int, 'address': f[2], 'port': f[3] | int, 'datadir': f[4]}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _mirror_count: "{{ _segcfg.stdout_lines | select('match', '^m\\|') | list | length }}"
+
+- name: Mirror 생성 (mirror 가 없을 때만)
+  when: _mirror_count | int == 0
+  block:
+    - name: primary 가 inventory 구성과 일치하는지 확인
+      ansible.builtin.assert:
+        that:
+          - _primaries | map(attribute='address') | reject('in', segment_hosts) | list | length == 0
+          - _primaries | map(attribute='datadir') | map('dirname') | reject('in', primary_data_dirs) | list | length == 0
+          # k(호스트 내 순번) = port - whpg_port_base, 그 k 의 디렉토리가 primary_data_dirs[k] 와 같아야 함
+          - _primaries | rejectattr('port', 'in', range(whpg_port_base | int, whpg_port_base | int + primary_data_dirs | length) | list) | list | length == 0
+          - _primaries | length == (segment_hosts | length) * (primary_data_dirs | length)
+        fail_msg: >-
+          gp_segment_configuration 의 primary 가 inventory 와 다릅니다.
+          address: {{ _primaries | map(attribute='address') | unique | list }} / segment_hosts: {{ segment_hosts }},
+          datadir: {{ _primaries | map(attribute='datadir') | map('dirname') | unique | list }} / primary_data_dirs: {{ primary_data_dirs }},
+          port: {{ _primaries | map(attribute='port') | unique | sort }} / whpg_port_base: {{ whpg_port_base }}
+        quiet: true
+
+    - name: gpaddmirrors 입력 파일 생성 ({{ whpg_mirror_group_size }}대 단위 spread)
+      ansible.builtin.template:
+        src: gpaddmirrors_config.j2
+        dest: "{{ whpg_gpaddmirrors_config }}"
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0644'
+      register: _mirror_cfg
+
+    - name: Mirror 배치 계획 출력
+      ansible.builtin.debug:
+        msg: "{{ lookup('template', 'gpaddmirrors_config.j2').splitlines() | reject('match', '^#') | reject('equalto', '') | list }}"
+
+    - name: Mirror 세그먼트 추가 (gpaddmirrors -i)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          gpaddmirrors -a -i {{ whpg_gpaddmirrors_config }} 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      register: mirror_result
+
+    - name: Mirror 추가 결과 출력
+      ansible.builtin.debug:
+        var: mirror_result.stdout_lines
+
+- name: Mirror 가 이미 있어 건너뜀
+  ansible.builtin.debug:
+    msg: "mirror {{ _mirror_count }}개가 이미 구성되어 있어 gpaddmirrors 를 실행하지 않았습니다."
+  when: _mirror_count | int > 0
+
+# ---------- 호스트 / 디스크별 배치 확인 ----------
+- name: 호스트 / 디스크별 primary · mirror 배치 조회
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -F '|' -c
+      "SELECT address, regexp_replace(datadir, '/[^/]+/[^/]+$', ''),
+              string_agg(CASE WHEN preferred_role = 'p' THEN 'P' ELSE 'M' END || content, ' ' ORDER BY preferred_role DESC, content)
+       FROM gp_segment_configuration WHERE content >= 0
+       GROUP BY 1, 2 ORDER BY 1, 2"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _layout
+  changed_when: false
+
+- name: 호스트 / 디스크별 배치 (P=primary, M=mirror, 숫자=content)
+  ansible.builtin.debug:
+    var: _layout.stdout_lines

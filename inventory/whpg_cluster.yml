@@ -1,0 +1,299 @@
+---
+# ======================================================
+# WarehousePG Ansible Deployment - Group Variables
+# 대상: whpg_cluster (coordinator + standby + segments)
+#
+# ※ 실제 로드 경로는 inventory/group_vars/whpg_cluster/main.yml (이 파일을 가리키는 심볼릭 링크) 입니다.
+#    편집은 이 파일(inventory/whpg_cluster.yml)에서 하면 됩니다. 링크는 삭제하지 마세요.
+# ※ 여러 role/playbook에서 공통으로 쓰는 값은 여기에만 정의합니다 (role defaults에 중복 정의 금지).
+#    role 내부에서만 쓰는 튜닝값은 roles/<role>/defaults/main.yml 에 있으며 여기서 override 가능합니다.
+# ======================================================
+
+# ------------------------------------------
+# 공통 접속 설정
+# ------------------------------------------
+ansible_user: root
+ansible_ssh_private_key_file: ~/.ssh/id_rsa
+ansible_python_interpreter: /usr/bin/python3
+
+# ------------------------------------------
+# 클러스터 호스트 정보 (inventory 그룹에서 자동 도출 - 직접 수정 불필요)
+# ------------------------------------------
+coordinator_host: "{{ groups['coordinator'] | first }}"
+standby_coordinator_host: "{{ groups['standby_coordinator'] | first }}"
+segment_hosts: "{{ groups['segments'] }}"
+wem_host: "{{ groups['wem_node'] | first }}"
+
+# ------------------------------------------
+# WarehousePG 버전 및 설치 경로
+# ------------------------------------------
+# 설치할 Core 버전. local_rpm_dir 에서 패키지명 + 버전이 일치하는 RPM 을 찾음
+# (예: warehouse-pg-7-7.5.0_WHPG-1.el9.x86_64.rpm), 없으면 dnf 로 같은 버전 설치
+whpg_version: "7.5.0"
+whpg_core_pkg_name: "warehouse-pg-7"                     # Core 패키지명 (RPM NAME)
+whpg_ext_pkg_prefix: "edb-whpg7"                         # Extension 패키지 접두어
+
+whpg_real_install_dir: "/usr/edb/whpg7"                  # 실제 RPM 설치 경로
+whpg_install_dir: "/usr/local/greenplum-db"              # symlink 경로 (greenplum_path.sh 기준)
+
+# ------------------------------------------
+# RPM 설치/업그레이드 공통 설정
+# Controller의 local_rpm_dir 우선 탐색 → 없으면 dnf fallback
+# ------------------------------------------
+local_rpm_dir: "/opt/whpg-rpms"     # RPM 저장 경로
+rpm_remote_tmp_dir: "/tmp/whpg-rpms" # 대상 노드에 RPM을 임시 복사할 경로
+rpm_dnf_fallback: true              # 로컬 RPM 없을 때 dnf 사용 여부
+rpm_disable_gpg_check: true         # GPG 검사 비활성화 (내부 레포 시 true)
+
+# ------------------------------------------
+# gpadmin 사용자 설정
+# ------------------------------------------
+gpadmin_user: gpadmin
+gpadmin_group: gpadmin
+gpadmin_uid: 5000
+gpadmin_gid: 5000
+gpadmin_home: "/home/{{ gpadmin_user }}"
+gpadmin_password: "{{ vault_gpadmin_password | default('changeme') }}"  # vault로 암호화 권장
+
+# gpssh / gpinitsystem 에서 사용하는 호스트 파일
+whpg_hostfile_all: "{{ gpadmin_home }}/hostfile_all"     # 전체 노드
+whpg_hostfile_segments: "{{ gpadmin_home }}/seg_hosts"   # 세그먼트 노드
+
+# ------------------------------------------
+# DB 접속 정보
+# ------------------------------------------
+whpg_coordinator_port: 5432
+whpg_database: gpadmin              # 초기 생성 DB / 관리 작업용 DB
+
+# ------------------------------------------
+# 데이터 디스크 / 디렉토리
+#  path   : 데이터 루트 (이 아래에 primary/, mirror/ 생성)
+#  device : 별도 디스크를 쓸 때만 지정 (/dev/sdb, /dev/disk/by-id/... 등)
+#           - 빈 디스크 : mkfs.xfs 후 UUID 로 /etc/fstab 등록·마운트
+#           - 이미 xfs  : 포맷 없이 마운트만
+#           - 그 외 데이터(다른 FS, 파티션 테이블, LVM PV 등)가 있으면 중단
+#           비우면("") 기존 파일시스템을 그대로 사용 (예: / 아래 /data1, 또는 이미 마운트된 /data1)
+#  어느 경우든 대상 서버에서 각 path 가 올라가 있는 물리 디스크를 조회해
+#  I/O 스케쥴러/read-ahead 튜닝 대상으로 사용 (os_preconfig)
+#  호스트별로 다르면 inventory/host_vars/<호스트>.yml 에서 override
+# ------------------------------------------
+whpg_data_mounts:
+  - { path: /data1, device: "" }
+  - { path: /data2, device: "" }
+# 예) 별도 디스크 사용 시
+#  - { path: /data1, device: /dev/sdb }
+#  - { path: /data2, device: /dev/sdc }
+
+# RHEL 8+ XFS 는 nobarrier 옵션을 지원하지 않음 (마운트 실패)
+xfs_mount_options: "rw,noatime,allocsize=16m,inode64,logbufs=8,logbsize=256k"
+
+# ------------------------------------------
+# 데이터 디렉토리 경로
+# gpinitsystem 은 각 디렉토리 밑에 {{ whpg_seg_prefix }}<N> 을 자동 생성함 (상위 디렉토리만 지정)
+# ------------------------------------------
+# 호스트당 primary segment 수 (mirror 도 같은 수). whpg_data_mounts 개수의 배수로 지정 → 디스크별 균등
+#   k 번째 segment 는 whpg_data_mounts[k mod 디스크수] 에 둔다 (/data1, /data2, /data1, /data2 ...)
+#   예) 2: /data1 1개 + /data2 1개,  4: 2개 + 2개,  8: 4개 + 4개  (primary / mirror 각각)
+#   포트: primary whpg_port_base + k, mirror whpg_mirror_port_base + k (k = 0 ~ segments_per_host-1)
+whpg_segments_per_host: 2
+whpg_data_root: "{{ whpg_data_mounts[0].path }}"   # Coordinator/Standby 데이터 위치
+whpg_seg_prefix: gpseg
+coordinator_data_dir: "{{ whpg_data_root }}/coordinator/{{ whpg_seg_prefix }}-1"
+standby_data_dir: "{{ whpg_data_root }}/coordinator/{{ whpg_seg_prefix }}-1"
+# 길이 = whpg_segments_per_host. 같은 경로가 반복됨 (예: 4 → /data1/primary /data2/primary /data1/primary /data2/primary)
+primary_data_dirs: "{{ _seg_disk_paths | product(['/primary']) | map('join') | list }}"
+mirror_data_dirs: "{{ _seg_disk_paths | product(['/mirror']) | map('join') | list }}"
+_seg_disk_paths: >-
+  {{ (whpg_data_mounts | map(attribute='path') | list
+      * ((whpg_segments_per_host | int) // (whpg_data_mounts | length) + 1))[:whpg_segments_per_host | int] }}
+
+# Mirror 배치 그룹 크기 (segment 호스트 N 대 단위)
+#   inventory/hosts 의 [segments] 를 적힌 순서대로 N 대씩 묶고, mirror 는 같은 그룹 안에만 둔다.
+#   segment 호스트 수는 N 의 배수여야 한다. 호스트당 segment 수(whpg_segments_per_host)는 제한 없음.
+#   그룹 내 순번 h 호스트의 k 번째 primary → 같은 그룹 (h + (k mod (N-1)) + 1) mod N 번째 호스트의 k 번째 mirror 슬롯
+#   증설도 N 대 단위로 [segments] 끝에 추가한다 (기존 호스트 순서는 바꾸지 않음).
+whpg_mirror_group_size: 4
+
+# gp 유틸리티(gpstart/gpstop/gpconfig/psql 등) 실행 시 공통 환경변수
+whpg_env:
+  COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  PGPORT: "{{ whpg_coordinator_port }}"
+  PGDATABASE: "{{ whpg_database }}"
+
+# ------------------------------------------
+# DB 초기화 파라미터
+# ------------------------------------------
+whpg_array_name: "WarehousePG Data Warehouse"
+whpg_port_base: 6000                # Primary 세그먼트 시작 포트
+whpg_mirror_port_base: 7000         # Mirror 세그먼트 시작 포트
+whpg_encoding: UTF8
+whpg_locale: ko_KR.UTF-8
+whpg_timezone: Asia/Seoul
+whpg_max_connections: 2000          # Coordinator max_connections
+whpg_seg_max_connections: 2000      # Segment max_connections
+whpg_shared_buffers: 2GB
+whpg_effective_cache_size: 8GB
+whpg_resource_manager: "group-v2"   # cgroup v2 기반 resource group
+
+# 항상 preload 되는 라이브러리 (extension 별 preload 는 whpg_extension_catalog 의 preload 항목)
+whpg_base_preload_libs:
+  - pg_stat_statements
+
+# pg_hba.conf 에 추가할 접근 규칙
+whpg_pg_hba_rules:
+  - { type: host, database: all, user: "{{ gpadmin_user }}", address: "0.0.0.0/0",    method: md5 }
+  - { type: host, database: all, user: all,                  address: "127.0.0.1/32", method: md5 }
+  - { type: host, database: all, user: all,                  address: "::1/128",      method: md5 }
+
+# ------------------------------------------
+# 로컬 YUM 레포지토리 설정
+# ------------------------------------------
+whpg_local_repo_enabled: true
+whpg_local_repo_baseurl: "http://repo.internal/whpg"   # 환경에 맞게 수정
+whpg_local_repo_gpgcheck: false
+
+# ------------------------------------------
+# OS 튜닝 설정
+# ------------------------------------------
+# sysctl 설정 파일 (os_preconfig, coordinator_ha 공용)
+whpg_sysctl_file: /etc/sysctl.d/95-whpg.conf
+
+# I/O 스케쥴러 (VMware 환경: none, 물리서버: mq-deadline)
+io_scheduler: "none"
+io_udev_pattern: "sd[a-z]"          # 데이터 디스크 자동 조회 실패 시에만 사용
+
+# THP/Read-ahead tuned 프로파일
+tuned_profile_name: "whpg-optimized"
+
+# cgroup v2 (Resource Group)
+whpg_cgroup_dir: /sys/fs/cgroup/gpdb
+
+# ------------------------------------------
+# SSH 임계값 설정
+# ------------------------------------------
+sshd_max_startups: "100:30:200"
+sshd_max_sessions: 200
+
+# ------------------------------------------
+# NTP 서버
+# ------------------------------------------
+ntp_servers:
+  - 0.rhel.pool.ntp.org
+  - 1.rhel.pool.ntp.org
+
+# ------------------------------------------
+# Extension 설치 플래그 (기본 항상 설치)
+# ------------------------------------------
+install_pxf: true
+install_pgaudit: true
+install_user_profile: true
+install_anonymizer: true
+install_whpg_fdw: true
+install_diskquota: true
+install_datascience_python: true    # Python 3.11 Data Science 패키지
+install_datascience_r: true         # R Data Science 패키지 (edb-whpg7-plr 필요 → install_plr: true)
+install_madlib: true
+install_plr: true
+install_pljava: true
+install_whpg_backup: true
+install_pg_partman: true            # 파티션 관리 extension
+install_whpg_copy: true             # WHPG 인스턴스 간 데이터 복사 CLI (/usr/bin/whpg-copy)
+install_whpg_cron: true             # 작업 스케줄러 (pg_cron, shared_preload_libraries 필요)
+
+# diskquota 는 버전이 붙은 라이브러리(diskquota-<major.minor>.so)를 preload 해야 함
+# diskquota RPM 업그레이드 시 이 값도 함께 변경 (예: 2.4.0 → "2.4")
+diskquota_lib_version: "2.4"
+
+# PXF Hadoop 연동
+pxf_hadoop_enabled: true
+pxf_namenode_host: "namenode.internal"  # 환경에 맞게 수정
+pxf_hdfs_port: 8020
+
+# ------------------------------------------
+# Optional Extension 플래그
+# ------------------------------------------
+install_postgis: false
+install_hll: false
+install_q3c: false
+install_pgsphere: false
+install_pgfs: false
+install_pgaa: false
+install_pgvector: true
+install_vectorplus: false           # pgvector 기반 ivfplus 인덱스 (install_pgvector 필요)
+install_utl_raw: false              # Oracle UTL_RAW 호환 (orafce extension 필요 - 레포에 없음)
+install_flowserver: false
+
+# ------------------------------------------
+# Extension 카탈로그 (설치 + 업그레이드 playbook 공용)
+#   name     : 식별자 (upgrade_targets 지정 시 사용 가능)
+#   pkg      : RPM 패키지명
+#   enabled  : 설치 여부 플래그
+#   sql_ext  : CREATE/ALTER EXTENSION 대상 이름 (없으면 생략)
+#   cascade  : CREATE EXTENSION ... CASCADE 사용 여부
+#   preload  : shared_preload_libraries 에 추가할 라이브러리 (없으면 생략)
+#   gucs     : 함께 설정할 GUC 목록 [{name, value}] (없으면 생략)
+# ------------------------------------------
+whpg_extension_catalog:
+  - { name: pxf,          pkg: "{{ whpg_ext_pkg_prefix }}-pxf",             enabled: "{{ install_pxf | bool }}" }
+  - { name: pgaudit,      pkg: "{{ whpg_ext_pkg_prefix }}-pgaudit",         enabled: "{{ install_pgaudit | bool }}", sql_ext: pgaudit, preload: pgaudit }
+  - { name: user_profile, pkg: "{{ whpg_ext_pkg_prefix }}-user_profile",    enabled: "{{ install_user_profile | bool }}", preload: user_profile }
+  - { name: anonymizer,   pkg: "{{ whpg_ext_pkg_prefix }}-anonymizer",      enabled: "{{ install_anonymizer | bool }}", sql_ext: anon, cascade: true }
+  - { name: whpg_fdw,     pkg: "{{ whpg_ext_pkg_prefix }}-whpg_fdw",        enabled: "{{ install_whpg_fdw | bool }}", sql_ext: whpg_fdw }
+  - { name: diskquota,    pkg: "{{ whpg_ext_pkg_prefix }}-diskquota",       enabled: "{{ install_diskquota | bool }}", preload: "diskquota-{{ diskquota_lib_version }}" }
+  - { name: datascience,  pkg: "{{ whpg_ext_pkg_prefix }}-data-science-python311", enabled: "{{ install_datascience_python | bool }}" }
+  - { name: madlib,       pkg: "{{ whpg_ext_pkg_prefix }}-madlib",          enabled: "{{ install_madlib | bool }}" }
+  - { name: plr,          pkg: "{{ whpg_ext_pkg_prefix }}-plr",             enabled: "{{ install_plr | bool }}", sql_ext: plr }
+  - { name: datascience_r, pkg: "{{ whpg_ext_pkg_prefix }}-data-science-r", enabled: "{{ install_datascience_r | bool }}" }   # plr 다음에 설치
+  - { name: pljava,       pkg: "{{ whpg_ext_pkg_prefix }}-pljava",          enabled: "{{ install_pljava | bool }}", sql_ext: pljava }
+  - { name: pg_partman,   pkg: "{{ whpg_ext_pkg_prefix }}-pg_partman",      enabled: "{{ install_pg_partman | bool }}", sql_ext: pg_partman }
+  - { name: whpg_copy,    pkg: "edb-whpg-copy",                             enabled: "{{ install_whpg_copy | bool }}" }
+  - { name: whpg_cron,    pkg: "{{ whpg_ext_pkg_prefix }}-whpg-cron",       enabled: "{{ install_whpg_cron | bool }}", sql_ext: pg_cron, preload: pg_cron,
+      gucs: [{ name: cron.database_name, value: "{{ whpg_database }}" }] }   # pg_cron 은 이 DB 에만 생성 가능
+  - { name: whpg_backup,  pkg: "whpg-backup",                               enabled: "{{ install_whpg_backup | bool }}" }
+  - { name: postgis,      pkg: "{{ whpg_ext_pkg_prefix }}-postgis",         enabled: "{{ install_postgis | bool }}", sql_ext: postgis }
+  - { name: hll,          pkg: "{{ whpg_ext_pkg_prefix }}-hll",             enabled: "{{ install_hll | bool }}", sql_ext: hll }
+  - { name: q3c,          pkg: "{{ whpg_ext_pkg_prefix }}-q3c",             enabled: "{{ install_q3c | bool }}", sql_ext: q3c }
+  - { name: pgsphere,     pkg: "{{ whpg_ext_pkg_prefix }}-pgsphere",        enabled: "{{ install_pgsphere | bool }}", sql_ext: pgsphere }
+  - { name: pgvector,     pkg: "{{ whpg_ext_pkg_prefix }}-pgvector",        enabled: "{{ install_pgvector | bool }}", sql_ext: vector }
+  - { name: vectorplus,   pkg: "{{ whpg_ext_pkg_prefix }}-vectorplus",      enabled: "{{ install_vectorplus | bool }}", sql_ext: edb_vectorplus, cascade: true }
+  - { name: utl_raw,      pkg: "{{ whpg_ext_pkg_prefix }}-utl-raw",         enabled: "{{ install_utl_raw | bool }}", sql_ext: whpg_utl_raw, cascade: true }
+  - { name: pgfs,         pkg: "{{ whpg_ext_pkg_prefix }}-pgfs",            enabled: "{{ install_pgfs | bool }}" }
+  - { name: pgaa,         pkg: "{{ whpg_ext_pkg_prefix }}-pgaa",            enabled: "{{ install_pgaa | bool }}", sql_ext: pgaa }
+  - { name: flowserver,   pkg: "whpg7-flow-server",                         enabled: "{{ install_flowserver | bool }}" }
+
+# ------------------------------------------
+# WEM 1.4 (roles/wem, 참고: https://github.com/edb-korea/wem_ansible)
+#   WEM / ClickHouse : wem_host (wem_node 그룹, 기본 standby)
+#   Host Agent / otelcol : 모든 노드
+# 전체 변수와 기본값은 roles/wem/defaults/main.yml. 바꿀 값만 아래에 같은 이름으로 추가
+# 비밀번호는 inventory/vault.yml (vault_wem_admin_password, vault_clickhouse_password, vault_wem_whpg_password)
+# ------------------------------------------
+wem_enabled: true
+# wem_version: "1.4.0"              # 설치할 whpg-enterprise-manager 버전
+# wem_port: 8080                    # WEM 웹 포트 (Host Agent 포트는 +1)
+# wem_use_vip: true                 # 기본: coordinator_ha_enabled 값. true 면 WEM 이 coordinator_vip 로 WHPG 접속
+# wem_state_install: false          # true: WEM host 에 별도 상태 DB(PostgreSQL 5433) 설치
+# clickhouse_data_dir: ""           # ClickHouse 데이터를 다른 디스크에 둘 때 (예: /data1/clickhouse)
+
+# ------------------------------------------
+# pgBouncer 설정 (pgbouncer_node 그룹)
+# ------------------------------------------
+pgbouncer_enabled: true
+pgbouncer_listen_port: 5433
+pgbouncer_max_client_conn: 5000
+pgbouncer_default_pool_size: 200
+pgbouncer_pool_mode: transaction
+pgbouncer_admin_users: "{{ gpadmin_user }}"
+pgbouncer_auth_users:
+  - "{{ gpadmin_user }}"
+pgbouncer_target_db: "{{ whpg_database }}"
+pgbouncer_target_port: "{{ whpg_coordinator_port }}"
+
+# ------------------------------------------
+# Coordinator HA 설정 (keepalived/corosync)
+# ------------------------------------------
+coordinator_ha_enabled: true
+coordinator_vip: "192.168.10.100"        # 환경에 맞게 수정
+coordinator_vip_interface: "eth0"
+coordinator_ha_method: "keepalived"      # keepalived or pacemaker
+keepalived_auth_pass: "{{ vault_keepalived_auth_pass | default('whpg2024') }}"  # vault 암호화 권장

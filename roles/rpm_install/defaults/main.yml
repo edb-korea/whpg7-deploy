@@ -2,14 +2,15 @@
 # ======================================================
 # rpm_install role 기본값
 # 로컬 RPM 디렉토리를 먼저 탐색하고 없으면 dnf로 설치
+# 공통 값(local_rpm_dir, rpm_remote_tmp_dir, rpm_dnf_fallback, rpm_disable_gpg_check)은
+# inventory/whpg_cluster.yml 에서 관리합니다.
 # ======================================================
 
-# 로컬 RPM 저장 디렉토리 (Control Node 기준 또는 각 노드 로컬 경로)
-# 이 디렉토리에 RPM 파일이 있으면 해당 파일로 설치, 없으면 dnf 사용
-local_rpm_dir: "/opt/whpg-rpms"
+# 설치 상태 (present / latest)
+rpm_install_state: present
 
-# dnf fallback 허용 여부
-rpm_dnf_fallback: true
+# 특정 버전만 설치할 때 지정 (예: "7.5.0"). 비우면 최신
+rpm_pkg_version: ""
 
-# RPM 설치 시 GPG 체크 비활성화 (내부 레포 사용 시 true)
-rpm_disable_gpg_check: true
+# dnf fallback 실패를 무시할지 (업그레이드 시 레포에 없는 패키지가 있어도 계속 진행)
+rpm_ignore_dnf_errors: false

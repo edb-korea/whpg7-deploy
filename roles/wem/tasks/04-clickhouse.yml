@@ -1,0 +1,152 @@
+---
+# ClickHouse 설치 (WEM host)
+# tag: clickhouse
+- name: Install and start ClickHouse
+  when: inventory_hostname == wem_host
+  block:
+    - name: Set vm.max_map_count for ClickHouse
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-clickhouse.conf
+        content: "vm.max_map_count = 262144\n"
+        mode: "0644"
+      register: _ch_sysctl
+
+    - name: Apply vm.max_map_count
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/99-clickhouse.conf
+      when: _ch_sysctl is changed
+
+    # Controller 의 local_rpm_dir 우선 → dnf fallback (의존성 순서대로)
+    - name: Install ClickHouse packages
+      ansible.builtin.include_role:
+        name: rpm_install
+      vars:
+        rpm_pkg_name: "{{ _ch_pkg }}"
+      loop: "{{ clickhouse_packages }}"
+      loop_control:
+        loop_var: _ch_pkg
+
+    - name: Create ClickHouse drop-in directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: clickhouse
+        mode: "0750"
+      loop:
+        - /etc/clickhouse-server/config.d
+        - /etc/clickhouse-server/users.d
+
+    - name: Write ClickHouse listen_host
+      ansible.builtin.copy:
+        dest: /etc/clickhouse-server/config.d/observability.xml
+        owner: root
+        group: clickhouse
+        mode: "0640"
+        content: |
+          <clickhouse>
+              <listen_host>0.0.0.0</listen_host>
+          </clickhouse>
+      register: _ch_conf_0
+
+    - name: Write ClickHouse default user password
+      ansible.builtin.copy:
+        dest: /etc/clickhouse-server/users.d/default-password.xml
+        owner: root
+        group: clickhouse
+        mode: "0640"
+        content: |
+          <clickhouse>
+              <users>
+                  <default>
+                      <password>{{ clickhouse_password | e }}</password>
+                  </default>
+              </users>
+          </clickhouse>
+      no_log: true
+      register: _ch_conf_1
+
+    - name: Prepare custom ClickHouse data directory
+      when: clickhouse_data_dir | length > 0
+      block:
+        - name: Create ClickHouse data / log directories
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: clickhouse
+            group: clickhouse
+            mode: "{{ item.mode }}"
+          loop:
+            - { path: "{{ clickhouse_data_dir }}", mode: "0750" }
+            - { path: "{{ clickhouse_log_dir | default(clickhouse_data_dir, true) }}", mode: "0770" }
+
+        - name: Write ClickHouse data-path.xml
+          ansible.builtin.copy:
+            dest: /etc/clickhouse-server/config.d/data-path.xml
+            owner: root
+            group: clickhouse
+            mode: "0640"
+            content: |
+              <clickhouse>
+                  <path>{{ (clickhouse_data_dir | regex_replace('/+$', '')) ~ '/' }}</path>
+                  <tmp_path>{{ (clickhouse_data_dir | regex_replace('/+$', '')) ~ '/' }}tmp/</tmp_path>
+                  <user_files_path>{{ (clickhouse_data_dir | regex_replace('/+$', '')) ~ '/' }}user_files/</user_files_path>
+                  <format_schema_path>{{ (clickhouse_data_dir | regex_replace('/+$', '')) ~ '/' }}format_schemas/</format_schema_path>
+                  <custom_cached_disks_base_directory>{{ (clickhouse_data_dir | regex_replace('/+$', '')) ~ '/' }}caches/</custom_cached_disks_base_directory>
+                  <user_directories>
+                      <local_directory>
+                          <path>{{ (clickhouse_data_dir | regex_replace('/+$', '')) ~ '/' }}access/</path>
+                      </local_directory>
+                  </user_directories>
+              </clickhouse>
+          register: _ch_conf_2
+
+    - name: Write ClickHouse log-path.xml
+      when: clickhouse_log_dir | length > 0
+      ansible.builtin.copy:
+        dest: /etc/clickhouse-server/config.d/log-path.xml
+        owner: root
+        group: clickhouse
+        mode: "0640"
+        content: |
+          <clickhouse>
+              <logger>
+                  <log>{{ clickhouse_log_dir }}/clickhouse-server.log</log>
+                  <errorlog>{{ clickhouse_log_dir }}/clickhouse-server.err.log</errorlog>
+              </logger>
+          </clickhouse>
+      register: _ch_conf_3
+
+    # 설정 파일이 바뀐 경우에만 재시작 (다시 실행해도 서비스 중단 없음)
+    - name: Enable and start clickhouse-server
+      ansible.builtin.systemd:
+        name: clickhouse-server
+        enabled: true
+        state: "{{ 'restarted' if _ch_changed | bool else 'started' }}"
+        daemon_reload: true
+      vars:
+        _ch_changed: >-
+          {{ [_ch_conf_0, _ch_conf_1, _ch_conf_2 | default({}), _ch_conf_3 | default({})]
+             | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0 }}
+
+    - name: Wait for ClickHouse native port
+      ansible.builtin.wait_for:
+        host: "{{ wem_host_ip }}"
+        port: "{{ clickhouse_native_port }}"
+        timeout: 120
+
+    - name: ClickHouse health check
+      ansible.builtin.command:
+        argv:
+          - clickhouse-client
+          - --host
+          - "{{ wem_host_ip }}"
+          - --user
+          - "{{ clickhouse_user }}"
+          - --password
+          - "{{ clickhouse_password }}"
+          - --query
+          - "SELECT 1"
+      register: _ch_health
+      changed_when: false
+      failed_when: _ch_health.stdout | trim != '1'
+      no_log: true

@@ -1,0 +1,25 @@
+---
+# ======================================================
+# whpg_expand role 기본값 (playbooks/ops/expand_segments.yml)
+# 공통 값(segment_hosts, primary/mirror_data_dirs, 포트, whpg_mirror_group_size)은 inventory/whpg_cluster.yml
+# ======================================================
+
+# gpexpand 입력 파일 (coordinator, gpadmin 홈)
+whpg_gpexpand_input: "{{ gpadmin_home }}/gpexpand_input"
+
+# 새 호스트에 os_preconfig 후 SELinux 가 꺼지지 않았거나 cgroup v2 가 비활성이면 재부팅
+expand_reboot_if_needed: true
+
+# 재분배 (gpexpand phase 2). false 면 segment 추가(phase 1)까지만 하고 재분배는 나중에 직접 실행
+expand_redistribute: true
+# 재분배 최대 시간 (gpexpand -d, 예: "04:00:00"). 비우면 끝날 때까지. 시간이 지나 멈추면 다시 실행하면 이어서 진행
+expand_duration: ""
+# 동시에 재분배할 테이블 수 (gpexpand -n)
+expand_parallel: 4
+# 재분배 후 ANALYZE (gpexpand -a)
+expand_analyze: false
+# 재분배가 길어 SSH 가 끊기지 않도록 비동기 실행. 최대 대기(초)
+expand_async_timeout: 172800
+
+# 재분배가 끝나면(EXPANSION COMPLETE) gpexpand 스키마 정리 (gpexpand -c)
+expand_cleanup: true

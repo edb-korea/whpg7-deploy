@@ -1,7 +1,7 @@
 ---
 # ======================================================
 # WarehousePG 전체 배포 메인 플레이북 (site.yml)
-# 실행 순서: OS 구성 → WHPG 설치 → 초기화 → Extension → WEM → pgBouncer → HA
+# 실행 순서: OS 구성 → WHPG 설치 → 초기화 → Extension → pgBouncer → HA → WEM
 # ======================================================
 
 # Phase 1: OS 사전 구성 (모든 클러스터 노드)
@@ -44,35 +44,37 @@
     - phase4
     - extensions
 
-# Phase 5: WEM (Prometheus + Loki + Grafana + Collector)
-- name: "Phase 5: WEM 설치"
-  hosts: whpg_cluster
-  become: true
-  roles:
-    - role: wem
-      when: wem_enabled | default(true)
-  tags:
-    - phase5
-    - wem
-
-# Phase 6: pgBouncer (Coordinator)
-- name: "Phase 6: pgBouncer 설치"
+# Phase 5: pgBouncer (Coordinator)
+- name: "Phase 5: pgBouncer 설치"
   hosts: pgbouncer_node
   become: true
   roles:
     - role: pgbouncer
       when: pgbouncer_enabled | default(true)
   tags:
-    - phase6
+    - phase5
     - pgbouncer
 
-# Phase 7: Coordinator HA (keepalived VIP)
-- name: "Phase 7: Coordinator HA 구성"
+# Phase 6: Coordinator HA (keepalived VIP)
+- name: "Phase 6: Coordinator HA 구성"
   hosts: coordinator:standby_coordinator
   become: true
   roles:
     - role: coordinator_ha
       when: coordinator_ha_enabled | default(false)
   tags:
-    - phase7
+    - phase6
     - ha
+
+# Phase 7: WEM 1.4 (ClickHouse + Host Agent + otelcol)
+# HA 이후에 실행: coordinator_ha_enabled 면 WEM 이 coordinator_vip 로 WHPG 에 접속 (wem_use_vip)
+- name: "Phase 7: WEM 설치"
+  hosts: whpg_cluster
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: wem
+      when: wem_enabled | default(true)
+  tags:
+    - phase7
+    - wem

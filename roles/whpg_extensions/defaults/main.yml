@@ -1,29 +1,12 @@
 ---
-# 기본 Extension (항상 설치)
-install_pxf: true
-install_pgaudit: true
-install_user_profile: true
-install_anonymizer: true
-install_whpg_fdw: true
-install_diskquota: true
-install_datascience_python: true
-install_madlib: true
-install_plr: true
-install_pljava: true
-install_whpg_backup: true
+# whpg_extensions role 기본값
+# 설치 플래그(install_*)와 Extension 카탈로그(whpg_extension_catalog)는
+# inventory/whpg_cluster.yml 에서 관리합니다 (업그레이드 playbook과 공유).
 
-# PXF Hadoop 연동
-pxf_hadoop_enabled: false
-pxf_namenode_host: "namenode.internal"
-pxf_hdfs_port: 8020
+# PXF 설정 파일 경로
+pxf_base_dir: "{{ gpadmin_home }}/pxf"
+pxf_hadoop_auth: simple
 
-# Optional Extension (기본 비활성화)
-install_postgis: false
-install_hll: false
-install_q3c: false
-install_pgsphere: false
-install_pgfs: false
-install_pgaa: false
-install_pgvector: false
-install_vectorchord: false
-install_flowserver: false
+# MADlib 설치 옵션
+madlib_schema: madlib
+madlib_platform: warehousepg

@@ -1,14 +1,33 @@
 ---
 # ======================================================
 # Role: whpg_init
-# 순서: cluster init → mirror → standby coordinator
+# 순서: cluster init (primary) → mirror (gpaddmirrors -i) → standby coordinator
 # ======================================================
+
+# ---------- 0. Mirror 그룹 구성 가능 여부 확인 (gpinitsystem 전에 중단) ----------
+- name: Mirror 그룹 조건 확인 (segment {{ whpg_mirror_group_size }}대 단위)
+  ansible.builtin.assert:
+    that:
+      - segment_hosts | length > 0
+      - segment_hosts | length % (whpg_mirror_group_size | int) == 0
+      - (whpg_mirror_group_size | int) >= 2
+      - primary_data_dirs | length == whpg_segments_per_host | int
+      - primary_data_dirs | length == mirror_data_dirs | length
+      - (whpg_segments_per_host | int) % (whpg_data_mounts | length) == 0
+    fail_msg: >-
+      segment 호스트 수({{ segment_hosts | length }}: {{ segment_hosts | join(', ') }})는
+      whpg_mirror_group_size({{ whpg_mirror_group_size }})의 배수여야 하고,
+      호스트당 segment 수(whpg_segments_per_host={{ whpg_segments_per_host }})는
+      데이터 디스크 수({{ whpg_data_mounts | length }})의 배수여야 합니다 (디스크별 균등 배치).
+      inventory/hosts 의 [segments] 를 확인하세요.
+    quiet: true
+  run_once: true
 
 # ---------- 1. gpinitsystem 설정파일 생성 ----------
 - name: gpinitsystem_config 생성
   ansible.builtin.template:
     src: gpinitsystem_config.j2
-    dest: "{{ gpadmin_home }}/gpinitsystem_config"
+    dest: "{{ whpg_gpinitsystem_config }}"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0644'
@@ -17,7 +36,7 @@
 - name: seg_hosts 파일 생성 (세그먼트 전용)
   ansible.builtin.template:
     src: seg_hosts.j2
-    dest: "{{ gpadmin_home }}/seg_hosts"
+    dest: "{{ whpg_hostfile_segments }}"
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0644'
@@ -28,12 +47,11 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpinitsystem -c {{ gpadmin_home }}/gpinitsystem_config
-      -h {{ gpadmin_home }}/seg_hosts -a 2>&1
+      gpinitsystem -c {{ whpg_gpinitsystem_config }}
+      -h {{ whpg_hostfile_segments }} -a 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   when: inventory_hostname == coordinator_host
   register: gpinit_result
   changed_when: "'Greenplum Database instance successfully created' in gpinit_result.stdout or
@@ -47,26 +65,9 @@
     var: gpinit_result.stdout_lines
   when: inventory_hostname == coordinator_host
 
-# ---------- 3. Mirror 세그먼트 추가 ----------
-- name: Mirror 세그먼트 추가 (gpaddmirrors)
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpaddmirrors -a 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
-  when: inventory_hostname == coordinator_host
-  register: mirror_result
-  changed_when: "'mirrors successfully added' in mirror_result.stdout"
-  failed_when:
-    - mirror_result.rc != 0
-    - "'already' not in mirror_result.stderr | default('')"
-
-- name: Mirror 추가 결과 출력
-  ansible.builtin.debug:
-    var: mirror_result.stdout_lines
+# ---------- 3. Mirror 세그먼트 추가 ({{ whpg_mirror_group_size }}대 단위 spread, gpaddmirrors -i) ----------
+- name: Mirror 세그먼트 추가
+  ansible.builtin.include_tasks: mirrors.yml
   when: inventory_hostname == coordinator_host
 
 # ---------- 4. Standby Coordinator 추가 ----------
@@ -74,11 +75,10 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpinitstandby -s {{ standby_coordinator_host }} -a 2>&1
+      gpinitstandby -s {{ standby_coordinator_host }} -S {{ standby_data_dir }} -a 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   when: inventory_hostname == coordinator_host
   register: standby_result
   changed_when: "'Standby coordinator successfully created' in standby_result.stdout"
@@ -96,21 +96,14 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpconfig -c {{ item.param }} -v "{{ item.value }}" 2>&1
+      gpconfig -c {{ item.name }} -v "{{ item.value }}"
+      {% if item.coordinator_value is defined %}-m "{{ item.coordinator_value }}"{% endif %} 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
-  loop:
-    - { param: "max_connections",           value: "{{ whpg_max_connections }}" }
-    - { param: "shared_buffers",            value: "{{ whpg_shared_buffers }}" }
-    - { param: "effective_cache_size",      value: "{{ whpg_effective_cache_size }}" }
-    - { param: "statement_mem",             value: "256MB" }
-    - { param: "max_statement_mem",         value: "2GB" }
-    - { param: "wal_level",                 value: "replica" }
-    - { param: "logging_collector",         value: "on" }
-    - { param: "log_min_duration_statement", value: "1000" }
-    - { param: "shared_preload_libraries",  value: "pg_stat_statements" }
+  environment: "{{ whpg_env }}"
+  loop: "{{ whpg_gpconfig_params + whpg_gpconfig_params_extra }}"
+  loop_control:
+    label: "{{ item.name }}"
   when: inventory_hostname == coordinator_host
   changed_when: true
 
@@ -118,9 +111,10 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d gpadmin -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>&1
+      psql -d {{ whpg_database }} -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
   when: inventory_hostname == coordinator_host
   changed_when: true
 
@@ -131,8 +125,7 @@
       gpstop -ra -a 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   when: inventory_hostname == coordinator_host
   changed_when: true
 
@@ -142,9 +135,9 @@
     path: "{{ coordinator_data_dir }}/pg_hba.conf"
     marker: "# {mark} Ansible Managed WHPG Access Rules"
     block: |
-      host    all             gpadmin         0.0.0.0/0         md5
-      host    all             all             127.0.0.1/32      md5
-      host    all             all             ::1/128           md5
+      {% for rule in whpg_pg_hba_rules %}
+      {{ rule.type }}    {{ rule.database }}    {{ rule.user }}    {{ rule.address }}    {{ rule.method }}
+      {% endfor %}
   when: inventory_hostname == coordinator_host
   notify: reload_whpg
 
@@ -156,8 +149,7 @@
       gpconfig -c TimeZone -v '{{ whpg_timezone }}' 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   when: inventory_hostname == coordinator_host
   changed_when: true
 
@@ -170,14 +162,13 @@
   failed_when: false
   when: inventory_hostname == coordinator_host
 
-- name: gpconfig resource_manager 설정 (cgroup v2 → group-v2)
+- name: "gpconfig resource_manager 설정 ({{ whpg_resource_manager }})"
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpconfig -c gp_resource_manager -v 'group-v2' 2>&1
+      gpconfig -c gp_resource_manager -v '{{ whpg_resource_manager }}' 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment:
-    COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
+  environment: "{{ whpg_env }}"
   when: inventory_hostname == coordinator_host
   changed_when: true

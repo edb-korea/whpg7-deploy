@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fault 상태 처리 스크립트
-LOGFILE=/var/log/whpg_ha_demote.log
+LOGFILE={{ ha_log_dir }}/whpg_ha_demote.log
 echo "[$(date)] keepalived FAULT state detected. Stopping WHPG if running." >> $LOGFILE
 
 source {{ whpg_install_dir }}/greenplum_path.sh

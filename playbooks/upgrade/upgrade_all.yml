@@ -3,7 +3,7 @@
 # WarehousePG 전체 업그레이드 통합 플레이북
 #
 # 사용법:
-#   # 전체 업그레이드 (Core + Extensions + WEM)
+#   # 전체 업그레이드 (Core + Extensions)
 #   ansible-playbook playbooks/upgrade/upgrade_all.yml \
 #     -e "local_rpm_dir=/opt/whpg-rpms"
 #
@@ -15,22 +15,11 @@
 #   ansible-playbook playbooks/upgrade/upgrade_all.yml \
 #     -e "local_rpm_dir=/opt/whpg-rpms" --tags extensions
 #
-#   # WEM만
-#   ansible-playbook playbooks/upgrade/upgrade_all.yml \
-#     -e "local_rpm_dir=/opt/whpg-rpms" --tags wem
-#
-#   # WEM Collector만
-#   ansible-playbook playbooks/upgrade/upgrade_all.yml \
-#     -e "local_rpm_dir=/opt/whpg-rpms" --tags collector
-#
-#   # WEM Dashboard만
-#   ansible-playbook playbooks/upgrade/upgrade_all.yml \
-#     -e "local_rpm_dir=/opt/whpg-rpms" --tags dashboard
-#
 # 업그레이드 순서:
 #   1. Core (WHPG 정지 → RPM 교체 → 재시작)
 #   2. Extensions (서비스 유지, RPM 교체 → ALTER EXTENSION UPDATE)
-#   3. WEM (Collector 교체 → Dashboard 교체)
+#
+# WEM 은 wem_version 등을 바꾼 뒤 playbooks/07_wem.yml 을 다시 실행 (README WEM 절)
 # ======================================================
 
 - name: "Upgrade Step 1: WHPG Core"
@@ -40,7 +29,3 @@
 - name: "Upgrade Step 2: Extensions"
   ansible.builtin.import_playbook: upgrade_extensions.yml
   tags: [extensions]
-
-- name: "Upgrade Step 3: WEM (Collector + Dashboard)"
-  ansible.builtin.import_playbook: upgrade_wem.yml
-  tags: [wem, collector, dashboard]

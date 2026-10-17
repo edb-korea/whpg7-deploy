@@ -1,0 +1,27 @@
+---
+# 서비스 상태 확인
+# tag: always
+- name: Collect service states
+  ansible.builtin.shell:
+    cmd: |
+      for s in {{ ('clickhouse-server ' ~ ((wem_state_service ~ ' ') if wem_state_install | bool else '') ~ 'wem ') if inventory_hostname == wem_host else '' }}acp-host-agent edb-otelcol; do
+        echo "$s=$(systemctl is-active $s)"
+      done
+    executable: /bin/bash
+  register: _states
+  changed_when: false
+
+- name: Show service states
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: {{ _states.stdout_lines }}"
+
+- name: Summary
+  ansible.builtin.debug:
+    msg:
+      - "WEM UI : http://{{ wem_host_ip }}:{{ wem_port }}/  (admin / WEM_ADMIN_PASSWORD)"
+      - "Host Agents: Management > Host Agents 에서 모두 approved 인지 확인"
+      - "otelcol은 승인 전에는 inactive 일 수 있음 (정상)"
+      - "WEM 웹 포털 HTTPS는 공식 설정 파라미터가 없어 구성하지 않았음 (HTTP + WEM_INSECURE_COOKIES=1)"
+      - "DB 메트릭(sqlquery) 수집: {{ ('standby(' ~ (_standby_hosts | first) ~ ')에서 ' ~ otelcol_sqlquery_host ~ ' 로 접속') if (_otel_sqlquery_move | bool) else 'coordinator에서 127.0.0.1 로 접속' }}"
+      - "otelcol 조정(batch, file_log, sqlquery)은 {{ otelcol_local_config }} 에 있음 (acp-host-agent 재시작에도 유지, 값 변경 후 -t tune)"
+  run_once: true

@@ -1,0 +1,35 @@
+{#
+  gpexpand -i 입력 파일 (형식: hostname|address|port|datadir|dbid|content|preferred_role)
+  입력: _expand_new_hosts (inventory [segments] 끝에 추가된 호스트, whpg_mirror_group_size 의 배수)
+        _expand_max_content / _expand_max_dbid (현재 최대값)
+
+  primary : 새 호스트 순서 × k(0..K-1) 순서로 content 부여, primary_data_dirs[k], 포트 whpg_port_base + k
+  mirror  : roles/whpg_init/templates/gpaddmirrors_config.j2 와 같은 규칙
+            그룹 내 순번 h 호스트의 k 번째 primary → 같은 그룹 (h + (k mod (G-1)) + 1) mod G 호스트의
+            k 번째 mirror 슬롯 (mirror_data_dirs[k], 포트 whpg_mirror_port_base + k)
+-#}
+{% set G = whpg_mirror_group_size | int %}
+{% set K = primary_data_dirs | length %}
+{% set ns = namespace(dbid=_expand_max_dbid | int) %}
+{% set first = _expand_max_content | int + 1 %}
+{% for host in _expand_new_hosts %}
+{%   set i = loop.index0 %}
+{%   for k in range(K) %}
+{%     set c = first + i * K + k %}
+{%     set ns.dbid = ns.dbid + 1 %}
+{{ hostvars[host]._expand_hostname }}|{{ host }}|{{ whpg_port_base | int + k }}|{{ primary_data_dirs[k] }}/{{ whpg_seg_prefix }}{{ c }}|{{ ns.dbid }}|{{ c }}|p
+{%   endfor %}
+{% endfor %}
+{% if _expand_has_mirrors | bool %}
+{%   for host in _expand_new_hosts %}
+{%     set i = loop.index0 %}
+{%     set h = segment_hosts.index(host) %}
+{%     set base = (h // G) * G %}
+{%     for k in range(K) %}
+{%       set c = first + i * K + k %}
+{%       set mh = segment_hosts[base + (h - base + k % (G - 1) + 1) % G] %}
+{%       set ns.dbid = ns.dbid + 1 %}
+{{ hostvars[mh]._expand_hostname }}|{{ mh }}|{{ whpg_mirror_port_base | int + k }}|{{ mirror_data_dirs[k] }}/{{ whpg_seg_prefix }}{{ c }}|{{ ns.dbid }}|{{ c }}|m
+{%     endfor %}
+{%   endfor %}
+{% endif %}
