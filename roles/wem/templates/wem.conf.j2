@@ -35,6 +35,9 @@ WEM_AGENT_JOIN_SECRET='{{ wem_join_secret_value }}'
 {% if wem_high_load_mode | length > 0 %}
 HIGH_LOAD_MODE={{ wem_high_load_mode }}
 {% endif %}
+{% if wem_pool_max_conns | string | length > 0 %}
+WEM_POOL_MAX_CONNS={{ wem_pool_max_conns }}
+{% endif %}
 {% for line in wem_extra_conf_lines %}
 {{ line }}
 {% endfor %}

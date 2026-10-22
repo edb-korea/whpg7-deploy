@@ -19,7 +19,7 @@
 #   1. Core (WHPG 정지 → RPM 교체 → 재시작)
 #   2. Extensions (서비스 유지, RPM 교체 → ALTER EXTENSION UPDATE)
 #
-# WEM 은 wem_version 등을 바꾼 뒤 playbooks/07_wem.yml 을 다시 실행 (README WEM 절)
+# WEM 은 playbooks/07_wem.yml -t upgrade 로 repo 최신 버전으로 업그레이드 (README WEM 절)
 # ======================================================
 
 - name: "Upgrade Step 1: WHPG Core"

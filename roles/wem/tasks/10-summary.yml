@@ -15,13 +15,28 @@
   ansible.builtin.debug:
     msg: "{{ inventory_hostname }}: {{ _states.stdout_lines }}"
 
+# -t upgrade 로 실행하면 모든 노드의 업그레이드 대상(--check) 또는 업그레이드한 패키지를 함께 보여 준다
 - name: Summary
   ansible.builtin.debug:
-    msg:
-      - "WEM UI : http://{{ wem_host_ip }}:{{ wem_port }}/  (admin / WEM_ADMIN_PASSWORD)"
-      - "Host Agents: Management > Host Agents 에서 모두 approved 인지 확인"
-      - "otelcol은 승인 전에는 inactive 일 수 있음 (정상)"
-      - "WEM 웹 포털 HTTPS는 공식 설정 파라미터가 없어 구성하지 않았음 (HTTP + WEM_INSECURE_COOKIES=1)"
-      - "DB 메트릭(sqlquery) 수집: {{ ('standby(' ~ (_standby_hosts | first) ~ ')에서 ' ~ otelcol_sqlquery_host ~ ' 로 접속') if (_otel_sqlquery_move | bool) else 'coordinator에서 127.0.0.1 로 접속' }}"
-      - "otelcol 조정(batch, file_log, sqlquery)은 {{ otelcol_local_config }} 에 있음 (acp-host-agent 재시작에도 유지, 값 변경 후 -t tune)"
+    msg: >-
+      {%- set out = [
+            'WEM UI : http://' ~ wem_host_ip ~ ':' ~ wem_port ~ '/  (admin / WEM_ADMIN_PASSWORD)',
+            'Host Agents: Management > Host Agents 에서 모두 approved 인지 확인',
+            'otelcol은 승인 전에는 inactive 일 수 있음 (정상)',
+            'WEM 웹 포털 HTTPS는 공식 설정 파라미터가 없어 구성하지 않았음 (HTTP + WEM_INSECURE_COOKIES=1)',
+            'DB 메트릭(sqlquery) 수집: ' ~ (('standby(' ~ (_standby_hosts | first) ~ ')에서 ' ~ otelcol_sqlquery_host ~ ' 로 접속') if (_otel_sqlquery_move | bool) else 'coordinator에서 127.0.0.1 로 접속'),
+            'otelcol 조정(file_log, sqlquery)은 ' ~ otelcol_local_config ~ ' 에 있음 (acp-host-agent 재시작에도 유지, 값 변경 후 -t tune)'] -%}
+      {%- set upg_hosts = ansible_play_hosts | select('in', hostvars) | map('extract', hostvars) | selectattr('_upg_targets', 'defined') | list -%}
+      {%- if upg_hosts -%}
+      {%- set _ = out.append(('업그레이드 대상 (--check: 실제로 변경하지 않음. 업그레이드하려면 --check 없이 -t upgrade)' if ansible_check_mode else '업그레이드한 패키지') ~ ':') -%}
+      {%- for h in upg_hosts -%}
+      {%- for t in h._upg_targets -%}
+      {%- set _ = out.append('  ' ~ h.inventory_hostname ~ ': ' ~ t) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- if (upg_hosts | map(attribute='_upg_targets') | flatten | length) == 0 -%}
+      {%- set _ = out.append('  없음 (모든 패키지가 repo 최신 버전)') -%}
+      {%- endif -%}
+      {%- endif -%}
+      {{ out }}
   run_once: true
