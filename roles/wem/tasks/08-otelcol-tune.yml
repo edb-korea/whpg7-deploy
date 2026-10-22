@@ -5,7 +5,7 @@
 # WEM 이 배포한 config.yaml 은 acp-host-agent 를 재시작하면 다시 렌더링되어 직접 수정한 값이 원복된다.
 # 그래서 config.yaml 은 건드리지 않고 override 파일(config_local.yaml)을 만들어
 # edb-otelcol.conf 의 OTELCOL_OPTIONS 에 --config 로 함께 읽게 한다.
-#   - 모든 노드: file_log(start_at=end, poll_interval), batch 값 조정
+#   - 모든 노드: file_log(start_at=end, poll_interval) 조정
 #   - wem_use_vip=true (coordinator failover 대비):
 #       coordinator : metrics 파이프라인에서 sqlquery/whpg 제거
 #       standby     : whpg_db_metrics.yaml 을 복사하고 sqlquery/whpg(VIP 접속)를 추가
@@ -27,7 +27,7 @@
 
 - name: Warn when otelcol config was not deployed
   ansible.builtin.debug:
-    msg: "{{ inventory_hostname }}: WEM 이 배포한 otelcol 설정이 {{ agent_approval_wait_seconds }}초 안에 들어오지 않았습니다. Host Agent 가 승인되지 않았을 수 있습니다 (agent 로그: awaiting TLS material). WEM UI 에서 승인 후 -t tune,querylogs 로 다시 실행하세요."
+    msg: "{{ inventory_hostname }}: WEM 이 배포한 otelcol 설정이 {{ agent_approval_wait_seconds }}초 안에 들어오지 않았습니다. Host Agent 가 승인되지 않았을 수 있습니다 (agent 로그: awaiting TLS material). WEM UI 에서 승인 후 -t tune 로 다시 실행하세요."
   when: _otel_cfg_wait is failed
 
 # 가이드 주의 2-1: coordinator 의 whpg_db_metrics.yaml 을 standby 로 복사

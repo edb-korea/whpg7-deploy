@@ -1,14 +1,14 @@
 ---
-# WEM 1.4 구성 (WEM 1.2 가 있으면 먼저 삭제). playbooks/07_wem.yml, site.yml Phase 5 가 실행한다.
+# WEM 1.4 구성 (WEM 1.2/1.3 이 있으면 먼저 삭제). playbooks/07_wem.yml, site.yml 이 실행한다.
 # 단계별 tag 로 일부만 실행할 수 있다 (예: -t tune). 자세한 내용은 README.md 의 WEM 절을 참고한다.
-# 참고: https://github.com/edb-korea/wem_ansible
+# 참고: https://github.com/edb-korea/wem-deploy
 
 # 실행 전 확인 (OS, VIP 활성 여부, wem_use_vip 조건, 배치 출력)
 - name: "00-checks"
   ansible.builtin.import_tasks: 00-checks.yml
   tags: [always]
 
-# WEM 1.2 삭제 (Prometheus / Loki / Alertmanager / Alloy / collector) - 1.2 가 감지된 경우만
+# WEM 1.2/1.3 삭제 (Prometheus / Loki / Alertmanager / Alloy / collector) - 1.2/1.3 이 감지된 경우만
 - name: "01-cleanup-wem12"
   ansible.builtin.import_tasks: 01-cleanup-wem12.yml
   tags: [cleanup]
@@ -39,14 +39,18 @@
   tags: [agent]
 
 # otelcol 설정 조정 (CPU 절감, DB 메트릭 수집 위치)
+# --check 에서 Host Agent 가 아직 설치되지 않았으면(설치 예정) 건너뛴다 (WEM 이 배포할 설정이 없음)
 - name: "08-otelcol-tune"
   ansible.builtin.import_tasks: 08-otelcol-tune.yml
+  when: not (ansible_check_mode and (_agent_installed.rc | default(0)) != 0)
   tags: [tune]
 
-# ClickHouse Coordinator Query Logs 객체 (WEM host)
-- name: "09-query-logs"
-  ansible.builtin.import_tasks: 09-query-logs.yml
-  tags: [querylogs]
+# WEM 관련 RPM 을 repo 최신 버전으로 업그레이드 (-t upgrade 를 지정할 때만)
+# site.yml 의 play tag(phase7, wem)가 상속되어 never 를 무시하지 않도록 ansible_run_tags 도 확인한다
+- name: "upgrade"
+  ansible.builtin.import_tasks: upgrade.yml
+  when: "'upgrade' in ansible_run_tags"
+  tags: [upgrade, never]
 
 # 서비스 상태 확인
 - name: "10-summary"

@@ -30,7 +30,7 @@ whpg-ansible/
 │       ├── stop.yml                   # 클러스터 정지
 │       ├── recover_segments.yml       # 세그먼트 복구 (gprecoverseg)
 │       ├── resync_standby.yml         # Standby 재동기화 (장애 후 재구성)
-│       ├── remove_wem.yml             # WEM 1.4 삭제
+│       ├── remove_wem.yml             # WEM 1.4 이상 삭제
 │       ├── expand_segments.yml        # Segment 4대 단위 증설 (gpexpand)
 │       └── minor_upgrade.yml          # 마이너 업그레이드
 └── roles/
@@ -58,10 +58,9 @@ whpg-ansible/
     │   ├── tasks/main.yml
     │   └── templates/pxf-core-site.xml.j2
     ├── whpg_expand/                   # Segment 증설 (plan / prepare / gpexpand)
-    ├── wem/                           # WEM 1.4 (edb-korea/wem_ansible 기반)
+    ├── wem/                           # WEM 1.4 (edb-korea/wem-deploy 기반)
     │   ├── defaults/main.yml          # WEM 변수 전체
-    │   ├── tasks/                     # 00-checks ~ 10-summary, remove-wem14 (단계별, tag)
-    │   ├── files/query_logs_*.sql     # ClickHouse Coordinator Query Logs 객체
+    │   ├── tasks/                     # 00-checks ~ 10-summary, upgrade, remove-wem14 (단계별, tag)
     │   └── templates/
     │       ├── wem.conf.j2                # WEM 설정
     │       └── otelcol_config_local.yaml.j2   # otelcol override (config_local.yaml)
@@ -351,7 +350,7 @@ ansible-playbook playbooks/ops/expand_segments.yml -e expand_duration=04:00:00  
 
 ## WEM 구성 (Phase 7)
 
-[edb-korea/wem_ansible](https://github.com/edb-korea/wem_ansible) 의 WEM 1.4 role 을 이 프로젝트 inventory 에 맞춰 반영했습니다.
+[edb-korea/wem-deploy](https://github.com/edb-korea/wem-deploy) 의 WEM 1.4 role 을 이 프로젝트 inventory 에 맞춰 반영했습니다.
 
 ```
 [wem_host = wem_node 그룹 (기본 standby, 없으면 coordinator 로 지정)]
@@ -372,29 +371,37 @@ ansible-playbook playbooks/ops/expand_segments.yml -e expand_duration=04:00:00  
 
 - 패키지는 다른 RPM 과 같이 Controller 의 `local_rpm_dir` 우선 → dnf fallback 으로 설치합니다.
   필요 패키지: `whpg-enterprise-manager`, `edb-clickhouse-common-static/server/client`, `edb-acp-host-agent`, `edb-otelcol`
-- WEM 1.2(Prometheus / Loki / Alertmanager / Alloy / observability-collector)가 설치되어 있으면 먼저 삭제합니다 (`wem_cleanup_legacy: auto`).
-  이때 WHPG 의 1.2 상태 DB(`wem`)도 삭제하므로, 보존하려면 `wem_drop_old_state_db_in_whpg: false`.
+- WEM 1.2/1.3(Prometheus / Loki / Alertmanager / Alloy / observability-collector)이 설치되어 있으면 먼저 삭제합니다 (`wem_cleanup_legacy: auto`).
+  `whpg-enterprise-manager` 가 1.4(`wem_remove_min_version`) 이상이면 1.2/1.3 으로 보지 않습니다.
+  이때 WHPG 의 1.2/1.3 상태 DB(`wem`)도 삭제하므로, 보존하려면 `wem_drop_old_state_db_in_whpg: false`.
 - 다시 실행해도 WEM 의 cookie / join secret 을 유지하고, 설정이 바뀐 서비스만 재시작합니다.
+  `-t upgrade` 로 `wem_version` 보다 높은 WEM 이 설치되어 있으면 `wem_version` 으로 내리지 않습니다.
+- `--check` 는 WEM 이 없는 호스트에서도 통과합니다 (설치 예정 패키지의 서비스 기동 / 확인, otelcol 조정은 건너뜀).
+- RPM 업그레이드(`-t upgrade`)는 설치되어 있는 패키지만 dnf repo 의 최신 버전으로 올립니다 (`local_rpm_dir` 은 보지 않음).
+  WEM host(ClickHouse → WEM)를 먼저 올리고, 모든 노드의 Host Agent / otelcol 을 한 대씩 올리며, 업그레이드된 서비스만 재시작합니다.
+  대상은 `wem_upgrade_packages_wem_host` / `wem_upgrade_packages_all_hosts`. 결과는 마지막 Summary 에 표시됩니다.
 - 접속: `http://<wem_host IP>:8080/` (admin / `vault_wem_admin_password`). **Management > Host Agents** 에서 모든 노드가 approved 인지 확인
 
 ```bash
 ansible-playbook playbooks/07_wem.yml                       # 설치
 ansible-playbook playbooks/07_wem.yml -e wem_use_vip=false  # VIP 대신 coordinator 실 IP 로 접속
-ansible-playbook playbooks/07_wem.yml -t tune,querylogs     # 일부 단계만
-ansible-playbook playbooks/ops/remove_wem.yml               # 삭제 (확인 질문 없음)
+ansible-playbook playbooks/07_wem.yml -t tune               # 일부 단계만
+ansible-playbook playbooks/07_wem.yml -t upgrade --check    # WEM 관련 RPM 의 설치 / repo 최신 버전 확인만
+ansible-playbook playbooks/07_wem.yml -t upgrade            # WEM 관련 RPM 을 repo 최신 버전으로 업그레이드
+ansible-playbook playbooks/ops/remove_wem.yml               # 삭제 (확인 질문 없음, WEM 1.4 이상일 때만)
 ```
 
 | tag | 태스크 파일 (`roles/wem/tasks/`) | 내용 |
 |---|---|---|
 | (always) | `00-checks.yml` | OS, VIP 활성 여부, 배치 출력 |
-| `cleanup` | `01-cleanup-wem12.yml` | WEM 1.2 삭제 (감지된 경우만) |
+| `cleanup` | `01-cleanup-wem12.yml` | WEM 1.2/1.3 삭제 (감지된 경우만) |
 | `pghba` | `03-pg-hba.yml` | coordinator / standby `pg_hba.conf` 에 wemon 허용 (`gpstop -u`) |
 | `clickhouse` | `04-clickhouse.yml` | ClickHouse 설치 (wem_host) |
 | `statedb` | `05-state-database.yml` | wemon 계정 / DB / resource group, (선택) 별도 상태 DB |
 | `wem` | `06-wem.yml` | WEM 1.4 설치, `wem.conf` |
 | `agent` | `07-host-agent.yml` | Host Agent / otelcol 설치, otelcol 조정 선적용, 자동 승인 |
 | `tune` | `08-otelcol-tune.yml` | WEM 이 배포한 otelcol 설정과 병합 검사, 변경 시만 재시작 |
-| `querylogs` | `09-query-logs.yml` | ClickHouse `coordinator_query_logs` 객체 |
+| `upgrade` | `upgrade.yml` | WEM 관련 RPM 을 repo 최신 버전으로 업그레이드 (`-t upgrade` 지정 시에만) |
 | (always) | `10-summary.yml` | 서비스 상태 |
 
 `-t agent` 는 `wem` 단계의 join secret 을 쓰므로 `-t wem,agent` 로 함께 실행합니다.
@@ -466,4 +473,4 @@ ansible-playbook playbooks/ops/minor_upgrade.yml \
 - [WHPG 설치 가이드 (한국어 Tips)](https://github.com/unixfree/WarehousePG-Tip/blob/main/02.설치가이드.md)
 - [Coordinator HA v2](https://github.com/unixfree/whpg_coordinator_ha_v2)
 - [WEM 설치 가이드](https://www.enterprisedb.com/docs/supported-open-source/warehousepg/wem/installing/)
-- [WEM 1.4 Ansible (edb-korea)](https://github.com/edb-korea/wem_ansible)
+- [WEM 1.4 Ansible (edb-korea)](https://github.com/edb-korea/wem-deploy)

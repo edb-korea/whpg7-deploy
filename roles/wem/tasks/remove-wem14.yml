@@ -10,20 +10,28 @@
     executable: /bin/bash
   register: _wem_ver
   changed_when: false
-  when: inventory_hostname == wem_host
+  check_mode: false
+  delegate_to: "{{ wem_host }}"
+  run_once: true
 
-- name: Decide whether the installed WEM is the 1.4 line
+- name: Decide whether the installed WEM is wem_remove_min_version or later
   ansible.builtin.set_fact:
-    _remove_wem_pkg: "{{ (_wem_ver.stdout | trim) is match('^' ~ (wem_remove_version_prefix | regex_escape)) }}"
-  when: inventory_hostname == wem_host
+    _remove_wem_pkg: >-
+      {{ (_wem_ver.stdout | trim | length > 0)
+         and ((_wem_ver.stdout | trim) is version(wem_remove_min_version, '>=')) }}
 
 - name: Show WEM removal decision
   ansible.builtin.debug:
     msg:
       - "WEM host = {{ wem_host }}"
       - "설치된 whpg-enterprise-manager 버전 = '{{ _wem_ver.stdout | trim | default('없음', true) }}'"
-      - "WEM 패키지 삭제 = {{ _remove_wem_pkg }} ({{ wem_remove_version_prefix }}.x 일 때만 삭제)"
-  when: inventory_hostname == wem_host
+      - "삭제 진행 = {{ _remove_wem_pkg }} ({{ wem_remove_min_version }} 이상일 때만 삭제)"
+  run_once: true
+
+# whpg-enterprise-manager 가 없거나 wem_remove_min_version 보다 낮으면 아무것도 지우지 않고 끝낸다
+- name: End play when WEM is not installed or older than wem_remove_min_version
+  ansible.builtin.meta: end_play
+  when: not (_remove_wem_pkg | bool)
 
 # =========================================================================
 # 1. 서비스 중지

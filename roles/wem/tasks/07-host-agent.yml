@@ -1,6 +1,13 @@
 ---
 # Host Agent + otelcol 설치, join-token 선등록 (전 노드)
 # tag: agent
+- name: Check whether Host Agent and otelcol are installed
+  ansible.builtin.command: rpm -q {{ host_agent_package }} {{ otelcol_package }}
+  register: _agent_installed
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
 # Controller 의 local_rpm_dir 우선 → dnf fallback
 - name: Install Host Agent and otelcol
   ansible.builtin.include_role:
@@ -38,30 +45,34 @@
   register: _agent_token
   no_log: true
 
-# agent 가 승인 후 otelcol 을 처음 띄울 때부터 조정 값(start_at: end, batch 등)이 적용되도록 미리 넣어 둔다
-- name: Pre-stage otelcol override before the agent starts otelcol
-  ansible.builtin.include_tasks:
-    file: otelcol-local-config.yml
-    apply:
-      tags: [agent]
-  vars:
-    _otel_prestage: true
+# --check 에서 패키지가 아직 설치되지 않았으면(설치 예정) 설정 파일 / 서비스가 없으므로 아래 단계는 건너뛴다
+- name: Pre-stage otelcol override and start Host Agent
+  when: not (ansible_check_mode and _agent_installed.rc != 0)
+  block:
+    # agent 가 승인 후 otelcol 을 처음 띄울 때부터 조정 값(start_at: end 등)이 적용되도록 미리 넣어 둔다
+    - name: Pre-stage otelcol override before the agent starts otelcol
+      ansible.builtin.include_tasks:
+        file: otelcol-local-config.yml
+        apply:
+          tags: [agent]
+      vars:
+        _otel_prestage: true
 
-# 설정 / join-token 이 바뀐 경우에만 재시작 (다시 실행해도 agent 가 재등록되지 않음)
-- name: Enable and start Host Agent (한 대씩 순차 기동)
-  ansible.builtin.systemd:
-    name: acp-host-agent
-    enabled: true
-    state: "{{ 'restarted' if (_agent_conf is changed or _agent_token is changed) else 'started' }}"
-  throttle: 1
+    # 설정 / join-token 이 바뀐 경우에만 재시작 (다시 실행해도 agent 가 재등록되지 않음)
+    - name: Enable and start Host Agent (한 대씩 순차 기동)
+      ansible.builtin.systemd:
+        name: acp-host-agent
+        enabled: true
+        state: "{{ 'restarted' if (_agent_conf is changed or _agent_token is changed) else 'started' }}"
+      throttle: 1
 
-- name: Verify join-token is still the pre-seeded value
-  ansible.builtin.slurp:
-    src: "{{ host_agent_join_token_file }}"
-  register: _join_after
-  no_log: true
+    - name: Verify join-token is still the pre-seeded value
+      ansible.builtin.slurp:
+        src: "{{ host_agent_join_token_file }}"
+      register: _join_after
+      no_log: true
 
-- name: Warn when the agent replaced the join-token
-  ansible.builtin.debug:
-    msg: "{{ inventory_hostname }}: join-token이 에이전트에 의해 재생성되었습니다. WEM UI(Management > Host Agents)에서 수동 승인이 필요할 수 있습니다."
-  when: (_join_after.content | b64decode | trim) != hostvars[wem_host].wem_join_secret_value
+    - name: Warn when the agent replaced the join-token
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: join-token이 에이전트에 의해 재생성되었습니다. WEM UI(Management > Host Agents)에서 수동 승인이 필요할 수 있습니다."
+      when: (_join_after.content | b64decode | trim) != hostvars[wem_host].wem_join_secret_value

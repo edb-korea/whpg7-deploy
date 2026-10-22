@@ -1,0 +1,138 @@
+---
+# WEM 관련 RPM 을 repo 의 최신 버전으로 업그레이드
+# tag: upgrade (never: -t upgrade 를 지정할 때만 실행)
+#
+#   ansible-playbook playbooks/07_wem.yml -t upgrade --check   # 버전 확인만 (업그레이드 안 함)
+#   ansible-playbook playbooks/07_wem.yml -t upgrade           # 확인 후 업그레이드
+#
+# 설치되어 있는 패키지만 올린다 (update_only). 설정 파일(wem.conf, config.yaml, edb-otelcol.conf,
+# config_local.yaml)은 RPM 의 %config(noreplace) 이거나 RPM 소유가 아니므로 업그레이드해도 유지된다.
+# 순서: WEM host (ClickHouse → WEM) 를 먼저 올리고, 그 다음 모든 노드의 Host Agent / otelcol 을 한 대씩 올린다.
+# 서비스는 업그레이드된 패키지가 있을 때만 재시작한다.
+
+- name: Check installed and repo latest versions
+  ansible.builtin.shell:
+    cmd: |
+      dnf -q makecache --refresh >/dev/null 2>&1
+      for p in {{ ((wem_upgrade_packages_wem_host + wem_upgrade_packages_all_hosts) if inventory_hostname == wem_host else wem_upgrade_packages_all_hosts) | join(' ') }}; do
+        i=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p" 2>/dev/null) || i='(미설치)'
+        l=$(dnf -q repoquery --available --latest-limit 1 --qf '%{version}-%{release}' "$p" 2>/dev/null | tail -n1)
+        u=$(dnf -q repoquery --upgrades --latest-limit 1 --qf '%{version}-%{release}' "$p" 2>/dev/null | tail -n1)
+        echo "$p: 설치=$i repo 최신=${l:-(없음)}${u:+  -> 업그레이드 대상}"
+        [ -n "$u" ] && echo "UPG $p $i -> $u"
+      done
+      true
+    executable: /bin/bash
+  register: _upg_before
+  changed_when: false
+  check_mode: false
+
+- name: Show upgrade plan
+  ansible.builtin.debug:
+    msg: "{{ [inventory_hostname] + (_upg_before.stdout_lines | reject('match', '^UPG ') | list) }}"
+
+# 10-summary 의 Summary 에 모든 노드의 업그레이드 대상을 모아 보여 준다
+- name: Remember upgrade targets for the summary
+  ansible.builtin.set_fact:
+    _upg_targets: "{{ _upg_before.stdout_lines | select('match', '^UPG ') | map('regex_replace', '^UPG ', '') | list }}"
+
+# ---------------------------------------------------------------------------
+# WEM host: ClickHouse → WEM
+# ---------------------------------------------------------------------------
+- name: Upgrade ClickHouse / WEM on the WEM host
+  when: inventory_hostname == wem_host
+  block:
+    - name: Upgrade ClickHouse packages
+      ansible.builtin.dnf:
+        name: "{{ wem_upgrade_packages_wem_host | reject('equalto', wem_pkg_name) | list }}"
+        state: latest
+        update_only: true
+        update_cache: true
+      register: _upg_clickhouse
+
+    - name: Restart ClickHouse after upgrade
+      when: _upg_clickhouse is changed
+      block:
+        - name: Restart clickhouse-server
+          ansible.builtin.systemd:
+            name: clickhouse-server
+            state: restarted
+            daemon_reload: true
+
+        - name: Wait for ClickHouse native port
+          ansible.builtin.wait_for:
+            host: "{{ wem_host_ip }}"
+            port: "{{ clickhouse_native_port }}"
+            timeout: 120
+
+    - name: Upgrade WEM package
+      ansible.builtin.dnf:
+        name: "{{ wem_pkg_name }}"
+        state: latest
+        update_only: true
+        update_cache: true
+      register: _upg_wem
+      when: wem_pkg_name in wem_upgrade_packages_wem_host
+
+    # WEM 은 시작할 때 필요한 상태 DB 변경(wem setup)을 스스로 수행한다
+    - name: Restart WEM after upgrade
+      when: _upg_wem is changed
+      block:
+        - name: Restart wem
+          ansible.builtin.systemd:
+            name: wem
+            state: restarted
+            daemon_reload: true
+
+        - name: Wait for WEM web / agent relay ports
+          ansible.builtin.wait_for:
+            host: "{{ wem_host_ip }}"
+            port: "{{ item }}"
+            timeout: 180
+          loop:
+            - "{{ wem_port }}"
+            - "{{ wem_agent_port }}"
+
+# ---------------------------------------------------------------------------
+# 모든 노드: Host Agent / otelcol
+# ---------------------------------------------------------------------------
+- name: Upgrade Host Agent / otelcol packages
+  ansible.builtin.dnf:
+    name: "{{ wem_upgrade_packages_all_hosts }}"
+    state: latest
+    update_only: true
+    update_cache: true
+  register: _upg_agent
+
+# config_local.yaml 은 RPM 소유가 아니고 edb-otelcol.conf 는 noreplace 이므로 조정 값은 유지된다
+- name: Restart Host Agent / otelcol after upgrade (한 대씩)
+  when: _upg_agent is changed
+  throttle: 1
+  block:
+    - name: Restart acp-host-agent
+      ansible.builtin.systemd:
+        name: acp-host-agent
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart edb-otelcol
+      ansible.builtin.systemd:
+        name: edb-otelcol
+        state: restarted
+
+- name: Check versions after upgrade
+  ansible.builtin.shell:
+    cmd: |
+      for p in {{ ((wem_upgrade_packages_wem_host + wem_upgrade_packages_all_hosts) if inventory_hostname == wem_host else wem_upgrade_packages_all_hosts) | join(' ') }}; do
+        echo "$p: $(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p" 2>/dev/null || echo '(미설치)')"
+      done
+    executable: /bin/bash
+  register: _upg_after
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+- name: Show upgrade result
+  ansible.builtin.debug:
+    msg: "{{ [inventory_hostname ~ ' (업그레이드: ' ~ ((_upg_clickhouse is changed) or (_upg_wem is changed) or (_upg_agent is changed)) ~ ')'] + _upg_after.stdout_lines }}"
+  when: not ansible_check_mode

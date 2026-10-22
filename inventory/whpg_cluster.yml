@@ -78,8 +78,9 @@ whpg_database: gpadmin              # 초기 생성 DB / 관리 작업용 DB
 #  호스트별로 다르면 inventory/host_vars/<호스트>.yml 에서 override
 # ------------------------------------------
 whpg_data_mounts:
-  - { path: /data1, device: "" }
-  - { path: /data2, device: "" }
+  - { path: /data, device: "" }
+#  - { path: /data1, device: "" }
+#  - { path: /data2, device: "" }
 # 예) 별도 디스크 사용 시
 #  - { path: /data1, device: /dev/sdb }
 #  - { path: /data2, device: /dev/sdc }
@@ -262,7 +263,7 @@ whpg_extension_catalog:
   - { name: flowserver,   pkg: "whpg7-flow-server",                         enabled: "{{ install_flowserver | bool }}" }
 
 # ------------------------------------------
-# WEM 1.4 (roles/wem, 참고: https://github.com/edb-korea/wem_ansible)
+# WEM 1.4 (roles/wem, 참고: https://github.com/edb-korea/wem-deploy)
 #   WEM / ClickHouse : wem_host (wem_node 그룹, 기본 standby)
 #   Host Agent / otelcol : 모든 노드
 # 전체 변수와 기본값은 roles/wem/defaults/main.yml. 바꿀 값만 아래에 같은 이름으로 추가
@@ -274,6 +275,7 @@ wem_enabled: true
 # wem_use_vip: true                 # 기본: coordinator_ha_enabled 값. true 면 WEM 이 coordinator_vip 로 WHPG 접속
 # wem_state_install: false          # true: WEM host 에 별도 상태 DB(PostgreSQL 5433) 설치
 # clickhouse_data_dir: ""           # ClickHouse 데이터를 다른 디스크에 둘 때 (예: /data1/clickhouse)
+# wem_pool_max_conns: "40"          # wem.conf 의 WEM_POOL_MAX_CONNS (비우면 넣지 않음)
 
 # ------------------------------------------
 # pgBouncer 설정 (pgbouncer_node 그룹)
