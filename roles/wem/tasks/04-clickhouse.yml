@@ -15,6 +15,13 @@
       ansible.builtin.command: sysctl -p /etc/sysctl.d/99-clickhouse.conf
       when: _ch_sysctl is changed
 
+    - name: Check whether ClickHouse packages are installed
+      ansible.builtin.command: rpm -q {{ clickhouse_packages | join(" ") }}
+      register: _ch_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
     # Controller 의 local_rpm_dir 우선 → dnf fallback (의존성 순서대로)
     - name: Install ClickHouse packages
       ansible.builtin.include_role:
@@ -116,37 +123,41 @@
           </clickhouse>
       register: _ch_conf_3
 
-    # 설정 파일이 바뀐 경우에만 재시작 (다시 실행해도 서비스 중단 없음)
-    - name: Enable and start clickhouse-server
-      ansible.builtin.systemd:
-        name: clickhouse-server
-        enabled: true
-        state: "{{ 'restarted' if _ch_changed | bool else 'started' }}"
-        daemon_reload: true
-      vars:
-        _ch_changed: >-
-          {{ [_ch_conf_0, _ch_conf_1, _ch_conf_2 | default({}), _ch_conf_3 | default({})]
-             | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0 }}
+    # --check 에서 패키지가 아직 설치되지 않았으면(설치 예정) 서비스 기동 / 확인은 건너뛴다
+    - name: Start and verify ClickHouse
+      when: not (ansible_check_mode and _ch_installed.rc != 0)
+      block:
+        # 설정 파일이 바뀐 경우에만 재시작 (다시 실행해도 서비스 중단 없음)
+        - name: Enable and start clickhouse-server
+          ansible.builtin.systemd:
+            name: clickhouse-server
+            enabled: true
+            state: "{{ 'restarted' if _ch_changed | bool else 'started' }}"
+            daemon_reload: true
+          vars:
+            _ch_changed: >-
+              {{ [_ch_conf_0, _ch_conf_1, _ch_conf_2 | default({}), _ch_conf_3 | default({})]
+                 | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0 }}
 
-    - name: Wait for ClickHouse native port
-      ansible.builtin.wait_for:
-        host: "{{ wem_host_ip }}"
-        port: "{{ clickhouse_native_port }}"
-        timeout: 120
+        - name: Wait for ClickHouse native port
+          ansible.builtin.wait_for:
+            host: "{{ wem_host_ip }}"
+            port: "{{ clickhouse_native_port }}"
+            timeout: 120
 
-    - name: ClickHouse health check
-      ansible.builtin.command:
-        argv:
-          - clickhouse-client
-          - --host
-          - "{{ wem_host_ip }}"
-          - --user
-          - "{{ clickhouse_user }}"
-          - --password
-          - "{{ clickhouse_password }}"
-          - --query
-          - "SELECT 1"
-      register: _ch_health
-      changed_when: false
-      failed_when: _ch_health.stdout | trim != '1'
-      no_log: true
+        - name: ClickHouse health check
+          ansible.builtin.command:
+            argv:
+              - clickhouse-client
+              - --host
+              - "{{ wem_host_ip }}"
+              - --user
+              - "{{ clickhouse_user }}"
+              - --password
+              - "{{ clickhouse_password }}"
+              - --query
+              - "SELECT 1"
+          register: _ch_health
+          changed_when: false
+          failed_when: _ch_health.stdout | trim != '1'
+          no_log: true

@@ -17,13 +17,6 @@ receivers:
   file_log:
     start_at: end
     poll_interval: {{ otelcol_filelog_poll_interval }}
-
-processors:
-
-  batch:
-    send_batch_size: {{ otelcol_batch_send_batch_size }}
-    send_batch_max_size: {{ otelcol_batch_send_batch_max_size }}
-    timeout: {{ otelcol_batch_timeout }}
 {% if _otel_sqlquery_effective in ['add', 'remove'] %}
 
 service:
