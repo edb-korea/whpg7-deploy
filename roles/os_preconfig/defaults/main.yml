@@ -2,6 +2,9 @@
 # os_preconfig role 기본값 (inventory/group_vars 에서 override 가능)
 # 공통 변수(gpadmin_*, xfs_*, io_*, ntp_servers 등)는 inventory/whpg_cluster.yml 참고
 
+# ---------- SELinux / SSSD ----------
+sssd_selinux_dropin_file: /etc/sssd/conf.d/90-whpg-selinux.conf
+
 # ---------- sysctl ----------
 os_sysctl_params:
   # Shared Memory
