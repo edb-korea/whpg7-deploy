@@ -1,0 +1,48 @@
+---
+# ======================================================
+# 데이터 볼륨 quota (XFS project quota)
+#   대상: whpg_data_mounts 의 각 경로가 올라가 있는 볼륨(파일시스템). 같은 볼륨은 한 번만
+#         - /data 가 / 아래 디렉토리면 / 볼륨 전체, /data1 · /data2 가 별도 마운트면 각각
+#   한도: 볼륨 크기 × whpg_data_quota_percent (soft 는 whpg_data_quota_soft_percent, 0 이면 없음)
+#   quota 가 꺼져 있으면
+#         - 별도 마운트: fstab 에 prjquota 추가 후 다시 마운트 (사용 중이면 중단)
+#         - / 볼륨    : 커널 인자 rootflags 에 prjquota 추가 → 재부팅 후 다시 실행하면 한도 적용
+#   /etc/projects 에 이미 등록된 볼륨은 그 project(id / 이름)를 그대로 쓴다
+#   XFS 가 아니면 경고만 하고 건너뛴다
+#   입력: whpg_data_disk_info (data_disks.yml 의 path / mountpoint / fstype)
+# ======================================================
+
+- name: quota 대상 볼륨 결정
+  ansible.builtin.set_fact:
+    _quota_mounts: "{{ whpg_data_disk_info | selectattr('fstype', 'equalto', 'xfs') | map(attribute='mountpoint') | unique | list }}"
+    _quota_skip: "{{ whpg_data_disk_info | rejectattr('fstype', 'equalto', 'xfs') | list }}"
+
+- name: XFS 가 아닌 데이터 볼륨은 quota 건너뜀
+  ansible.builtin.debug:
+    msg: "※ WARNING: {{ item.path }} ({{ item.mountpoint }}, {{ item.fstype }}) 는 XFS 가 아니어서 quota 를 설정하지 않습니다."
+  loop: "{{ _quota_skip }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: 볼륨별 quota 설정
+  ansible.builtin.include_tasks: data_quota_mount.yml
+  loop: "{{ _quota_mounts }}"
+  loop_control:
+    loop_var: _quota_mp
+
+- name: 데이터 볼륨 quota 결과
+  ansible.builtin.shell:
+    cmd: |
+      {% for mp in _quota_mounts %}
+      xfs_quota -x -c 'report -p -N -h' {{ mp }} 2>/dev/null | awk -v mp={{ mp }} '$1 ~ /^{{ whpg_data_quota_project_prefix }}/ { print mp ": project " $1 " used " $2 " soft " $3 " hard " $4 }'
+      {% endfor %}
+    executable: /bin/bash
+  register: _quota_report
+  changed_when: false
+  check_mode: false
+  when: _quota_mounts | length > 0
+
+- name: 데이터 볼륨 quota 출력
+  ansible.builtin.debug:
+    msg: "{{ _quota_report.stdout_lines | default([]) }}"
+  when: _quota_mounts | length > 0

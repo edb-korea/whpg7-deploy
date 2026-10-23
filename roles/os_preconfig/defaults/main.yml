@@ -82,3 +82,10 @@ os_required_packages:
   - apr
   - apr-util
   - bash-completion
+
+# ---------- 데이터 볼륨 quota (tasks/data_quota.yml, inventory/whpg_cluster.yml 에서 조정) ----------
+whpg_data_quota_enabled: true
+whpg_data_quota_percent: 95
+whpg_data_quota_soft_percent: 0
+whpg_data_quota_project_id_base: 1001
+whpg_data_quota_project_prefix: whpg

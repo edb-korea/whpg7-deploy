@@ -247,13 +247,29 @@ ansible-playbook playbooks/site.yml --check --diff
 | SSH 무암호 로그인 | `~/.ssh/authorized_keys` | gpadmin RSA 키 전체 노드 배포 |
 | ulimits | `/etc/security/limits.d/95-gpadmin.conf` | nofile=524288, nproc=131072 |
 | 로컬 YUM 레포 | `/etc/yum.repos.d/whpg-local.repo` | 내부 레포 설정 |
-| XFS 마운트 옵션 | `/etc/fstab` | noatime, allocsize=16m 등 |
+| XFS 마운트 옵션 | `/etc/fstab` | noatime, allocsize=16m 등 (quota 사용 시 prjquota) |
+| 데이터 볼륨 quota | `/etc/projects`, `/etc/projid`, xfs_quota | 데이터 경로가 있는 볼륨에 XFS project quota hard = 볼륨 크기 × `whpg_data_quota_percent`(기본 95%) |
 | I/O 스케쥴러 | `/etc/udev/rules.d/99-vmware-db-scheduler.rules` | `none` (SSD/VMware) |
 | THP 비활성화 | `/etc/tuned/whpg-optimized/tuned.conf` | `transparent_hugepages=never` |
 | Read-ahead 조정 | tuned profile | `readahead=16` |
 | SSH 임계값 | `/etc/ssh/sshd_config` | MaxStartups=100:30:200, MaxSessions=200 |
 | NTP | `/etc/chrony.conf` | chrony 서버 설정 + 서비스 활성화 |
 | 필수 패키지 | yum | rsync, sysstat, java-11, perl 등 |
+
+### 데이터 볼륨 quota (`roles/os_preconfig/tasks/data_quota.yml`)
+
+`whpg_data_mounts` 의 각 경로가 올라가 있는 **볼륨(파일시스템)** 에 XFS project quota 를 겁니다 (같은 볼륨은 한 번).
+
+| 데이터 경로 | quota 대상 | quota 가 꺼져 있을 때 |
+|---|---|---|
+| `/data` (/ 아래 디렉토리) | `/` 볼륨 전체 | 커널 인자 `rootflags` 에 `prjquota` 추가 → **재부팅 후 다시 실행**하면 한도 적용 |
+| `/data1`, `/data2` (별도 마운트) | 각 마운트 | fstab 에 `prjquota` 추가 후 umount → mount (사용 중이면 중단) |
+
+- 한도: hard = 볼륨 크기 × `whpg_data_quota_percent`(95), soft = `whpg_data_quota_soft_percent`(0 = 없음). 값이 다를 때만 다시 설정합니다.
+- `/etc/projects` 에 이미 있는 볼륨은 그 project 를 그대로 쓰고, 없으면 `whpg_data_quota_project_prefix` + 경로 이름(`whpgroot`, `whpgdata1` …)으로
+  `whpg_data_quota_project_id_base`(1001)부터 할당합니다. 처음 등록할 때 `xfs_quota project -s` 로 볼륨의 기존 파일에 project 를 붙입니다.
+- XFS 가 아닌 볼륨은 경고만 하고 건너뜁니다. 끄려면 `whpg_data_quota_enabled: false`.
+- 확인: `xfs_quota -x -c 'report -p -h' /` (또는 `/data1`)
 
 ---
 

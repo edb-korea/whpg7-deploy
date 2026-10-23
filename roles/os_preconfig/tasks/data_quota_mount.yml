@@ -1,0 +1,140 @@
+---
+# 볼륨 하나(_quota_mp)의 project quota 설정 (data_quota.yml 에서 loop)
+
+- name: "{{ _quota_mp }} - project quota 활성 여부 / 볼륨 크기 / 기존 project 조회"
+  ansible.builtin.shell:
+    cmd: |
+      opts=$(findmnt -n -o OPTIONS --target {{ _quota_mp }})
+      echo "ACTIVE=$(grep -qE '(^|,)(prjquota|pquota)(,|$)' <<<"$opts" && echo yes || echo no)"
+      echo "SIZE_KB=$(df -k --output=size {{ _quota_mp }} | tail -n1 | tr -d ' ')"
+      id=$(awk -F: -v mp={{ _quota_mp }} '$2 == mp { print $1; exit }' /etc/projects 2>/dev/null)
+      echo "ID=$id"
+      echo "NAME=$( [ -n "$id" ] && awk -F: -v id="$id" '$2 == id { print $1; exit }' /etc/projid 2>/dev/null )"
+      echo "MAXID=$(cut -d: -f1 /etc/projects 2>/dev/null | sort -n | tail -n1)"
+      echo "NAMES=$(cut -d: -f1 /etc/projid 2>/dev/null | paste -sd,)"
+    executable: /bin/bash
+  register: _q_raw
+  changed_when: false
+  check_mode: false
+
+- name: "{{ _quota_mp }} - 조회 결과 정리"
+  ansible.builtin.set_fact:
+    _q: >-
+      {%- set d = {} -%}
+      {%- for l in _q_raw.stdout_lines if '=' in l -%}
+      {%-   set _ = d.update({l.split('=', 1)[0]: l.split('=', 1)[1]}) -%}
+      {%- endfor -%}
+      {%- set default_name = whpg_data_quota_project_prefix ~ ('root' if _quota_mp == '/' else _quota_mp | regex_replace('[^A-Za-z0-9]', '')) -%}
+      {%- set _ = d.update({
+            'name': d.NAME or default_name,
+            'id': d.ID or ([d.MAXID | default(0, true) | int + 1, whpg_data_quota_project_id_base | int] | max),
+            'new': not d.ID,
+            'hard_kb': (d.SIZE_KB | int) * (whpg_data_quota_percent | int) // 100,
+            'soft_kb': (d.SIZE_KB | int) * (whpg_data_quota_soft_percent | int) // 100}) -%}
+      {{ d }}
+
+- name: "{{ _quota_mp }} - project 이름 충돌 확인"
+  ansible.builtin.assert:
+    that: not _q.new or _q.name not in _q.NAMES.split(',')
+    fail_msg: >-
+      {{ _quota_mp }}: 새로 만들 project 이름 {{ _q.name }} 이 /etc/projid 에 이미 다른 경로용으로 있습니다.
+      whpg_data_quota_project_prefix 를 바꾸거나 /etc/projects, /etc/projid 를 확인하세요.
+    quiet: true
+
+# ---------- quota 가 꺼져 있으면 켠다 ----------
+- name: "{{ _quota_mp }} - project quota 켜기"
+  when: _q.ACTIVE != 'yes'
+  block:
+    # / 볼륨: XFS 는 remount 로 quota 를 켤 수 없어 커널 인자(rootflags)로 켜고 재부팅
+    - name: "{{ _quota_mp }} - 현재 커널 인자의 rootflags 조회"
+      ansible.builtin.shell:
+        cmd: "grubby --info DEFAULT | sed -n 's/^args=\"\\(.*\\)\"$/\\1/p' | tr ' ' '\\n' | sed -n 's/^rootflags=//p'"
+      register: _q_rootflags
+      changed_when: false
+      check_mode: false
+      when: _quota_mp == '/'
+
+    - name: "{{ _quota_mp }} - 커널 인자 rootflags 에 prjquota 추가 (재부팅 후 적용)"
+      ansible.builtin.command:
+        cmd: "grubby --update-kernel=ALL --args=rootflags={{ (_q_rootflags.stdout.split(',') | reject('equalto', '') | list + ['prjquota']) | unique | join(',') }}"
+      when: _quota_mp == '/'
+      notify: reboot_required
+
+    # 별도 마운트: fstab 옵션에 prjquota 를 넣고 umount → mount
+    - name: "{{ _quota_mp }} - fstab 항목 조회"
+      ansible.builtin.command:
+        cmd: "findmnt --fstab -n -o SOURCE,FSTYPE,OPTIONS {{ _quota_mp }}"
+      register: _q_fstab
+      changed_when: false
+      check_mode: false
+      failed_when: _q_fstab.rc != 0 or _q_fstab.stdout | length == 0
+      when: _quota_mp != '/'
+
+    - name: "{{ _quota_mp }} - fstab 옵션에 prjquota 추가"
+      ansible.posix.mount:
+        path: "{{ _quota_mp }}"
+        src: "{{ _q_fstab.stdout.split()[0] }}"
+        fstype: "{{ _q_fstab.stdout.split()[1] }}"
+        opts: "{{ (_q_fstab.stdout.split()[2].split(',') + ['prjquota']) | unique | join(',') }}"
+        state: present
+      when: _quota_mp != '/'
+
+    - name: "{{ _quota_mp }} - 다시 마운트 (quota 적용, 사용 중이면 실패)"
+      ansible.builtin.shell:
+        cmd: "umount {{ _quota_mp }} && mount {{ _quota_mp }}"
+      when: _quota_mp != '/'
+
+    - name: "{{ _quota_mp }} - quota 활성 재확인"
+      ansible.builtin.shell:
+        cmd: "findmnt -n -o OPTIONS --target {{ _quota_mp }} | grep -qE '(^|,)(prjquota|pquota)(,|$)' && echo yes || echo no"
+      register: _q_active2
+      changed_when: false
+      check_mode: false
+
+    - name: "{{ _quota_mp }} - quota 상태 반영"
+      ansible.builtin.set_fact:
+        _q: "{{ _q | combine({'ACTIVE': _q_active2.stdout | trim}) }}"
+
+    - name: "{{ _quota_mp }} - 재부팅 필요 안내"
+      ansible.builtin.debug:
+        msg: >-
+          {{ _quota_mp }}: project quota 가 아직 꺼져 있습니다{{ ' (rootflags 에 prjquota 추가함)' if _quota_mp == '/' else '' }}.
+          재부팅 후 01_os_preconfig.yml 을 다시 실행하면 한도({{ whpg_data_quota_percent }}%)를 적용합니다.
+      when: _q.ACTIVE != 'yes'
+
+# ---------- project 등록 / 한도 ----------
+- name: "{{ _quota_mp }} - project 등록 및 한도 설정"
+  when: _q.ACTIVE == 'yes'
+  block:
+    - name: "{{ _quota_mp }} - /etc/projects 등록 ({{ _q.id }}:{{ _quota_mp }})"
+      ansible.builtin.lineinfile:
+        path: /etc/projects
+        line: "{{ _q.id }}:{{ _quota_mp }}"
+        create: true
+        mode: '0644'
+      register: _q_projects
+
+    - name: "{{ _quota_mp }} - /etc/projid 등록 ({{ _q.name }}:{{ _q.id }})"
+      ansible.builtin.lineinfile:
+        path: /etc/projid
+        line: "{{ _q.name }}:{{ _q.id }}"
+        create: true
+        mode: '0644'
+
+    # 볼륨 전체의 기존 파일 / 디렉토리에 project id 와 상속 플래그를 붙인다 (처음 등록할 때만)
+    - name: "{{ _quota_mp }} - project 초기화 (xfs_quota project -s {{ _q.name }})"
+      ansible.builtin.command:
+        cmd: "xfs_quota -x -c 'project -s {{ _q.name }}' {{ _quota_mp }}"
+      when: _q_projects is changed
+
+    - name: "{{ _quota_mp }} - 현재 한도 조회"
+      ansible.builtin.shell:
+        cmd: "xfs_quota -x -c 'report -p -N' {{ _quota_mp }} | awk -v n={{ _q.name }} '$1 == n { print $3, $4 }'"
+      register: _q_cur
+      changed_when: false
+      check_mode: false
+
+    - name: "{{ _quota_mp }} - 한도 설정 (hard {{ whpg_data_quota_percent }}% = {{ _q.hard_kb }}k, soft {{ whpg_data_quota_soft_percent }}% = {{ _q.soft_kb }}k)"
+      ansible.builtin.command:
+        cmd: "xfs_quota -x -c 'limit -p bsoft={{ _q.soft_kb }}k bhard={{ _q.hard_kb }}k {{ _q.name }}' {{ _quota_mp }}"
+      when: (_q_cur.stdout | trim) != (_q.soft_kb ~ ' ' ~ _q.hard_kb)

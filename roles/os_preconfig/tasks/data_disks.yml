@@ -92,7 +92,8 @@
     path: "{{ item.item.path }}"
     src: "UUID={{ item.stdout }}"
     fstype: xfs
-    opts: "{{ xfs_mount_options }}"
+    # quota 를 쓰면 처음 마운트할 때부터 project quota 를 켠다 (XFS 는 remount 로 켤 수 없음)
+    opts: "{{ xfs_mount_options }}{{ ',prjquota' if whpg_data_quota_enabled | default(false) | bool else '' }}"
     state: mounted
   loop: "{{ _data_dev_uuid.results }}"
   loop_control:

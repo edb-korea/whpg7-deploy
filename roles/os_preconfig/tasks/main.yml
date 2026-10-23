@@ -266,6 +266,11 @@
 - name: 데이터 디스크 구성
   ansible.builtin.import_tasks: data_disks.yml
 
+# ---------- 10-1. 데이터 볼륨 quota (XFS project quota, 볼륨 크기의 whpg_data_quota_percent %) ----------
+- name: 데이터 볼륨 quota
+  ansible.builtin.include_tasks: data_quota.yml
+  when: whpg_data_quota_enabled | bool
+
 # ---------- 11. I/O 스케쥴러 udev 규칙 ----------
 # 대상: 10단계에서 조회한 데이터 경로의 물리 디스크 (조회 결과가 없으면 io_udev_pattern)
 - name: I/O 스케쥴러 udev 규칙 설정 (VMware/SSD용 none)
