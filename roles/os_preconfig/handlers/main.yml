@@ -1,7 +1,7 @@
 ---
 - name: reboot_required
   ansible.builtin.debug:
-    msg: "SELinux 또는 cgroup 변경으로 리부팅이 필요합니다. 수동으로 reboot 후 진행하세요."
+    msg: "SELinux / cgroup / 데이터 볼륨 quota(rootflags) 변경으로 리부팅이 필요합니다. 수동으로 reboot 후 진행하세요."
 
 - name: update_grub
   ansible.builtin.command:
