@@ -32,7 +32,9 @@ whpg-ansible/
 │       ├── resync_standby.yml         # Standby 재동기화 (장애 후 재구성)
 │       ├── remove_wem.yml             # WEM 1.4 이상 삭제
 │       ├── expand_segments.yml        # Segment 4대 단위 증설 (gpexpand)
-│       └── minor_upgrade.yml          # 마이너 업그레이드
+│       └── minor_upgrade.yml          # 마이너 업그레이드 (RPM 파일 지정, 이전 방식)
+│   └── upgrade/
+│       └── upgrade.yml                # core / pxf / backup / flowserver / extension 업그레이드 (-e upgrade=...)
 └── roles/
     ├── os_preconfig/                  # OS 사전 구성
     │   ├── defaults/main.yml
@@ -71,6 +73,9 @@ whpg-ansible/
     │   └── templates/
     │       ├── pgbouncer.ini.j2
     │       └── pgbouncer.service.j2
+    ├── whpg_upgrade/                  # 패키지를 repo 최신 버전으로 업그레이드 (minor upgrade 문서 절차)
+    │   ├── defaults/main.yml
+    │   └── tasks/main.yml
     └── coordinator_ha/                # keepalived VIP 기반 HA
         ├── defaults/main.yml
         ├── handlers/main.yml
@@ -429,6 +434,51 @@ keepalived를 통한 VIP 기반 Active/Standby 구성:
 ```bash
 ansible-playbook playbooks/ops/resync_standby.yml
 ```
+
+---
+
+## 업그레이드 (`playbooks/upgrade/upgrade.yml`)
+
+[Minor upgrade 문서](https://www.enterprisedb.com/docs/warehousepg/latest/install_guide/minor_upgrade/) 절차를 따라
+설치되어 있는 패키지를 dnf repo 의 최신 버전으로 올립니다 (`local_rpm_dir` 은 보지 않음). WEM 은 기존대로 `07_wem.yml -t upgrade`.
+
+```bash
+ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=all --check      # 점검 + 변경 예정 사항 Summary (변경 없음)
+ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=all              # 전체
+ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=core             # warehouse-pg-7 + warehouse-pg-7-clients
+ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=pxf,backup       # 쉼표로 여러 개
+ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=extensions       # extension 전체
+ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=postgis,pgaudit  # 개별 extension
+```
+
+| `-e upgrade=` | 패키지 | 절차 |
+|---|---|---|
+| `all` | 아래 전체 (설치된 것만) | core 가 포함되면 클러스터 정지 구간에 한 트랜잭션으로 모두 업그레이드 |
+| `core` | `warehouse-pg-7` + `warehouse-pg-7-clients` (항상 함께) | 아래 core 절차 (서비스 중단) |
+| `pxf` | `edb-whpg7-pxf` | `pxf cluster stop` → dnf → `pxf cluster register` → `pxf cluster start` → `ALTER EXTENSION pxf UPDATE` |
+| `backup` | `whpg-backup` | dnf (gpbackup / gprestore 실행 중이면 중단) |
+| `flowserver` | `whpg7-flow-server` | dnf (실행 중이면 중단, 업그레이드 후 수동 시작 + 잡 재제출) |
+| `extensions` / `<이름>` | `whpg_extension_catalog` 의 나머지 (name 또는 pkg 로 지정) | 클러스터 정지 없이 dnf → `ALTER EXTENSION ... UPDATE`. preload 라이브러리(pgaudit, user_profile, diskquota 등)는 재시작해야 적용 (`-e whpg_upgrade_restart=true` 면 `gpstop -ra`) |
+
+core 절차 (괄호는 문서 단계 번호):
+
+1. 점검 (`--check` 에서도 실행): 7.4 이상, 7.5.0 이상이면 python3.11, FlowServer / gpbackup 미실행(16), 활성 세션(18, 모니터링 계정 `wemon` 제외),
+   segment 동기화(19), gpadmin 외 crontab(7), gpadmin `.bashrc` / `.bash_profile` 의 `greenplum_path.sh`(28),
+   server / clients 같은 목표 버전, 노드 간 버전 일치, dnf 테스트 트랜잭션(`tsflags=test`, 의존성 / 파일 충돌)
+2. 업그레이드 전 상태 기록 `~gpadmin/whpg_upgrade_baseline_<시각>.txt` (10, 11)
+3. gpadmin crontab 백업 / 제거 (6, 8) → `pxf cluster stop`(13) → pgBouncer(14) → WEM(15) → keepalived(standby → coordinator) 정지
+4. `gpstop -a -M fast`(20) → 바이너리 백업 `/usr/edb/whpg7_save_<현재버전>` (21, 모든 노드) → dnf server + clients (25, 26)
+5. 소유권 / symlink `/usr/local/greenplum-db`, `/usr/local/greenplum-db-clients` → `/usr/edb/whpg7` (27) → 모든 노드 버전 일치 확인
+6. `pxf cluster register` → `gpstart -a`(29) → `ALTER EXTENSION gp_exttable_fdw / gp_toolkit UPDATE`(35, 36)
+7. 7.6.x 권한 SQL (32~34, 모든 DB, template0 은 잠시 접속 허용 후 원복, `whpg_upgrade_post_sql`) → 버전 / `gpstate -f` / `gpstate -m` (30, 31)
+8. crontab 복원(37) → keepalived(coordinator → standby) → `pxf cluster start`(38) → pgBouncer(39) → WEM(40). FlowServer(41)는 수동
+
+- 점검에 문제가 있으면 `--check` 는 Summary 에 사유를 보여 주고, 실제 실행은 클러스터를 건드리기 전에 중단합니다. 실행 중 한 노드라도 실패하면 전체 중단.
+- Summary: `--check` 는 변경 예정 사항(서비스 중단 여부, 순서, 대상 노드 / DB), 실행 시는 결과. 수동 작업(문서 1~5, 38, 41~45, 버전별 확인 사항)도 표시합니다.
+- core 업그레이드 후 `inventory/whpg_cluster.yml` 의 `whpg_version` 을 새 버전으로 바꿉니다. diskquota 를 올리면 `diskquota_lib_version` 도 확인.
+- 변수 (`roles/whpg_upgrade/defaults/main.yml`): `whpg_upgrade_post_sql`(_optional), `whpg_upgrade_backup_binaries`, `whpg_upgrade_force`(활성 세션이 있어도 진행),
+  `whpg_upgrade_restart`, `whpg_upgrade_ignore_session_users`, `whpg_upgrade_services`, `whpg_upgrade_symlinks`, `whpg_upgrade_special`
+- `playbooks/upgrade/upgrade_all.yml` / `upgrade_core.yml` / `upgrade_extensions.yml`, `playbooks/ops/minor_upgrade.yml` 은 이전 방식(`local_rpm_dir` / RPM 파일 지정)입니다.
 
 ---
 

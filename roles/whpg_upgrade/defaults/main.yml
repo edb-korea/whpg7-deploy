@@ -1,0 +1,69 @@
+---
+# ======================================================
+# whpg_upgrade role 기본값 (playbooks/upgrade/upgrade.yml)
+# 공통 값(whpg_core_pkg_name, whpg_extension_catalog, 경로 등)은 inventory/whpg_cluster.yml 참고
+# ======================================================
+
+# 업그레이드 대상 (필수). 쉼표로 여러 개 지정 가능
+#   all         : 아래 전체 (설치되어 있는 패키지만)
+#   core        : warehouse-pg-7 + warehouse-pg-7-clients (항상 함께)
+#   pxf         : PXF
+#   backup      : whpg-backup (gpbackup / gprestore)
+#   flowserver  : FlowServer
+#   extensions  : 위를 제외한 whpg_extension_catalog 의 extension 전체
+#   <이름>      : 개별 extension (whpg_extension_catalog 의 name 또는 pkg, 예: postgis, pgaudit)
+#   WEM 은 playbooks/07_wem.yml -t upgrade 로 별도 업그레이드
+upgrade: ""
+
+# 별도 옵션으로 다루는 카탈로그 항목 (옵션 이름: 카탈로그 name). extensions 에서는 제외된다
+whpg_upgrade_special:
+  pxf: pxf
+  backup: whpg_backup
+  flowserver: flowserver
+
+# core 에 함께 묶는 패키지
+whpg_upgrade_core_pkgs:
+  - "{{ whpg_core_pkg_name }}"
+  - "{{ whpg_core_pkg_name }}-clients"
+
+# 업그레이드 후 ALTER EXTENSION ... UPDATE 할 extension (카탈로그 sql_ext 외 추가분, 새 버전이 있을 때만 갱신)
+whpg_upgrade_sql_ext_extra:
+  core: [gp_exttable_fdw, gp_toolkit]   # 7.6.1 문서 35, 36 단계
+  pxf: [pxf, pxf_fdw]
+
+# core 업그레이드 후 문서의 7.6.x 권한 SQL 을 모든 DB 에 적용 (template0 은 잠시 접속 허용 후 원복)
+#   7.6.0 이상: pg_file_write / pg_file_rename / pg_file_unlink / pg_logdir_ls 권한 조정 (문서 34 단계, 필수)
+#   7.6.1 이상: memory context view / function 권한 제한 (문서 32 단계)
+whpg_upgrade_post_sql: true
+whpg_upgrade_post_sql_optional: false   # true: 7.6.1 선택 항목(문서 33 단계, gp_expand_* 등 PUBLIC 실행 권한 회수)
+
+# core 업그레이드 시 정지 → 재시작할 서비스 (실행 중인 것만)
+# 정지: pgBouncer → WEM → keepalived(standby → coordinator), 시작: 역순 (WEM 이 VIP 로 접속할 수 있도록 keepalived 먼저)
+whpg_upgrade_services:
+  - "{{ pgbouncer_service_name | default('pgbouncer') }}"
+  - wem
+# core 업그레이드 시 gpadmin crontab 을 백업 / 제거 후 복원할 호스트
+whpg_upgrade_cron_hosts: "{{ groups['coordinator'] + groups['standby_coordinator'] | default([]) }}"
+# 확인할 symlink (모두 whpg_real_install_dir 를 가리켜야 함, 없으면 생성)
+whpg_upgrade_symlinks:
+  - "{{ whpg_install_dir }}"
+  - /usr/local/greenplum-db-clients
+
+whpg_upgrade_backup_binaries: true   # core 업그레이드 시 whpg_real_install_dir 를 <dir>_save_<현재버전> 으로 복사 (모든 노드)
+whpg_upgrade_force: false            # true: 활성 세션이 있어도 진행 (gpstop -M fast 로 종료)
+# true: core 없이 preload extension(pgaudit, diskquota 등)만 업그레이드할 때 gpstop -ra 로 재시작
+#       false 면 Summary 에 재시작 필요만 표시
+whpg_upgrade_restart: false
+# 활성 세션 점검에서 제외할 계정 (WEM / otelcol 모니터링 등, gpstop -M fast 로 끊겨도 무방)
+whpg_upgrade_ignore_session_users:
+  - "{{ wem_whpg_user | default('wemon') }}"
+# 업그레이드 전 상태(패키지 / 버전)를 기록할 파일 (각 노드)
+whpg_upgrade_baseline_file: "{{ gpadmin_home }}/whpg_upgrade_baseline_{{ _whpg_upg_ts }}.txt"
+
+whpg_upgrade_doc_url: https://www.enterprisedb.com/docs/warehousepg/latest/install_guide/minor_upgrade/
+
+# PXF 명령 실행 환경: 문서대로 gpadmin .bashrc(PXF_HOME / PXF_BASE)를 읽고, PATH 에 없으면 $PXF_HOME/bin/pxf
+_whpg_upg_pxf_sh: |-
+  source {{ gpadmin_home }}/.bashrc >/dev/null 2>&1
+  source {{ whpg_install_dir }}/greenplum_path.sh
+  PXF=$(command -v pxf 2>/dev/null || echo "${PXF_HOME:-{{ whpg_install_dir }}/pxf}/bin/pxf")

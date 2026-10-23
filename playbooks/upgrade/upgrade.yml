@@ -1,0 +1,20 @@
+---
+# ======================================================
+# WarehousePG 업그레이드 (core / PXF / backup / FlowServer / extension → dnf repo 최신 버전)
+#
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=all --check     # 점검 + 변경 예정 사항 Summary (변경 없음)
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=all             # 전체 (core, pxf, backup, flowserver, extension)
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=core            # warehouse-pg-7 + clients (항상 함께)
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=pxf,backup      # PXF / whpg-backup / flowserver 는 별도 옵션
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=extensions      # extension 전체 (pxf / backup / flowserver 제외)
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=postgis,pgaudit # 개별 extension (카탈로그 name 또는 pkg)
+#
+#   대상 이름: all, core, pxf, backup, flowserver, extensions, 또는 whpg_extension_catalog 의 name
+#   WEM 은 playbooks/07_wem.yml -t upgrade (기존 방식)
+#   상세: roles/whpg_upgrade/tasks/main.yml, 변수: roles/whpg_upgrade/defaults/main.yml
+# ======================================================
+- name: WarehousePG 업그레이드
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - whpg_upgrade
