@@ -3,6 +3,7 @@
 # Role: whpg_expand (coordinator 에서 실행)
 #   tasks/plan.yml 로 계획을 세운 뒤 실행된다 (playbooks/ops/expand_segments.yml)
 #   1. hostfile 갱신 + gpssh-exkeys (새 호스트 포함)
+#   1-1. mirror 재배치 (gpmovemirrors)                 ← 기존 2 / 3대에서 증설할 때 (tasks/remirror.yml)
 #   2. gpexpand -i  : 새 segment 추가 (phase 1)       ← 새 호스트가 있고 진행 중인 증설이 없을 때
 #   3. PXF 새 호스트 등록
 #   4. gpexpand     : 테이블 재분배 (phase 2)          ← expand_redistribute
@@ -33,6 +34,16 @@
   become_user: "{{ gpadmin_user }}"
   when: _expand_new_hosts | length > 0
   changed_when: true
+
+# ---------- 1-1. 기존 2 / 3대 → mirror 재배치 (gpexpand 전) ----------
+# 증설 후 전체 호스트를 한 그룹으로 보고 기존 mirror 를 최종 위치로 옮겨, gpexpand 가 새 mirror 를 둘 자리를 비운다
+- name: mirror 재배치 (기존 2 / 3대 증설)
+  ansible.builtin.include_tasks: remirror.yml
+  when:
+    - _expand_small | bool
+    - _expand_has_mirrors | bool
+    - _expand_new_hosts | length > 0
+    - _expand_status == 'NONE'
 
 # ---------- 2. 새 segment 추가 (gpexpand phase 1) ----------
 - name: 새 segment 추가

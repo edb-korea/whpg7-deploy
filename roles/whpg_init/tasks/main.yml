@@ -5,18 +5,19 @@
 # ======================================================
 
 # ---------- 0. Mirror 그룹 구성 가능 여부 확인 (gpinitsystem 전에 중단) ----------
-- name: Mirror 그룹 조건 확인 (segment {{ whpg_mirror_group_size }}대 단위)
+- name: Mirror 그룹 조건 확인 (segment {{ whpg_mirror_group_size }}대 단위 또는 2 ~ {{ whpg_mirror_group_size | int - 1 }}대)
   ansible.builtin.assert:
     that:
-      - segment_hosts | length > 0
-      - segment_hosts | length % (whpg_mirror_group_size | int) == 0
+      - segment_hosts | length >= 2
+      - (segment_hosts | length % (whpg_mirror_group_size | int) == 0) or (segment_hosts | length < whpg_mirror_group_size | int)
       - (whpg_mirror_group_size | int) >= 2
       - primary_data_dirs | length == whpg_segments_per_host | int
       - primary_data_dirs | length == mirror_data_dirs | length
       - (whpg_segments_per_host | int) % (whpg_data_mounts | length) == 0
+      - whpg_data_mounts | map(attribute='path') | unique | list | length == whpg_data_mounts | length
     fail_msg: >-
       segment 호스트 수({{ segment_hosts | length }}: {{ segment_hosts | join(', ') }})는
-      whpg_mirror_group_size({{ whpg_mirror_group_size }})의 배수여야 하고,
+      whpg_mirror_group_size({{ whpg_mirror_group_size }})의 배수이거나 2 ~ {{ whpg_mirror_group_size | int - 1 }}대여야 하고 (mirror 를 두려면 최소 2대),
       호스트당 segment 수(whpg_segments_per_host={{ whpg_segments_per_host }})는
       데이터 디스크 수({{ whpg_data_mounts | length }})의 배수여야 합니다 (디스크별 균등 배치).
       inventory/hosts 의 [segments] 를 확인하세요.
@@ -65,7 +66,7 @@
     var: gpinit_result.stdout_lines
   when: inventory_hostname == coordinator_host
 
-# ---------- 3. Mirror 세그먼트 추가 ({{ whpg_mirror_group_size }}대 단위 spread, gpaddmirrors -i) ----------
+# ---------- 3. Mirror 세그먼트 추가 (첫 그룹 whpg_mirror_first_group_size 대, 이후 whpg_mirror_group_size 대 단위 spread, gpaddmirrors -i) ----------
 - name: Mirror 세그먼트 추가
   ansible.builtin.include_tasks: mirrors.yml
   when: inventory_hostname == coordinator_host

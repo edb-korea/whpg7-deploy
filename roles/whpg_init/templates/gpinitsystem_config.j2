@@ -26,7 +26,7 @@ PORT_BASE={{ whpg_port_base }}
 declare -a DATA_DIRECTORY=({% for dir in primary_data_dirs %}{{ dir }} {% endfor %})
 
 # Mirror 는 여기서 만들지 않음 (MIRROR_* 미지정)
-# → gpinitsystem 후 gpaddmirrors -i 로 whpg_mirror_group_size(4)대 단위 spread 배치 (roles/whpg_init/tasks/mirrors.yml)
+# → gpinitsystem 후 gpaddmirrors -i 로 whpg_mirror_group_size(4)대 단위 spread 배치, 2 / 3대는 한 그룹 (roles/whpg_init/tasks/mirrors.yml)
 
 # 기본 데이터베이스 인코딩
 ENCODING={{ whpg_encoding }}

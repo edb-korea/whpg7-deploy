@@ -2,24 +2,27 @@
   gpaddmirrors -i 입력 파일 (형식: contentID|address|port|data_dir)
   입력: _primaries = [{content, address, port, datadir}, ...]  (gp_segment_configuration 의 primary)
 
-  배치 규칙 (G = whpg_mirror_group_size(4), K = whpg_segments_per_host)
-    - segment_hosts([segments] 순서)를 G 대씩 묶은 그룹 안에서만 mirror 를 둔다
+  배치 규칙 (G = whpg_mirror_group_size(4), F = whpg_mirror_first_group_size, K = whpg_segments_per_host)
+    - segment_hosts([segments] 순서)를 앞에서부터 F 대, 이후 G 대씩 묶은 그룹 안에서만 mirror 를 둔다
+      (F = min(호스트 수, G) → 2 / 3대 클러스터는 전체가 한 그룹)
     - 호스트 내 순번 k = port - whpg_port_base (primary_data_dirs[k] 에 있음, 디스크 = k mod 디스크수)
-    - 그룹 내 순번 h 호스트의 k 번째 primary 의 mirror
-        → 같은 그룹 (h + (k mod (G-1)) + 1) mod G 번째 호스트의 k 번째 mirror 슬롯
-          (mirror_data_dirs[k], 포트 whpg_mirror_port_base + k)
+    - 그룹(크기 S) 내 순번 h 호스트의 k 번째 primary 의 mirror
+        → 같은 그룹 (h + (k mod (S-1)) + 1) mod S 번째 호스트의 k 번째 mirror 슬롯
+          (mirror_data_dirs[k], 포트 whpg_mirror_port_base + k). S = 2 면 항상 상대 호스트
     - 받는 호스트는 k = 0..K-1 mirror 를 하나씩 받으므로 포트 / 디렉토리가 겹치지 않고,
       디스크마다 primary K/디스크수 개 + mirror K/디스크수 개가 된다.
-      호스트 1대 장애 시 그 primary 들은 같은 그룹의 나머지 G-1 대로 나뉘어 넘어간다
-    - K <= G-1 이면 (h + k + 1) mod G 와 같다 (기존 규칙과 호환)
+      호스트 1대 장애 시 그 primary 들은 같은 그룹의 나머지 S-1 대로 나뉘어 넘어간다
+    - K <= S-1 이면 (h + k + 1) mod S 와 같다 (기존 규칙과 호환)
     - roles/whpg_expand/templates/gpexpand_input.j2 도 같은 규칙
 -#}
 # Managed by Ansible (roles/whpg_init/templates/gpaddmirrors_config.j2)
-# mirror group size = {{ whpg_mirror_group_size }}, segments per host = {{ whpg_segments_per_host }}, segment hosts = {{ segment_hosts | join(',') }}
+# mirror group size = {{ whpg_mirror_group_size }} (first group {{ whpg_mirror_first_group_size }}), segments per host = {{ whpg_segments_per_host }}, segment hosts = {{ segment_hosts | join(',') }}
 {% set G = whpg_mirror_group_size | int %}
+{% set F = whpg_mirror_first_group_size | int %}
 {% for p in _primaries | sort(attribute='content') %}
 {%   set h = segment_hosts.index(p.address) %}
 {%   set k = p.port | int - whpg_port_base | int %}
-{%   set base = (h // G) * G %}
-{{ p.content }}|{{ segment_hosts[base + (h - base + k % (G - 1) + 1) % G] }}|{{ whpg_mirror_port_base | int + k }}|{{ mirror_data_dirs[k] }}/{{ whpg_seg_prefix }}{{ p.content }}
+{%   set base = 0 if h < F else F + ((h - F) // G) * G %}
+{%   set S = F if h < F else G %}
+{{ p.content }}|{{ segment_hosts[base + (h - base + k % (S - 1) + 1) % S] }}|{{ whpg_mirror_port_base | int + k }}|{{ mirror_data_dirs[k] }}/{{ whpg_seg_prefix }}{{ p.content }}
 {% endfor %}

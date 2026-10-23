@@ -8,6 +8,19 @@
 #                  (파티션/LVM/MD 역추적) → whpg_data_disks 로 I/O 튜닝 대상에 사용
 # ======================================================
 
+- name: 데이터 경로 설정 확인 (1개 /data 또는 2개 /data1, /data2 등)
+  ansible.builtin.assert:
+    that:
+      - whpg_data_mounts | length >= 1
+      - whpg_data_mounts | map(attribute='path') | unique | list | length == whpg_data_mounts | length
+      - whpg_data_mounts | map(attribute='path') | select('match', '^/[^ ]*[^/]$') | list | length == whpg_data_mounts | length
+      - (whpg_segments_per_host | int) % (whpg_data_mounts | length) == 0
+    fail_msg: >-
+      whpg_data_mounts({{ whpg_data_mounts | map(attribute='path') | list }}) 는 1개 이상, 서로 다른 절대 경로(끝에 / 없이)여야 하고,
+      whpg_segments_per_host({{ whpg_segments_per_host }}) 는 데이터 경로 수({{ whpg_data_mounts | length }})의 배수여야 합니다.
+    quiet: true
+  run_once: true
+
 - name: 데이터 경로 분류 (별도 디바이스 / 기존 파일시스템)
   ansible.builtin.set_fact:
     _data_mounts_dev: "{{ whpg_data_mounts | selectattr('device', 'defined') | selectattr('device') | list }}"

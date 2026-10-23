@@ -3,6 +3,7 @@
 # Mirror 추가 (coordinator 에서 실행)
 #   gpinitsystem 은 primary 만 만들고, 여기서 gpaddmirrors -i 로
 #   whpg_mirror_group_size(4)대 단위 spread 배치 mirror 를 만든다.
+#   segment 2 / 3대는 전체가 한 그룹 (whpg_mirror_first_group_size).
 #   배치 규칙: templates/gpaddmirrors_config.j2
 #   이미 mirror 가 있으면 아무것도 하지 않는다 (다시 실행해도 안전)
 # ======================================================
@@ -49,7 +50,7 @@
           port: {{ _primaries | map(attribute='port') | unique | sort }} / whpg_port_base: {{ whpg_port_base }}
         quiet: true
 
-    - name: gpaddmirrors 입력 파일 생성 ({{ whpg_mirror_group_size }}대 단위 spread)
+    - name: gpaddmirrors 입력 파일 생성 (첫 그룹 {{ whpg_mirror_first_group_size }}대, 이후 {{ whpg_mirror_group_size }}대 단위 spread)
       ansible.builtin.template:
         src: gpaddmirrors_config.j2
         dest: "{{ whpg_gpaddmirrors_config }}"

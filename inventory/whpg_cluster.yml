@@ -77,11 +77,17 @@ whpg_database: gpadmin              # 초기 생성 DB / 관리 작업용 DB
 #  I/O 스케쥴러/read-ahead 튜닝 대상으로 사용 (os_preconfig)
 #  호스트별로 다르면 inventory/host_vars/<호스트>.yml 에서 override
 # ------------------------------------------
+#  데이터 볼륨 1개 / 2개 모두 지원 (모든 segment 호스트에서 같은 구성이어야 함, 증설 호스트 포함)
+#    1개: segment 가 모두 /data 아래 (whpg_segments_per_host 제한 없음)
+#    2개: k 번째 segment 를 /data1, /data2 에 번갈아 배치 (whpg_segments_per_host 는 2의 배수)
+#    Coordinator / Standby 데이터는 첫 번째 경로(whpg_data_root) 아래
 whpg_data_mounts:
+  # --- 볼륨 1개 ---
   - { path: /data, device: "" }
+  # --- 볼륨 2개 (위 /data 줄을 지우고 아래 두 줄 사용) ---
 #  - { path: /data1, device: "" }
 #  - { path: /data2, device: "" }
-# 예) 별도 디스크 사용 시
+  # --- 볼륨 2개, 빈 디스크를 포맷 / 마운트 ---
 #  - { path: /data1, device: /dev/sdb }
 #  - { path: /data2, device: /dev/sdc }
 
@@ -93,8 +99,9 @@ xfs_mount_options: "rw,noatime,allocsize=16m,inode64,logbufs=8,logbsize=256k"
 # gpinitsystem 은 각 디렉토리 밑에 {{ whpg_seg_prefix }}<N> 을 자동 생성함 (상위 디렉토리만 지정)
 # ------------------------------------------
 # 호스트당 primary segment 수 (mirror 도 같은 수). whpg_data_mounts 개수의 배수로 지정 → 디스크별 균등
-#   k 번째 segment 는 whpg_data_mounts[k mod 디스크수] 에 둔다 (/data1, /data2, /data1, /data2 ...)
-#   예) 2: /data1 1개 + /data2 1개,  4: 2개 + 2개,  8: 4개 + 4개  (primary / mirror 각각)
+#   k 번째 segment 는 whpg_data_mounts[k mod 디스크수] 에 둔다
+#   볼륨 1개: 모두 /data            예) 2 / 4 / 8 → /data 에 primary 2 / 4 / 8 + mirror 2 / 4 / 8
+#   볼륨 2개: /data1, /data2 번갈아  예) 2: 각 1개, 4: 각 2개, 8: 각 4개  (primary / mirror 각각)
 #   포트: primary whpg_port_base + k, mirror whpg_mirror_port_base + k (k = 0 ~ segments_per_host-1)
 whpg_segments_per_host: 2
 whpg_data_root: "{{ whpg_data_mounts[0].path }}"   # Coordinator/Standby 데이터 위치
@@ -109,11 +116,15 @@ _seg_disk_paths: >-
       * ((whpg_segments_per_host | int) // (whpg_data_mounts | length) + 1))[:whpg_segments_per_host | int] }}
 
 # Mirror 배치 그룹 크기 (segment 호스트 N 대 단위)
-#   inventory/hosts 의 [segments] 를 적힌 순서대로 N 대씩 묶고, mirror 는 같은 그룹 안에만 둔다.
-#   segment 호스트 수는 N 의 배수여야 한다. 호스트당 segment 수(whpg_segments_per_host)는 제한 없음.
-#   그룹 내 순번 h 호스트의 k 번째 primary → 같은 그룹 (h + (k mod (N-1)) + 1) mod N 번째 호스트의 k 번째 mirror 슬롯
-#   증설도 N 대 단위로 [segments] 끝에 추가한다 (기존 호스트 순서는 바꾸지 않음).
+#   inventory/hosts 의 [segments] 를 적힌 순서대로 묶고, mirror 는 같은 그룹 안에만 둔다.
+#   초기 구성: segment 호스트 수는 N 의 배수이거나 2 ~ N-1 대 (2 / 3대는 전체가 한 그룹). 1대는 mirror 불가.
+#   호스트당 segment 수(whpg_segments_per_host)는 제한 없음.
+#   그룹 내 순번 h 호스트의 k 번째 primary → 같은 그룹 (h + (k mod (S-1)) + 1) mod S 번째 호스트의 k 번째 mirror 슬롯 (S = 그룹 크기)
+#   증설은 [segments] 끝에 추가한다 (기존 호스트 순서는 바꾸지 않음): 2 / 3대 → N 대까지, 이후 N 대 단위.
 whpg_mirror_group_size: 4
+# 첫 그룹 크기 (자동): min(segment 호스트 수, N). 나머지 그룹은 N 대씩 → 2대 [2], 3대 [3], 4대 [4], 8대 [4] [4]
+#   2 / 3대는 먼저 N 대까지 증설하며(2→3, 2→4, 3→4) 이때 mirror 를 새 그룹에 맞게 재배치한다 (playbooks/ops/expand_segments.yml)
+whpg_mirror_first_group_size: "{{ [segment_hosts | length, whpg_mirror_group_size | int] | min }}"
 
 # gp 유틸리티(gpstart/gpstop/gpconfig/psql 등) 실행 시 공통 환경변수
 whpg_env:
