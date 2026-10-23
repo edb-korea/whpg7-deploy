@@ -469,7 +469,7 @@ core 절차 (괄호는 문서 단계 번호):
 3. gpadmin crontab 백업 / 제거 (6, 8) → `pxf cluster stop`(13) → pgBouncer(14) → WEM(15) → keepalived(standby → coordinator) 정지
 4. `gpstop -a -M fast`(20) → 바이너리 백업 `/usr/edb/whpg7_save_<현재버전>` (21, 모든 노드) → dnf server + clients (25, 26)
 5. 소유권 / symlink `/usr/local/greenplum-db`, `/usr/local/greenplum-db-clients` → `/usr/edb/whpg7` (27) → 모든 노드 버전 일치 확인
-6. `pxf cluster register` → `gpstart -a`(29) → `ALTER EXTENSION gp_exttable_fdw / gp_toolkit UPDATE`(35, 36)
+6. `gpstart -a`(29) → `pxf cluster register` → `ALTER EXTENSION gp_exttable_fdw / gp_toolkit UPDATE`(35, 36)
 7. 7.6.x 권한 SQL (32~34, 모든 DB, template0 은 잠시 접속 허용 후 원복, `whpg_upgrade_post_sql`) → 버전 / `gpstate -f` / `gpstate -m` (30, 31)
 8. crontab 복원(37) → keepalived(coordinator → standby) → `pxf cluster start`(38) → pgBouncer(39) → WEM(40). FlowServer(41)는 수동
 
