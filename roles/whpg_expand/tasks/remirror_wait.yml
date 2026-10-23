@@ -1,0 +1,16 @@
+---
+# 모든 segment 가 up 이고 동기화(mode=s)될 때까지 대기 (tasks/remirror.yml)
+- name: segment up / 동기화 대기 (최대 {{ expand_remirror_sync_timeout }}초)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -c
+      "SELECT count(*) FROM gp_segment_configuration WHERE content >= 0 AND (status <> 'u' OR mode <> 's')"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _remirror_unsync
+  until: _remirror_unsync.stdout | trim == '0'
+  retries: "{{ (expand_remirror_sync_timeout | int / 30) | int }}"
+  delay: 30
+  changed_when: false

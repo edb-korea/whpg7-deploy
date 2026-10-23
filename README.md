@@ -122,7 +122,7 @@ inventory 그룹에서 자동으로 도출되므로 **inventory/hosts 만 수정
 | `whpg_version` | 설치할 WHPG 버전 | `7.5.0` |
 | `local_rpm_dir` | Controller 의 RPM 저장 경로 | `/opt/whpg-rpms` |
 | `coordinator_vip` / `coordinator_vip_interface` | HA용 Virtual IP / NIC | `192.168.10.100` / `eth0` |
-| `whpg_data_mounts` | 데이터 루트 경로와 디스크 (`device` 비우면 기존 FS 사용) | `{path: /data1, device: /dev/sdb}` |
+| `whpg_data_mounts` | 데이터 루트 경로와 디스크 (1개 `/data` 또는 2개 `/data1`, `/data2`, `device` 비우면 기존 FS 사용) | `{path: /data, device: ""}` / `{path: /data1, device: /dev/sdb}` |
 | `pxf_namenode_host` | Hadoop NameNode | `namenode.internal` |
 | `whpg_local_repo_baseurl` | 내부 YUM 레포 URL | `http://repo.internal/whpg` |
 
@@ -135,7 +135,7 @@ inventory 그룹에서 자동으로 도출되므로 **inventory/hosts 만 수정
 | `whpg_database` | 관리용 DB 이름 | `gpadmin` |
 | `whpg_data_root` | Coordinator/Standby 데이터 루트 | `whpg_data_mounts` 첫 번째 path |
 | `whpg_segments_per_host` | 호스트당 primary segment 수 (데이터 디스크 수의 배수) | `2` (4, 8 …) |
-| `primary_data_dirs` / `mirror_data_dirs` | 세그먼트 상위 디렉토리 (`whpg_data_mounts`, `whpg_segments_per_host` 에서 자동 생성) | `/data1/primary`, `/data2/primary` (mirror 동일) |
+| `primary_data_dirs` / `mirror_data_dirs` | 세그먼트 상위 디렉토리 (`whpg_data_mounts`, `whpg_segments_per_host` 에서 자동 생성) | 1개: `/data/primary` / 2개: `/data1/primary`, `/data2/primary` (mirror 동일) |
 | `whpg_pg_hba_rules` | pg_hba.conf 추가 규칙 | gpadmin md5 등 |
 | `install_*` | Extension 설치 플래그 | 아래 표 참고 |
 
@@ -304,16 +304,21 @@ ansible-playbook playbooks/site.yml --check --diff
 ## Mirror 구성 (Phase 3)
 
 `gpinitsystem` 은 primary 만 만들고, `gpaddmirrors -i` 로 mirror 를 **segment 4대 단위 spread** 로 배치합니다
-(`roles/whpg_init/tasks/mirrors.yml`, 규칙은 `templates/gpaddmirrors_config.j2`).
+(`roles/whpg_init/tasks/mirrors.yml`, 규칙은 `templates/gpaddmirrors_config.j2`). segment 2 / 3대도 mirror 를 구성합니다.
 
-- `inventory/hosts` 의 `[segments]` 를 적힌 순서대로 `whpg_mirror_group_size`(4)대씩 묶고, mirror 는 같은 그룹 안에만 둡니다.
-- 호스트당 segment 수는 `whpg_segments_per_host` (2 / 4 / 8 …, 데이터 디스크 수의 배수). k 번째 segment 는 `/data1`, `/data2` 에 번갈아 둡니다.
-- 그룹 내 순번 h 호스트의 k 번째 primary mirror → 같은 그룹 `(h + (k mod 3) + 1) mod 4` 번째 호스트의 k 번째 mirror 슬롯
+- `inventory/hosts` 의 `[segments]` 를 적힌 순서대로 묶고, mirror 는 같은 그룹 안에만 둡니다.
+  첫 그룹은 `whpg_mirror_first_group_size`(= min(호스트 수, 4))대, 이후 `whpg_mirror_group_size`(4)대씩입니다.
+  → 2대: [2], 3대: [3], 4대: [4], 8대: [4][4]
+- 호스트당 segment 수는 `whpg_segments_per_host` (2 / 4 / 8 …, 데이터 볼륨 수의 배수).
+  데이터 볼륨이 1개(`/data`)면 모두 `/data` 아래, 2개(`/data1`, `/data2`)면 k 번째 segment 를 번갈아 둡니다.
+  mirror 도 같은 k 의 디렉토리를 쓰므로 볼륨마다 primary / mirror 수가 같습니다. Coordinator / Standby 는 첫 번째 볼륨에 둡니다.
+- 그룹(크기 S) 내 순번 h 호스트의 k 번째 primary mirror → 같은 그룹 `(h + (k mod (S-1)) + 1) mod S` 번째 호스트의 k 번째 mirror 슬롯
   (포트 `whpg_mirror_port_base + k`). 받는 호스트마다 k 가 하나씩이라 포트 / 디렉토리가 겹치지 않습니다.
-- segment 호스트 수가 4의 배수가 아니거나 segment 수가 디스크 수의 배수가 아니면 `gpinitsystem` 전에 중단합니다.
+  2대면 서로 상대 호스트에, 3대면 나머지 2대에 번갈아 둡니다.
+- segment 호스트 수가 4의 배수도 2 / 3대도 아니거나(1, 5, 6, 7대 …), segment 수가 디스크 수의 배수가 아니면 `gpinitsystem` 전에 중단합니다.
 - mirror 가 이미 있으면 건너뜁니다 (다시 실행해도 안전).
 
-| `whpg_segments_per_host` | 디스크(/data1, /data2)마다 | 호스트 1대 장애 시 넘겨받는 segment 수 |
+| `whpg_segments_per_host` | 볼륨 2개(/data1, /data2)일 때 볼륨마다 (1개면 /data 에 합산) | 호스트 1대 장애 시 넘겨받는 segment 수 |
 |---|---|---|
 | 2 | primary 1 + mirror 1 | 다음 2대에 1, 1 |
 | 4 | primary 2 + mirror 2 | 나머지 3대에 2, 1, 1 |
@@ -328,11 +333,30 @@ ansible-playbook playbooks/site.yml --check --diff
 | sdw3 | P4, M2 | P5, M1 |
 | sdw4 | P6, M4 | P7, M3 |
 
-- 증설은 `[segments]` 끝에 4대를 추가하며, 새 4대는 새 그룹으로 같은 규칙이 적용됨 (sdw5~8 → 그룹 2)
+볼륨 1개(`/data`), `whpg_segments_per_host: 2`, 4대 예시: 위 표의 /data1, /data2 칸을 합친 것과 같습니다 (예: sdw1 `/data` = P0, P1, M5, M6).
+
+`whpg_segments_per_host: 2`, 2대 / 3대 예시:
+
+| 호스트 (2대) | /data1 | /data2 |
+|---|---|---|
+| sdw1 | P0, M2 | P1, M3 |
+| sdw2 | P2, M0 | P3, M1 |
+
+| 호스트 (3대) | /data1 | /data2 |
+|---|---|---|
+| sdw1 | P0, M4 | P1, M3 |
+| sdw2 | P2, M0 | P3, M5 |
+| sdw3 | P4, M2 | P5, M1 |
+
+- 2 / 3대는 호스트 1대 장애 시 나머지 1 / 2대가 그 primary 를 모두 넘겨받으므로 부하가 몰립니다.
+- 증설은 `[segments]` 끝에 추가합니다. 2 / 3대는 먼저 4대까지(2→3, 2→4, 3→4) 증설하며 이때 기존 mirror 를 새 그룹 기준으로 재배치하고,
+  4대 이후에는 4대 단위로 증설해 새 4대가 새 그룹이 됩니다 (sdw5~8 → 그룹 2, 기존 mirror 유지). 아래 Segment 증설 참고
 
 ## Segment 증설 (`playbooks/ops/expand_segments.yml`)
 
-1. 새 호스트 4대를 `inventory/hosts` 의 `[segments]` **끝에** 추가 (기존 순서 유지)
+1. 새 호스트를 `inventory/hosts` 의 `[segments]` **끝에** 추가 (기존 순서 유지)
+   - 기존 2 / 3대: 합계 4대까지 (2→3, 2→4, 3→4). 기존 mirror 를 증설 후 구성(전체 한 그룹)에 맞게 재배치
+   - 기존 4대 이상: 4대 단위. 기존 mirror 는 그대로
 2. 실행:
 
 ```bash
@@ -343,13 +367,19 @@ ansible-playbook playbooks/ops/expand_segments.yml -e expand_duration=04:00:00  
 
 | 단계 | 대상 | 내용 |
 |---|---|---|
-| 1. 계획 | coordinator | `gp_segment_configuration` 과 `[segments]` 비교 → 새 호스트 결정. 4대 단위 / 기존 순서 / 포트 규칙 확인 |
+| 1. 계획 | coordinator | `gp_segment_configuration` 과 `[segments]` 비교 → 새 호스트 결정. 증설 대수(2 / 3대 → 4대까지, 이후 4대 단위) / 기존 순서 / 포트 규칙 확인 |
 | 2. /etc/hosts | 전체 | 새 호스트 등록 |
 | 3. 준비 | 새 호스트 | `os_preconfig` → (SELinux / cgroup v2 적용에 필요하면) 재부팅 → `whpg_install` → extension RPM |
-| 4. gpexpand | coordinator | hostfile 갱신, gpssh-exkeys → `gpexpand -s -i` (새 primary + mirror, 초기 구성과 같은 4대 그룹 spread) → PXF 등록 → 재분배 → `gpexpand -c` |
+| 4. gpexpand | coordinator | hostfile 갱신, gpssh-exkeys → (기존 2 / 3대면) mirror 재배치 → `gpexpand -s -i` (새 primary + mirror, 초기 구성과 같은 그룹 spread) → PXF 등록 → 재분배 → `gpexpand -c` |
 | 5. WEM | 전체 | `wem_enabled` 면 `07_wem.yml` (새 호스트 Host Agent / otelcol, pg_hba) |
 
-- 중간에 멈추거나 `expand_duration` 이 지나도 **같은 명령을 다시 실행**하면 `gpexpand.status` 를 보고 이어서 진행합니다.
+- mirror 재배치(기존 2 / 3대, `roles/whpg_expand/tasks/remirror.yml`): 증설 후 전체 호스트를 한 그룹으로 보고 위치가 바뀌는 기존 mirror 만
+  `gpmovemirrors` 로 옮깁니다. 최종 위치가 다른 segment 에 쓰이고 있으면 임시 위치(포트 +100, 디렉토리 `_mv`)를 거쳐 2단계로 옮기고,
+  단계마다 모든 segment 동기화를 기다린 뒤 등록되지 않은 이전 mirror 디렉토리를 지웁니다.
+  클러스터는 정지하지 않지만 옮기는 동안 해당 primary 는 이중화 없이 동작하고, mirror 전체를 복사하므로 데이터 크기만큼 시간이 걸립니다
+  (`expand_remirror_sync_timeout`, 기본 4시간). 시작 전 모든 segment 가 up / 동기화 / 원래 역할이어야 합니다.
+- 중간에 멈추거나 `expand_duration` 이 지나도 **같은 명령을 다시 실행**하면 `gpexpand.status` 를 보고 이어서 진행합니다
+  (mirror 재배치도 현재 위치에서 다시 계산해 이어서 진행).
 - 새 primary 는 content / dbid 를 현재 최대값 다음부터, 포트는 기존과 같은 `whpg_port_base + k` / `whpg_mirror_port_base + k` 를 씁니다.
 - 변수: `roles/whpg_expand/defaults/main.yml` (`expand_redistribute`, `expand_duration`, `expand_parallel`, `expand_analyze`, `expand_cleanup`, `expand_reboot_if_needed`)
 

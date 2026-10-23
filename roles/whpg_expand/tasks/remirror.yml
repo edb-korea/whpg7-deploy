@@ -1,0 +1,140 @@
+---
+# ======================================================
+# 기존 2 / 3대 클러스터 증설 시 mirror 재배치 (coordinator, gpexpand 전에 실행)
+#   증설 후 전체 segment 호스트(최대 4대)를 한 그룹으로 보고, 기존 mirror 를 초기 구성과 같은 규칙의
+#   최종 위치로 gpmovemirrors 로 옮긴다. 이어서 gpexpand 가 새 primary / mirror 를 남은 최종 위치에 추가한다.
+#   - 1차: 최종 위치가 비어 있으면 바로, 다른 segment 가 쓰고 있으면 임시 위치로 이동
+#   - 2차: 임시 위치 → 최종 위치
+#   - 단계마다 모든 segment 가 up / 동기화될 때까지 대기, 끝나면 등록되지 않은 이전 mirror 디렉토리 정리
+#   - 클러스터는 정지하지 않는다. 옮기는 동안 해당 primary 는 이중화 없이 동작한다
+#   - 중간에 멈춰도 다시 실행하면 현재 위치에서 다시 계산해 이어서 진행한다
+# ======================================================
+
+- name: mirror 재배치 - 클러스터 상태 확인 (모든 segment up / 원래 역할 / 동기화)
+  ansible.builtin.assert:
+    that:
+      - _segs | selectattr('content', 'ge', 0) | rejectattr('status', 'equalto', 'u') | list | length == 0
+      - _segs | selectattr('content', 'ge', 0) | rejectattr('mode', 'equalto', 's') | list | length == 0
+      - (_segs | selectattr('content', 'ge', 0) | map(attribute='role') | list)
+        == (_segs | selectattr('content', 'ge', 0) | map(attribute='prole') | list)
+    fail_msg: >-
+      down / 동기화 안 됨 / 역할이 바뀐 segment 가 있어 mirror 를 옮길 수 없습니다.
+      gprecoverseg -a (필요하면 gprecoverseg -r) 로 정상화한 뒤 다시 실행하세요.
+    quiet: true
+
+- name: mirror 재배치 계획
+  ansible.builtin.include_tasks: remirror_plan.yml
+
+- name: mirror 재배치 계획 출력 (현재 → 최종)
+  ansible.builtin.debug:
+    msg: >-
+      {{ ['기존 mirror ' ~ (_segs | selectattr('content', 'ge', 0) | selectattr('prole', 'equalto', 'm') | list | length)
+          ~ '개 중 ' ~ _remirror_moves | length ~ '개 이동 (' ~ segment_hosts | length ~ '대 한 그룹 기준)']
+         + (_remirror_moves | map(attribute='content') | map('string')
+            | zip(_remirror_moves | map(attribute='from'), _remirror_moves | map(attribute='final'),
+                  _remirror_moves | map(attribute='direct'))
+            | map('join', ' : ') | map('regex_replace', ' : True$', ' (바로)')
+            | map('regex_replace', ' : False$', ' (임시 위치 경유)') | list) }}
+
+- name: mirror 이동
+  when: _remirror_moves | length > 0
+  block:
+    - name: gpmovemirrors 1차 입력 파일 (바로 최종 위치 / 임시 위치)
+      ansible.builtin.copy:
+        dest: "{{ whpg_gpmovemirrors_input }}_1"
+        content: |
+          {% for m in _remirror_moves %}
+          {{ m.from }} {{ m.final if m.direct else m.temp }}
+          {% endfor %}
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0644'
+
+    - name: gpmovemirrors 1차
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          yes | gpmovemirrors -i {{ whpg_gpmovemirrors_input }}_1 2>&1
+        chdir: "{{ gpadmin_home }}"
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      register: _remirror_pass1
+
+    - name: 1차 이동 후 동기화 대기
+      ansible.builtin.include_tasks: remirror_wait.yml
+
+    - name: gpmovemirrors 2차 (임시 위치 → 최종 위치)
+      when: _remirror_moves | rejectattr('direct') | list | length > 0
+      block:
+        - name: gpmovemirrors 2차 입력 파일
+          ansible.builtin.copy:
+            dest: "{{ whpg_gpmovemirrors_input }}_2"
+            content: |
+              {% for m in _remirror_moves | rejectattr('direct') %}
+              {{ m.temp }} {{ m.final }}
+              {% endfor %}
+            owner: "{{ gpadmin_user }}"
+            group: "{{ gpadmin_group }}"
+            mode: '0644'
+
+        - name: gpmovemirrors 2차
+          ansible.builtin.shell:
+            cmd: >
+              source {{ whpg_install_dir }}/greenplum_path.sh &&
+              yes | gpmovemirrors -i {{ whpg_gpmovemirrors_input }}_2 2>&1
+            chdir: "{{ gpadmin_home }}"
+          become: true
+          become_user: "{{ gpadmin_user }}"
+          environment: "{{ whpg_env }}"
+          register: _remirror_pass2
+
+        - name: 2차 이동 후 동기화 대기
+          ansible.builtin.include_tasks: remirror_wait.yml
+
+# ---------- 이전 mirror 디렉토리 정리 ----------
+# gp_segment_configuration 에 등록되지 않은 mirror_data_dirs 아래의 segment 디렉토리(gpseg*)만 지운다
+- name: 현재 등록된 segment 디렉토리 조회
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -F '|' -c "SELECT address, datadir FROM gp_segment_configuration WHERE content >= 0"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _remirror_registered
+  changed_when: false
+
+# address 가 inventory 이름과 다르면 보존 목록이 비어 정상 mirror 까지 지울 수 있으므로 중단
+- name: 등록된 segment address 가 inventory [segments] 이름과 같은지 확인
+  ansible.builtin.assert:
+    that: >-
+      _remirror_registered.stdout_lines | map('regex_replace', '\|.*$', '') | unique
+      | reject('in', segment_hosts) | list | length == 0
+    fail_msg: >-
+      gp_segment_configuration 의 address({{ _remirror_registered.stdout_lines | map('regex_replace', '\|.*$', '') | unique | list }})가
+      inventory [segments]({{ segment_hosts }})와 달라 이전 디렉토리 정리를 건너뛸 수 없습니다. 직접 정리하세요.
+    quiet: true
+
+- name: 등록되지 않은 이전 mirror 디렉토리 삭제
+  ansible.builtin.shell:
+    cmd: |
+      for d in {% for p in mirror_data_dirs | unique %}{{ p }}/{{ whpg_seg_prefix }}* {% endfor %}; do
+        [ -d "$d" ] || continue
+        case " {{ _keep | join(' ') }} " in *" $d "*) continue ;; esac
+        rm -rf "$d" && echo "삭제: $d"
+      done
+    executable: /bin/bash
+  vars:
+    _keep: >-
+      {{ _remirror_registered.stdout_lines | select('match', '^' ~ (item | regex_escape) ~ '\|') | map('regex_replace', '^[^|]*\|', '') | list }}
+  delegate_to: "{{ item }}"
+  loop: "{{ segment_hosts }}"
+  register: _remirror_cleanup
+  changed_when: _remirror_cleanup.stdout | length > 0
+
+- name: mirror 재배치 결과
+  ansible.builtin.debug:
+    msg:
+      - "이동: {{ _remirror_moves | length }}개 (1차 {{ _remirror_moves | length }}, 2차 {{ _remirror_moves | rejectattr('direct') | list | length }})"
+      - "정리한 이전 디렉토리: {{ _remirror_cleanup.results | map(attribute='stdout_lines') | flatten | list or '없음' }}"
