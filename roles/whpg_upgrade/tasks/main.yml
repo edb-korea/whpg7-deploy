@@ -1,0 +1,813 @@
+---
+# ======================================================
+# Role: whpg_upgrade
+# WarehousePG core / PXF / backup / FlowServer / extension 을 dnf repo 의 최신 버전으로 업그레이드
+#
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=all --check     # 점검 + 변경 예정 사항 (변경 없음)
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=core            # warehouse-pg-7 + clients
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=pxf,backup      # 여러 개
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=extensions      # extension 전체
+#   ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=postgis         # 개별 extension
+#
+# core 절차 (https://www.enterprisedb.com/docs/warehousepg/latest/install_guide/minor_upgrade/ 의 단계 번호):
+#   점검  : 7.4 이상(10), python3.11(7.5.0+), FlowServer / gpbackup 미실행(16), 활성 세션(18), segment 동기화(19),
+#           다른 계정 crontab(7), .bashrc 경로(28), dnf 테스트 트랜잭션
+#   baseline 기록(10, 11) → gpadmin crontab 백업 / 제거(6, 8) → PXF(13) / pgBouncer(14) / WEM(15) / keepalived 정지
+#   → gpstop -a -M fast(20) → 바이너리 백업(21) → dnf: server + clients(25, 26) → symlink(27) → 버전 일치 확인
+#   → pxf cluster register → gpstart -a(29) → ALTER EXTENSION gp_exttable_fdw / gp_toolkit UPDATE(35, 36)
+#   → 7.6.x 권한 SQL(32~34) → 버전 / gpstate -f / gpstate -m(30, 31)
+#   → crontab 복원(37) → keepalived → PXF(38) → pgBouncer(39) → WEM(40) 시작. FlowServer(41)는 잡 재제출이 필요해 수동
+# pxf        : pxf cluster stop → dnf → pxf cluster register → pxf cluster start → ALTER EXTENSION pxf UPDATE
+# backup     : dnf (gpbackup / gprestore 실행 중이면 중단)
+# flowserver : dnf (실행 중이면 중단, 업그레이드 후 수동 시작 + 잡 재제출)
+# extension  : 클러스터 정지 없이 dnf → ALTER EXTENSION UPDATE (preload 라이브러리는 재시작해야 적용, whpg_upgrade_restart)
+#
+# 설치되어 있는 패키지만 올린다. local_rpm_dir 은 보지 않는다. WEM 은 playbooks/07_wem.yml -t upgrade.
+# 점검은 --check 에서도 실행하고, 문제가 있으면 클러스터를 건드리기 전에 중단한다.
+# ======================================================
+
+# ---------------------------------------------------------------------------
+# 0. 업그레이드 대상 해석 (-e upgrade=...)
+# ---------------------------------------------------------------------------
+- name: 업그레이드 대상 해석
+  ansible.builtin.set_fact:
+    _whpg_upg_ts: "{{ now(fmt='%Y%m%d_%H%M%S') }}"
+    _whpg_upg_sel: "{{ (upgrade.split(',') if upgrade is string else upgrade) | map('trim') | reject('equalto', '') | list }}"
+    # 패키지 단위 항목: {id(옵션 이름), name(카탈로그 name), pkg, group(core / pxf / backup / flowserver / ext), sql, preload}
+    _whpg_upg_all_items: >-
+      {%- set out = [] -%}
+      {%- for p in whpg_upgrade_core_pkgs -%}
+      {%- set _ = out.append({'id': 'core', 'name': 'core', 'pkg': p, 'group': 'core',
+            'sql': whpg_upgrade_sql_ext_extra.core | default([]) if loop.first else [], 'preload': false}) -%}
+      {%- endfor -%}
+      {%- set special = {} -%}
+      {%- for k, v in whpg_upgrade_special.items() -%}{%- set _ = special.update({v: k}) -%}{%- endfor -%}
+      {%- for e in whpg_extension_catalog -%}
+      {%- set id = special[e.name] | default(e.name) -%}
+      {%- set _ = out.append({'id': id, 'name': e.name, 'pkg': e.pkg, 'group': id if e.name in special else 'ext',
+            'sql': ([e.sql_ext] if e.sql_ext is defined else []) + whpg_upgrade_sql_ext_extra[id] | default([]),
+            'preload': e.preload is defined}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: 업그레이드 대상 목록
+  ansible.builtin.set_fact:
+    # 이름 / 카탈로그 name / pkg 로 지정해도 같은 옵션(id)의 패키지를 모두 고른다 (core = server + clients)
+    _whpg_upg_ids: >-
+      {%- set ids = [] -%}
+      {%- for i in _whpg_upg_all_items -%}
+      {%- if 'all' in _whpg_upg_sel or ('extensions' in _whpg_upg_sel and i.group == 'ext')
+            or i.id in _whpg_upg_sel or i.name in _whpg_upg_sel or i.pkg in _whpg_upg_sel -%}
+      {%- set _ = ids.append(i.id) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ids | unique | list }}
+    _whpg_upg_unknown: >-
+      {{ _whpg_upg_sel | reject('in', ['all', 'extensions'] + _whpg_upg_all_items | map(attribute='id') | list
+           + _whpg_upg_all_items | map(attribute='name') | list + _whpg_upg_all_items | map(attribute='pkg') | list) | list }}
+
+- name: 업그레이드 대상 패키지
+  ansible.builtin.set_fact:
+    _whpg_upg_items: "{{ _whpg_upg_all_items | selectattr('id', 'in', _whpg_upg_ids) | list }}"
+
+- name: 업그레이드 대상 확인
+  ansible.builtin.assert:
+    that:
+      - _whpg_upg_sel | length > 0
+      - _whpg_upg_unknown | length == 0
+    fail_msg: >-
+      {{ ('알 수 없는 대상: ' ~ (_whpg_upg_unknown | join(', ')) ~ '. ') if _whpg_upg_unknown else '' }}
+      {{- ('WEM 은 ansible-playbook playbooks/07_wem.yml -t upgrade 로 업그레이드합니다. ')
+          if (_whpg_upg_unknown | select('search', '(?i)wem') | list) else '' }}
+      -e upgrade=<대상> 을 지정하세요 (쉼표로 여러 개): all, core, {{ whpg_upgrade_special.keys() | join(', ') }}, extensions,
+      또는 개별 extension: {{ _whpg_upg_all_items | selectattr('group', 'equalto', 'ext') | map(attribute='id') | join(', ') }}
+    quiet: true
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# 1. 점검 (모든 노드)
+# ---------------------------------------------------------------------------
+- name: 업그레이드 점검 - 설치 / repo 최신 버전, 서비스, 프로세스, crontab, symlink
+  ansible.builtin.shell:
+    cmd: |
+      dnf -q makecache --refresh >/dev/null 2>&1
+      for p in {{ _whpg_upg_items | map(attribute='pkg') | join(' ') }}; do
+        i=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p" 2>/dev/null) || i=''
+        u=''
+        [ -n "$i" ] && u=$(dnf -q repoquery --upgrades --latest-limit 1 --qf '%{version}-%{release}' "$p" 2>/dev/null | tail -n1)
+        echo "PKG|$p|$i|$u"
+      done
+      for s in keepalived {{ whpg_upgrade_services | join(' ') }}; do
+        echo "SVC|$s|$(systemctl is-active "$s" 2>/dev/null)"
+      done
+      pgrep -x flowserver >/dev/null && echo "FLOW|yes" || echo "FLOW|no"
+      pgrep -x 'gpbackup|gprestore' >/dev/null && echo "BKP|yes" || echo "BKP|no"
+      command -v python3.11 >/dev/null 2>&1 && echo "PY311|yes" || echo "PY311|no"
+      for l in {{ whpg_upgrade_symlinks | join(' ') }}; do echo "LINK|$l|$(readlink "$l" 2>/dev/null)"; done
+      {% if inventory_hostname in whpg_upgrade_cron_hosts %}
+      crontab -l -u {{ gpadmin_user }} >/dev/null 2>&1 && echo "CRON|yes" || echo "CRON|no"
+      # 문서 7단계: gpadmin 외 계정의 crontab (DB 작업이 있으면 직접 중지)
+      echo "CRONUSERS|$(for u in $(cut -f1 -d: /etc/passwd); do [ "$u" != {{ gpadmin_user }} ] && crontab -l -u "$u" >/dev/null 2>&1 && echo -n "$u "; done)"
+      # 문서 28단계: gpadmin 셸 환경(.bashrc / .bash_profile)이 source 하는 greenplum_path.sh 경로
+      echo "BASHRC|$(cat {{ gpadmin_home }}/.bashrc {{ gpadmin_home }}/.bash_profile 2>/dev/null | grep -v '^\s*#' | grep -o '[^ "'"'"']*greenplum_path\.sh' | sort -u | paste -sd' ')"
+      {% endif %}
+    executable: /bin/bash
+  register: _whpg_upg_info
+  changed_when: false
+  check_mode: false
+
+- name: 업그레이드 점검 - 결과 정리
+  ansible.builtin.set_fact:
+    _whpg_upg_pkgs: >-
+      {%- set out = [] -%}
+      {%- for l in _whpg_upg_info.stdout_lines if l.startswith('PKG|') -%}
+      {%- set f = l.split('|') -%}
+      {%- set _ = out.append({'name': f[1], 'installed': f[2], 'upgrade': f[3]}) -%}
+      {%- endfor -%}
+      {{ out }}
+    _whpg_upg_kv: >-
+      {%- set d = {'LINK': {}} -%}
+      {%- for l in _whpg_upg_info.stdout_lines if not l.startswith('PKG|') and not l.startswith('SVC|') -%}
+      {%- set f = l.split('|') -%}
+      {%- if f[0] == 'LINK' -%}{%- set _ = d.LINK.update({f[1]: f[2]}) -%}
+      {%- else -%}{%- set _ = d.update({f[0]: f[1] | trim}) -%}{%- endif -%}
+      {%- endfor -%}
+      {{ d }}
+    _whpg_upg_active_svcs: >-
+      {{ _whpg_upg_info.stdout_lines | select('match', '^SVC\|.*\|active$')
+         | map('split', '|') | map(attribute='1') | list }}
+    _whpg_upg_cron_backup: "{{ gpadmin_home }}/crontab_backup_{{ _whpg_upg_ts }}"
+
+- name: 업그레이드 점검 - 노드별 대상 패키지
+  ansible.builtin.set_fact:
+    # 설치되어 있고 repo 에 더 높은 버전이 있는 패키지
+    _whpg_upg_todo: "{{ _whpg_upg_pkgs | rejectattr('installed', 'equalto', '') | rejectattr('upgrade', 'equalto', '') | list }}"
+    _whpg_upg_has_cron: "{{ _whpg_upg_kv.CRON | default('no') == 'yes' }}"
+    _whpg_upg_backup_dir: >-
+      {{ whpg_real_install_dir }}_save_{{ (_whpg_upg_pkgs | selectattr('name', 'equalto', whpg_core_pkg_name)
+         | map(attribute='installed') | first | default('', true)) or 'unknown' }}
+
+# 실제 설치 없이 의존성 / 파일 충돌 확인 (rpm test transaction). 정지 전에 실패 원인을 잡기 위함
+- name: 업그레이드 점검 - dnf 테스트 트랜잭션 (실제 설치 안 함)
+  ansible.builtin.shell:
+    cmd: |
+      dnf -y upgrade --setopt=tsflags=test {{ _whpg_upg_todo | map(attribute='name') | join(' ') }} 2>&1 | tail -n 15
+      exit ${PIPESTATUS[0]}
+    executable: /bin/bash
+  register: _whpg_upg_dnftest
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: _whpg_upg_todo | length > 0
+
+- name: 업그레이드 점검 - DB / PXF / extension 상태 (Coordinator)
+  ansible.builtin.shell:
+    cmd: |
+      {{ _whpg_upg_pxf_sh }}
+      if [ -x "$PXF" ]; then
+        "$PXF" cluster status >/dev/null 2>&1 && echo "PXF=running" || echo "PXF=stopped"
+      else
+        echo "PXF=none"
+      fi
+      if ! psql -d {{ whpg_database }} -Atc 'select 1' >/dev/null 2>&1; then
+        echo "DB=stopped"
+        exit 0
+      fi
+      echo "DB=running"
+      # 모니터링 계정(whpg_upgrade_ignore_session_users) 세션은 gpstop -M fast 로 끊겨도 무방하므로 제외
+      echo "ACTIVE=$(psql -d {{ whpg_database }} -Atc "select count(*) || coalesce(' (' || string_agg(distinct usename || '@' ||
+        coalesce(nullif(application_name, ''), host(client_addr), 'local'), ', ') || ')', '') from pg_stat_activity
+        where backend_type = 'client backend' and state <> 'idle' and pid <> pg_backend_pid()
+        and usename not in ('{{ whpg_upgrade_ignore_session_users | join("', '") }}')")"
+      # status 가 down 이거나, mirror 가 있는 content 인데 동기화(mode=s)가 아닌 segment 수 (gpstate -m 의 Synchronized)
+      echo "UNSYNC=$(psql -d {{ whpg_database }} -Atc "select count(*) from gp_segment_configuration c
+        where c.content >= 0 and (c.status <> 'u' or (c.mode <> 's' and exists
+        (select 1 from gp_segment_configuration m where m.content = c.content and m.role = 'm')))")"
+      echo "DBS=$(psql -d {{ whpg_database }} -Atc "select string_agg(datname, ' ' order by datname) from pg_database where datallowconn")"
+      {% if _whpg_upg_sql_exts | length > 0 %}
+      # 업그레이드 대상 extension 이 생성되어 있는 DB (업그레이드 후 ALTER EXTENSION UPDATE 대상)
+      for db in $(psql -d {{ whpg_database }} -Atc "select datname from pg_database where datallowconn"); do
+        psql -d "$db" -Atc "select 'EXT|$db|' || extname || '|' || extversion from pg_extension
+          where extname in ('{{ _whpg_upg_sql_exts | join("', '") }}')"
+      done
+      {% endif %}
+    executable: /bin/bash
+  vars:
+    _whpg_upg_sql_exts: "{{ _whpg_upg_items | map(attribute='sql') | flatten | unique | list }}"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _whpg_upg_db_raw
+  changed_when: false
+  check_mode: false
+  when: inventory_hostname == coordinator_host
+
+- name: 업그레이드 점검 - DB 상태 정리 (Coordinator)
+  ansible.builtin.set_fact:
+    _whpg_upg_db: >-
+      {%- set d = {'EXT': []} -%}
+      {%- for l in _whpg_upg_db_raw.stdout_lines -%}
+      {%- if l.startswith('EXT|') -%}
+      {%- set _ = d.EXT.append(l[4:]) -%}
+      {%- elif '=' in l -%}
+      {%- set _ = d.update({l.split('=', 1)[0]: l.split('=', 1)[1]}) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ d }}
+  when: inventory_hostname == coordinator_host
+
+# ---------------------------------------------------------------------------
+# 점검 결과 종합 (클러스터 단위)
+# ---------------------------------------------------------------------------
+- name: 업그레이드 점검 - 클러스터 종합
+  ansible.builtin.set_fact:
+    _whpg_upg_plan: >-
+      {%- set hv = ansible_play_hosts | map('extract', hostvars) | list -%}
+      {%- set db = hostvars[coordinator_host]._whpg_upg_db | default({}) -%}
+      {%- set all_rows = hv | map(attribute='_whpg_upg_pkgs') | flatten | list -%}
+      {%- set todo_all = hv | map(attribute='_whpg_upg_todo') | flatten | map(attribute='name') | unique | list -%}
+      {%- set items = _whpg_upg_items | selectattr('pkg', 'in', todo_all) | list -%}
+      {%- set up_groups = items | map(attribute='group') | unique | list -%}
+      {%- set needs_stop = 'core' in up_groups -%}
+      {%- set preload_up = items | selectattr('preload') | map(attribute='id') | list -%}
+      {%- set restart = (not needs_stop) and (preload_up | length > 0) and (whpg_upgrade_restart | bool) -%}
+      {%- set downtime = needs_stop or restart -%}
+      {%- set cur = all_rows | selectattr('name', 'equalto', whpg_core_pkg_name) | map(attribute='installed') | reject('equalto', '') | unique | sort | first | default('') -%}
+      {%- set issues = [] -%}
+      {%- set warns = [] -%}
+      {%- set targets = {} -%}
+      {%- if ansible_play_hosts | length != ansible_play_hosts_all | length -%}
+      {%- set _ = issues.append('접속 실패 / 실패한 노드: ' ~ (ansible_play_hosts_all | difference(ansible_play_hosts) | join(', '))) -%}
+      {%- endif -%}
+      {#- 패키지별: 모든 노드가 같은 버전으로 올라가는지 -#}
+      {%- for p in todo_all -%}
+      {%- set vers = all_rows | selectattr('name', 'equalto', p) | rejectattr('installed', 'equalto', '') | map(attribute='upgrade') | reject('equalto', '') | unique | list -%}
+      {%- set _ = targets.update({p: vers | first}) -%}
+      {%- if vers | length > 1 -%}
+      {%- set _ = issues.append(p ~ ': 노드별 repo 최신 버전이 다름 (' ~ (vers | join(', ')) ~ ')') -%}
+      {%- endif -%}
+      {%- for h in hv -%}
+      {%- for r in h._whpg_upg_pkgs if r.name == p and r.installed and not r.upgrade -%}
+      {%- set _ = issues.append(h.inventory_hostname ~ ': repo 에 ' ~ p ~ ' ' ~ (vers | first) ~ ' 없음 (노드별 버전이 달라짐)') -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- for h in hv if h._whpg_upg_dnftest is defined and h._whpg_upg_dnftest.rc is defined and h._whpg_upg_dnftest.rc != 0 -%}
+      {%- set _ = issues.append(h.inventory_hostname ~ ': dnf 테스트 트랜잭션 실패 → '
+            ~ (h._whpg_upg_dnftest.stdout_lines | select('search', 'Problem|nothing provides|conflicts|Error') | reject('match', '^Error:\s*$') | list | join(' / '))) -%}
+      {%- endfor -%}
+      {%- set tgt = targets[whpg_core_pkg_name] | default(cur) -%}
+      {%- set cur_n = cur | regex_search('^[0-9.]+') | default('0', true) -%}
+      {%- set tgt_n = tgt | regex_search('^[0-9.]+') | default('0', true) -%}
+      {#- core: server / clients 는 같은 버전 -#}
+      {%- if needs_stop -%}
+      {%- set core_tgts = whpg_upgrade_core_pkgs | select('in', targets) | map('extract', targets) | unique | list -%}
+      {%- if core_tgts | length > 1 -%}
+      {%- set _ = issues.append('core: server / clients 목표 버전이 다름 (' ~ (core_tgts | join(', ')) ~ '), repo 에 같은 버전이 모두 있어야 함') -%}
+      {%- endif -%}
+      {%- if cur_n is version('7.4', '<') -%}
+      {%- set _ = issues.append('core: 현재 ' ~ cur ~ ' (7.4 미만은 설치 경로가 달라 지원하지 않음, 문서 절차대로 수동 업그레이드)') -%}
+      {%- endif -%}
+      {%- if tgt_n is version('7.5.0', '>=') -%}
+      {%- for h in hv if h._whpg_upg_kv.PY311 | default('no') != 'yes' -%}
+      {%- set _ = issues.append(h.inventory_hostname ~ ': python3.11 없음 (7.5.0 이상 필수: python3.11, python3.11-psycopg2, python3.11-pyyaml)') -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- for h in hv if h._whpg_upg_kv.CRONUSERS | default('') -%}
+      {%- set _ = warns.append(h.inventory_hostname ~ ': gpadmin 외 crontab 있음 (' ~ h._whpg_upg_kv.CRONUSERS ~ ') → DB 작업이 있으면 직접 중지') -%}
+      {%- endfor -%}
+      {%- set gp_paths = [whpg_install_dir ~ '/greenplum_path.sh', whpg_real_install_dir ~ '/greenplum_path.sh'] -%}
+      {%- for h in hv if h._whpg_upg_kv.BASHRC is defined and (h._whpg_upg_kv.BASHRC.split() | reject('in', gp_paths) | list or not h._whpg_upg_kv.BASHRC) -%}
+      {%- set _ = warns.append(h.inventory_hostname ~ ': gpadmin .bashrc / .bash_profile 의 greenplum_path.sh 가 ' ~ (h._whpg_upg_kv.BASHRC or '없음')
+            ~ ' (문서 28: ' ~ gp_paths | join(' 또는 ') ~ ' 를 source 해야 함)') -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {#- 실행 중이면 안 되는 프로세스 -#}
+      {%- set flow_hosts = [] -%}
+      {%- set bkp_hosts = [] -%}
+      {%- for h in hv -%}
+      {%- if h._whpg_upg_kv.FLOW | default('no') == 'yes' -%}{%- set _ = flow_hosts.append(h.inventory_hostname) -%}{%- endif -%}
+      {%- if h._whpg_upg_kv.BKP | default('no') == 'yes' -%}{%- set _ = bkp_hosts.append(h.inventory_hostname) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- if flow_hosts and (needs_stop or 'flowserver' in up_groups) -%}
+      {%- set _ = issues.append('FlowServer 실행 중 (' ~ flow_hosts | join(', ') ~ '): 잡 정지 후 flowcli stop --all; pkill flowserver. 업그레이드 후 수동 시작 + 잡 재제출') -%}
+      {%- endif -%}
+      {%- if bkp_hosts and (needs_stop or 'backup' in up_groups) -%}
+      {%- set _ = issues.append('gpbackup / gprestore 실행 중 (' ~ bkp_hosts | join(', ') ~ ')') -%}
+      {%- endif -%}
+      {%- if downtime and db.DB | default('') == 'running' -%}
+      {%- if db.UNSYNC | default('0') | int > 0 -%}
+      {%- set _ = issues.append('동기화되지 않았거나 down 인 segment ' ~ db.UNSYNC ~ '개 (gprecoverseg -a 후 재실행)') -%}
+      {%- endif -%}
+      {%- if db.ACTIVE | default('0') | regex_search('^[0-9]+') | int > 0 -%}
+      {%- if whpg_upgrade_force | bool -%}
+      {%- set _ = warns.append('활성 세션 ' ~ db.ACTIVE ~ ' → gpstop -M fast 로 종료됨 (whpg_upgrade_force=true)') -%}
+      {%- else -%}
+      {%- set _ = issues.append('활성 세션 ' ~ db.ACTIVE ~ ' (종료 후 재실행, 또는 -e whpg_upgrade_force=true)') -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- if downtime and db.DB | default('') == 'stopped' -%}
+      {%- set _ = warns.append('DB 가 정지 상태 → 패키지만 업그레이드 (gpstart / ALTER EXTENSION / 권한 SQL 하지 않음)') -%}
+      {%- endif -%}
+      {%- if preload_up and not downtime -%}
+      {%- set _ = warns.append('preload extension(' ~ (preload_up | join(', ')) ~ ') 은 재시작해야 새 버전 적용: gpstop -ra (또는 -e whpg_upgrade_restart=true)') -%}
+      {%- endif -%}
+      {%- if 'diskquota' in (items | map(attribute='id') | list) -%}
+      {%- set _ = warns.append('diskquota: 라이브러리명이 버전별(diskquota-<major.minor>)이므로 diskquota_lib_version / shared_preload_libraries 확인') -%}
+      {%- endif -%}
+      {#- 7.6.x 권한 SQL (core 업그레이드 시) -#}
+      {%- set post_sql = [] -%}
+      {%- if needs_stop and whpg_upgrade_post_sql | bool -%}
+      {%- if tgt_n is version('7.6.0', '>=') -%}{%- set _ = post_sql.append('file') -%}{%- endif -%}
+      {%- if tgt_n is version('7.6.1', '>=') -%}{%- set _ = post_sql.append('memctx') -%}{%- endif -%}
+      {%- if tgt_n is version('7.6.1', '>=') and whpg_upgrade_post_sql_optional | bool -%}{%- set _ = post_sql.append('optional') -%}{%- endif -%}
+      {%- endif -%}
+      {%- set skipped = [] -%}
+      {%- for id in _whpg_upg_ids -%}
+      {%- set pk = _whpg_upg_items | selectattr('id', 'equalto', id) | map(attribute='pkg') | list -%}
+      {%- if (all_rows | selectattr('name', 'in', pk) | rejectattr('installed', 'equalto', '') | list | length) == 0 -%}
+      {%- set _ = skipped.append(id) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ {'needed': todo_all | length > 0, 'todo': todo_all, 'up_items': items, 'up_groups': up_groups, 'targets': targets,
+          'needs_stop': needs_stop, 'pxf_up': 'pxf' in up_groups, 'preload_up': preload_up, 'restart': restart,
+          'downtime': downtime, 'current': cur, 'target': tgt, 'cur_n': cur_n, 'tgt_n': tgt_n,
+          'sql': items | map(attribute='sql') | flatten | unique | list, 'post_sql': post_sql,
+          'skipped': skipped, 'db': db, 'issues': issues, 'warns': warns} }}
+  run_once: true
+
+- name: 업그레이드 점검 - 업그레이드 불가 시 중단 (--check 에서는 Summary 에 표시)
+  ansible.builtin.fail:
+    msg: "{{ ['업그레이드를 진행할 수 없습니다 (클러스터는 변경하지 않음):'] + _whpg_upg_plan.issues }}"
+  when:
+    - not ansible_check_mode
+    - _whpg_upg_plan.needed
+    - _whpg_upg_plan.issues | length > 0
+
+# ---------------------------------------------------------------------------
+# 2. 업그레이드 (점검 통과, --check 아님, 대상 있음)
+#    한 노드라도 실패하면 모든 노드에서 중단 (any_errors_fatal)
+# ---------------------------------------------------------------------------
+- name: 업그레이드 실행
+  when:
+    - not ansible_check_mode
+    - _whpg_upg_plan.needed
+  any_errors_fatal: true
+  vars:
+    _p: "{{ _whpg_upg_plan }}"
+    _db_running: "{{ _whpg_upg_plan.db.DB | default('') == 'running' }}"
+    _pxf_running: "{{ _whpg_upg_plan.db.PXF | default('') == 'running' }}"
+    _pxf_cycle: "{{ _whpg_upg_plan.needs_stop or _whpg_upg_plan.pxf_up }}"
+    _gp: "source {{ whpg_install_dir }}/greenplum_path.sh"
+  block:
+    # ----- 2-1. baseline 기록 (문서 10, 11) -----
+    - name: 업그레이드 전 상태 기록 ({{ whpg_upgrade_baseline_file }})
+      ansible.builtin.shell:
+        cmd: |
+          {
+            echo "# $(date) {{ inventory_hostname }} upgrade={{ _whpg_upg_sel | join(',') }}"
+            rpm -qa | grep -Ei 'whpg|warehouse|flow-server' | sort
+          {% if inventory_hostname == coordinator_host %}
+            # gpadmin 로그인 환경(.bashrc 의 PXF_HOME / PXF_BASE 등)으로 실행
+            su - {{ gpadmin_user }} -c 'pxf --version 2>&1 | head -n1; pgbouncer --version 2>&1 | head -n1;
+              psql -d {{ whpg_database }} -Atc "select version()"' 2>/dev/null
+          {% endif %}
+          } > {{ whpg_upgrade_baseline_file }}
+          chown {{ gpadmin_user }}:{{ gpadmin_group }} {{ whpg_upgrade_baseline_file }}
+        executable: /bin/bash
+      changed_when: true
+
+    # ----- 2-2. (core) crontab / 연관 서비스 정지 (문서 6, 8, 13~15) -----
+    - name: gpadmin crontab 백업
+      ansible.builtin.shell:
+        cmd: crontab -l -u {{ gpadmin_user }} > {{ _whpg_upg_cron_backup }}
+      when: _p.needs_stop and _whpg_upg_has_cron
+      changed_when: true
+
+    - name: gpadmin crontab 제거 (업그레이드 후 복원)
+      ansible.builtin.command: crontab -r -u {{ gpadmin_user }}
+      when: _p.needs_stop and _whpg_upg_has_cron
+      changed_when: true
+
+    - name: PXF 정지 (pxf cluster stop)
+      ansible.builtin.shell:
+        cmd: |
+          {{ _whpg_upg_pxf_sh }}
+          "$PXF" cluster stop 2>&1
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      when: inventory_hostname == coordinator_host and _pxf_running and _pxf_cycle
+      changed_when: true
+
+    - name: pgBouncer / WEM 정지
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ whpg_upgrade_services | select('in', _whpg_upg_active_svcs) | list if _p.needs_stop else [] }}"
+
+    # VIP 가 standby 로 넘어가 승격 스크립트가 실행되지 않도록 BACKUP(standby) → MASTER 순으로 정지
+    - name: keepalived 정지 (standby 먼저)
+      ansible.builtin.systemd:
+        name: keepalived
+        state: stopped
+      when: _p.needs_stop and 'keepalived' in _whpg_upg_active_svcs and inventory_hostname != coordinator_host
+
+    - name: keepalived 정지 (coordinator)
+      ansible.builtin.systemd:
+        name: keepalived
+        state: stopped
+      when: _p.needs_stop and 'keepalived' in _whpg_upg_active_svcs and inventory_hostname == coordinator_host
+
+    # ----- 2-3. (core) 클러스터 정지 / 바이너리 백업 (문서 20, 21) -----
+    - name: gpstop -a -M fast
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpstop -a -M fast 2>&1"
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      when: inventory_hostname == coordinator_host and _p.needs_stop and _db_running
+      changed_when: true
+
+    - name: 현재 바이너리 백업 ({{ whpg_real_install_dir }} → {{ _whpg_upg_backup_dir }})
+      ansible.builtin.command:
+        cmd: cp -a {{ whpg_real_install_dir }} {{ _whpg_upg_backup_dir }}
+        creates: "{{ _whpg_upg_backup_dir }}"
+      when: _p.needs_stop and whpg_upgrade_backup_binaries | bool and _whpg_upg_todo | length > 0
+
+    # ----- 2-4. dnf 업그레이드: 노드별 대상 전체를 한 트랜잭션으로 (core 는 server + clients, 문서 25, 26) -----
+    - name: dnf 업그레이드
+      ansible.builtin.dnf:
+        name: "{{ _whpg_upg_todo | map(attribute='name') | list }}"
+        state: latest
+        update_only: true
+        update_cache: true
+      when: _whpg_upg_todo | length > 0
+
+    - name: 설치 디렉토리 소유권 재정비 ({{ gpadmin_user }})
+      ansible.builtin.file:
+        path: "{{ whpg_real_install_dir }}"
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        recurse: true
+      when: _whpg_upg_todo | length > 0
+
+    - name: symlink 확인 (문서 27, → {{ whpg_real_install_dir }})
+      ansible.builtin.file:
+        src: "{{ whpg_real_install_dir }}"
+        dest: "{{ item }}"
+        state: link
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+      loop: "{{ whpg_upgrade_symlinks }}"
+      when: _p.needs_stop
+
+    - name: 업그레이드 후 패키지 버전 확인
+      ansible.builtin.shell:
+        cmd: |
+          for p in {{ _p.todo | join(' ') }}; do
+            v=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p" 2>/dev/null) && echo "$p|$v"
+          done
+        executable: /bin/bash
+      register: _whpg_upg_after
+      changed_when: false
+
+    - name: 모든 노드 버전 일치 확인
+      ansible.builtin.assert:
+        that: _expected | difference(_whpg_upg_after.stdout_lines) | length == 0
+        fail_msg: >-
+          목표 버전과 다른 패키지: {{ _expected | difference(_whpg_upg_after.stdout_lines) }}
+          (설치: {{ _whpg_upg_after.stdout_lines }}).
+          {{ ('클러스터는 정지 상태이며 바이너리 백업은 ' ~ _whpg_upg_backup_dir ~ ' 입니다.') if _p.needs_stop else '' }}
+        quiet: true
+      vars:
+        _expected: >-
+          {%- set e = [] -%}
+          {%- for k in _whpg_upg_pkgs if k.installed and k.name in _p.todo -%}
+          {%- set _ = e.append(k.name ~ '|' ~ _p.targets[k.name]) -%}
+          {%- endfor -%}
+          {{ e }}
+
+    # ----- 2-5. PXF 등록 / 클러스터 시작 또는 재시작 (문서 29) -----
+    # PXF 를 올렸거나 WHPG 바이너리가 바뀌면 extension 파일을 다시 등록
+    - name: PXF 등록 (pxf cluster register)
+      ansible.builtin.shell:
+        cmd: |
+          {{ _whpg_upg_pxf_sh }}
+          "$PXF" cluster register 2>&1
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      when: inventory_hostname == coordinator_host and _p.db.PXF | default('none') != 'none' and _pxf_cycle
+      changed_when: true
+
+    - name: gpstart -a
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpstart -a 2>&1"
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      when: inventory_hostname == coordinator_host and _p.needs_stop and _db_running
+      changed_when: true
+
+    - name: gpstop -ra -M fast (preload extension 적용)
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpstop -ra -M fast 2>&1"
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      when: inventory_hostname == coordinator_host and _p.restart and _db_running
+      changed_when: true
+
+    # ----- 2-6. ALTER EXTENSION UPDATE: extension 이 생성된 모든 DB (문서 35, 36) -----
+    - name: ALTER EXTENSION ... UPDATE
+      ansible.builtin.shell:
+        cmd: |
+          {{ _gp }}
+          for db in $(psql -d {{ whpg_database }} -Atc "select datname from pg_database where datallowconn"); do
+            psql -d "$db" -Atc "select name || '|' || installed_version || '|' || default_version
+              from pg_available_extensions where installed_version is not null
+              and installed_version <> default_version and name in ('{{ _p.sql | join("', '") }}')" |
+            while IFS='|' read -r e iv dv; do
+              if err=$(psql -d "$db" -v ON_ERROR_STOP=1 -qc "ALTER EXTENSION \"$e\" UPDATE" 2>&1 >/dev/null); then
+                echo "$db: $e $iv → $dv"
+              else
+                echo "FAIL $db: $e $iv → $dv ($(head -n1 <<<"$err"))"
+              fi
+            done
+          done
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      register: _whpg_upg_alter
+      changed_when: _whpg_upg_alter.stdout | length > 0
+      when: inventory_hostname == coordinator_host and _db_running and _p.sql | length > 0
+
+    # ----- 2-7. 7.6.x 권한 SQL: 모든 DB (문서 32~34) -----
+    - name: 7.6.x 권한 SQL 적용 ({{ _p.post_sql | join(', ') }})
+      ansible.builtin.shell:
+        cmd: |
+          {{ _gp }}
+          sql=$(mktemp)
+          trap 'rm -f "$sql"' EXIT
+          cat > "$sql" <<'EOSQL'
+          {% if 'file' in _p.post_sql %}
+          REVOKE EXECUTE ON FUNCTION pg_file_write(text,text,boolean) FROM public;
+          REVOKE EXECUTE ON FUNCTION pg_file_rename(text,text,text) FROM public;
+          REVOKE EXECUTE ON FUNCTION pg_file_unlink(text) FROM public;
+          REVOKE EXECUTE ON FUNCTION pg_logdir_ls() FROM public;
+          GRANT EXECUTE ON FUNCTION pg_file_write(text,text,boolean) TO pg_write_server_files;
+          GRANT EXECUTE ON FUNCTION pg_file_rename(text,text,text) TO pg_write_server_files;
+          GRANT EXECUTE ON FUNCTION pg_file_unlink(text) TO pg_write_server_files;
+          GRANT EXECUTE ON FUNCTION pg_logdir_ls() TO pg_read_server_files;
+          {% endif %}
+          {% if 'memctx' in _p.post_sql %}
+          REVOKE ALL ON pg_backend_memory_contexts FROM PUBLIC;
+          GRANT SELECT ON pg_backend_memory_contexts TO pg_read_all_stats;
+          REVOKE EXECUTE ON FUNCTION pg_get_backend_memory_contexts() FROM PUBLIC;
+          GRANT EXECUTE ON FUNCTION pg_get_backend_memory_contexts() TO pg_read_all_stats;
+          REVOKE ALL ON gp_backend_memory_contexts FROM PUBLIC;
+          GRANT SELECT ON gp_backend_memory_contexts TO pg_read_all_stats;
+          {% endif %}
+          {% if 'optional' in _p.post_sql %}
+          REVOKE EXECUTE ON FUNCTION gp_log_backend_memory_contexts(bigint) FROM PUBLIC;
+          REVOKE EXECUTE ON FUNCTION gp_log_backend_memory_contexts(bigint, bigint) FROM PUBLIC;
+          REVOKE EXECUTE ON FUNCTION gp_expand_lock_catalog() FROM PUBLIC;
+          REVOKE EXECUTE ON FUNCTION gp_expand_bump_version() FROM PUBLIC;
+          REVOKE EXECUTE ON FUNCTION gp_add_coordinator_standby(text, text, text) FROM PUBLIC;
+          REVOKE EXECUTE ON FUNCTION gp_add_coordinator_standby(text, text, text, integer) FROM PUBLIC;
+          REVOKE EXECUTE ON FUNCTION gp_add_master_standby(text, text, text) FROM PUBLIC;
+          REVOKE EXECUTE ON FUNCTION gp_add_master_standby(text, text, text, integer) FROM PUBLIC;
+          {% endif %}
+          EOSQL
+          {% if 'memctx' in _p.post_sql %}
+          # 문서 32: template0 포함 → 잠시 접속 허용, 종료 시 반드시 원복
+          psql -d {{ whpg_database }} -qAtc "ALTER DATABASE template0 ALLOW_CONNECTIONS true" || exit 1
+          trap 'psql -d {{ whpg_database }} -qAtc "ALTER DATABASE template0 ALLOW_CONNECTIONS false"; rm -f "$sql"' EXIT
+          {% endif %}
+          for db in $(psql -d {{ whpg_database }} -Atc "select datname from pg_database where datallowconn order by 1"); do
+            out=$(psql -d "$db" -q -f "$sql" 2>&1)
+            n=$(grep -c 'ERROR' <<<"$out")
+            pub=$(psql -d "$db" -Atc "select string_agg(proname, ',') from pg_proc
+              where proname in ('pg_file_write', 'pg_file_rename', 'pg_file_unlink', 'pg_logdir_ls')
+              and has_function_privilege('public', oid, 'execute')")
+            if [ "$n" = 0 ] && [ -z "$pub" ]; then
+              echo "OK $db"
+            else
+              echo "WARN $db: ERROR ${n}건 $(grep -m1 'ERROR' <<<"$out")${pub:+ / PUBLIC 실행 가능: $pub}"
+            fi
+          done
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      register: _whpg_upg_postsql
+      changed_when: true
+      when: inventory_hostname == coordinator_host and _db_running and _p.post_sql | length > 0
+
+    # ----- 2-8. 버전 / 상태 확인 (문서 30, 31) -----
+    - name: 업그레이드 후 DB 버전 / gpstate -f / gpstate -m
+      ansible.builtin.shell:
+        cmd: |
+          {{ _gp }}
+          echo "coordinator: $(psql -d {{ whpg_database }} -Atc 'select version()')"
+          psql -d {{ whpg_database }} -Atc "select 'segments: ' || version() from gp_dist_random('gp_id') group by 1"
+          echo "gpstate -f: $(gpstate -f 2>&1 | grep -E 'Standby status|Sync state' | sed 's/.*\]:-//; s/  */ /g' | paste -sd',')"
+          m=$(gpstate -m 2>&1)
+          echo "gpstate -m: Synchronized $(grep -c ' Synchronized' <<<"$m"), Not Synchronized $(grep -ci 'Not Synchronized' <<<"$m")"
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      register: _whpg_upg_db_after
+      changed_when: false
+      when: inventory_hostname == coordinator_host and _p.downtime and _db_running
+
+    # ----- 2-9. 복원: crontab → keepalived → PXF → pgBouncer → WEM (문서 37~40) -----
+    - name: gpadmin crontab 복원
+      ansible.builtin.command: crontab -u {{ gpadmin_user }} {{ _whpg_upg_cron_backup }}
+      when: _p.needs_stop and _whpg_upg_has_cron
+      changed_when: true
+
+    - name: keepalived 시작 (coordinator 먼저)
+      ansible.builtin.systemd:
+        name: keepalived
+        state: started
+      when: _p.needs_stop and 'keepalived' in _whpg_upg_active_svcs and inventory_hostname == coordinator_host
+
+    - name: keepalived 시작 (standby)
+      ansible.builtin.systemd:
+        name: keepalived
+        state: started
+      when: _p.needs_stop and 'keepalived' in _whpg_upg_active_svcs and inventory_hostname != coordinator_host
+
+    - name: PXF 시작 (pxf cluster start)
+      ansible.builtin.shell:
+        cmd: |
+          {{ _whpg_upg_pxf_sh }}
+          "$PXF" cluster start 2>&1
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      when: inventory_hostname == coordinator_host and _pxf_running and _pxf_cycle
+      changed_when: true
+
+    - name: pgBouncer / WEM 시작
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+      loop: "{{ whpg_upgrade_services | select('in', _whpg_upg_active_svcs) | list if _p.needs_stop else [] }}"
+
+# ---------------------------------------------------------------------------
+# 3. Summary
+# ---------------------------------------------------------------------------
+- name: 업그레이드 Summary
+  ansible.builtin.debug:
+    msg: >-
+      {%- set p = _whpg_upg_plan -%}
+      {%- set hv = ansible_play_hosts | map('extract', hostvars) | list -%}
+      {%- set out = [] -%}
+      {%- set running = p.db.DB | default('') == 'running' -%}
+      {%- set _ = out.append('모드: ' ~ ('--check (아무것도 변경하지 않음)' if ansible_check_mode else '업그레이드 실행')
+            ~ ' / 대상: ' ~ (_whpg_upg_sel | join(',')) ~ ' → ' ~ (_whpg_upg_ids | join(', '))) -%}
+      {%- if running -%}
+      {%- set _ = out.append('DB: 실행 중 / 활성 세션 ' ~ p.db.ACTIVE ~ ' / 동기화 안 된 segment ' ~ p.db.UNSYNC ~ ' / PXF ' ~ p.db.PXF) -%}
+      {%- else -%}
+      {%- set _ = out.append('DB: 정지 상태 / PXF ' ~ p.db.PXF | default('-')) -%}
+      {%- endif -%}
+      {#- 패키지: 노드 간 같은 상태는 한 줄로 묶는다 -#}
+      {%- set _ = out.append('패키지:') -%}
+      {%- for i in _whpg_upg_items if i.id not in p.skipped -%}
+      {%- set groups_ = {} -%}
+      {%- for h in hv -%}
+      {%- for k in h._whpg_upg_pkgs if k.name == i.pkg -%}
+      {%- set st = (k.installed or '(미설치)') ~ ((' → ' ~ k.upgrade) if (k.installed and k.upgrade) else ('' if not k.installed else ' (최신)')) -%}
+      {%- set _ = groups_.update({st: groups_.get(st, []) + [h.inventory_hostname]}) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- for st, hs in groups_.items() -%}
+      {%- set _ = out.append('  [' ~ i.id ~ '] ' ~ i.pkg ~ ' ' ~ st ~ ('' if hs | length == hv | length else '  (' ~ hs | join(', ') ~ ')')) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- if p.skipped -%}
+      {%- set _ = out.append('  미설치로 제외: ' ~ p.skipped | join(', ')) -%}
+      {%- endif -%}
+      {%- if not p.needed -%}
+      {%- set _ = out.append('결과: 업그레이드할 패키지 없음 (모두 repo 최신 버전)') -%}
+      {%- elif p.issues -%}
+      {%- set _ = out.append('업그레이드 불가 (해결 후 다시 실행):') -%}
+      {%- for i in p.issues -%}{%- set _ = out.append('  ✗ ' ~ i) -%}{%- endfor -%}
+      {%- endif -%}
+      {%- for w in p.warns if p.needed -%}{%- set _ = out.append('  ! ' ~ w) -%}{%- endfor -%}
+      {%- set pxf_cycle = p.db.PXF | default('') == 'running' and (p.needs_stop or p.pxf_up) -%}
+      {%- if p.needed and ansible_check_mode -%}
+      {%- set svc = {} -%}
+      {%- for h in hv -%}{%- for s in h._whpg_upg_active_svcs -%}
+      {%- set _ = svc.update({s: svc.get(s, []) + [h.inventory_hostname]}) -%}
+      {%- endfor -%}{%- endfor -%}
+      {%- set cron_hosts = hv | selectattr('_whpg_upg_has_cron') | map(attribute='inventory_hostname') | list -%}
+      {%- set dbs = (p.db.DBS | default('')).split() -%}
+      {%- set steps = ['업그레이드 전 상태 기록: ' ~ gpadmin_home ~ '/whpg_upgrade_baseline_<시각>.txt (모든 노드)'] -%}
+      {%- if p.needs_stop and cron_hosts -%}{%- set _ = steps.append('gpadmin crontab 백업 후 제거: ' ~ cron_hosts | join(', ')) -%}{%- endif -%}
+      {%- if pxf_cycle -%}{%- set _ = steps.append('pxf cluster stop') -%}{%- endif -%}
+      {%- if p.needs_stop -%}
+      {%- for s in whpg_upgrade_services if svc[s] is defined -%}{%- set _ = steps.append(s ~ ' 정지: ' ~ svc[s] | join(', ')) -%}{%- endfor -%}
+      {%- if svc.keepalived is defined -%}{%- set _ = steps.append('keepalived 정지 (standby → coordinator): ' ~ svc.keepalived | join(', ')) -%}{%- endif -%}
+      {%- if running -%}{%- set _ = steps.append('gpstop -a -M fast (서비스 중단 시작)') -%}{%- endif -%}
+      {%- if whpg_upgrade_backup_binaries | bool -%}
+      {%- set _ = steps.append('바이너리 백업: ' ~ whpg_real_install_dir ~ ' → ' ~ whpg_real_install_dir ~ '_save_' ~ p.current ~ ' (모든 노드)') -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- for i in p.up_items -%}
+      {%- set hs = [] -%}
+      {%- for h in hv if i.pkg in h._whpg_upg_todo | map(attribute='name') | list -%}
+      {%- set _ = hs.append(h.inventory_hostname) -%}
+      {%- endfor -%}
+      {%- set _ = steps.append('dnf 업그레이드 [' ~ i.id ~ ']: ' ~ i.pkg ~ ' → ' ~ p.targets[i.pkg] ~ ' (' ~ hs | join(', ') ~ ')') -%}
+      {%- endfor -%}
+      {%- if p.needs_stop -%}{%- set _ = steps.append('소유권 ' ~ gpadmin_user ~ ' 재설정, symlink 확인: ' ~ whpg_upgrade_symlinks | join(', ') ~ ' → ' ~ whpg_real_install_dir) -%}{%- endif -%}
+      {%- if p.db.PXF | default('none') != 'none' and (p.needs_stop or p.pxf_up) -%}{%- set _ = steps.append('pxf cluster register') -%}{%- endif -%}
+      {%- if p.needs_stop and running -%}{%- set _ = steps.append('gpstart -a') -%}{%- endif -%}
+      {%- if p.restart and running -%}{%- set _ = steps.append('gpstop -ra -M fast (preload extension 적용, 서비스 중단)') -%}{%- endif -%}
+      {%- if running and p.sql -%}
+      {%- set erows = p.db.EXT | default([]) | map('split', '|') | selectattr('1', 'in', p.sql) | list -%}
+      {%- set edbs = erows | map('first') | unique | list -%}
+      {%- set exts = erows | map(attribute='1') | unique | list -%}
+      {%- set _ = steps.append('ALTER EXTENSION ... UPDATE (새 버전이 있을 때만): '
+            ~ ((exts | join(', ') ~ ' / DB ' ~ edbs | length ~ '개: ' ~ edbs | join(', ')) if exts else '생성된 DB 없음')) -%}
+      {%- endif -%}
+      {%- if running and p.post_sql -%}
+      {%- set _ = steps.append('7.6.x 권한 SQL (' ~ p.post_sql | join(', ') ~ '): DB ' ~ dbs | length ~ '개'
+            ~ (' + template0 (잠시 접속 허용 후 원복)' if 'memctx' in p.post_sql else '') ~ ', PUBLIC 실행 권한 확인') -%}
+      {%- endif -%}
+      {%- if p.downtime and running -%}{%- set _ = steps.append('버전 확인 (coordinator / segments), gpstate -f, gpstate -m') -%}{%- endif -%}
+      {%- if p.needs_stop -%}
+      {%- if cron_hosts -%}{%- set _ = steps.append('gpadmin crontab 복원: ' ~ cron_hosts | join(', ')) -%}{%- endif -%}
+      {%- if svc.keepalived is defined -%}{%- set _ = steps.append('keepalived 시작 (coordinator → standby): ' ~ svc.keepalived | join(', ')) -%}{%- endif -%}
+      {%- endif -%}
+      {%- if pxf_cycle -%}{%- set _ = steps.append('pxf cluster start') -%}{%- endif -%}
+      {%- if p.needs_stop -%}
+      {%- for s in whpg_upgrade_services if svc[s] is defined -%}{%- set _ = steps.append(s ~ ' 시작: ' ~ svc[s] | join(', ')) -%}{%- endfor -%}
+      {%- endif -%}
+      {%- set _ = out.append('변경 예정 사항' ~ (' (점검 문제 해결 후)' if p.issues else '')
+            ~ ' - 서비스 중단: ' ~ ('있음' if p.downtime and running else '없음')
+            ~ ' / 실행: ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=' ~ (_whpg_upg_sel | join(','))) -%}
+      {%- for s in steps -%}{%- set _ = out.append('  ' ~ loop.index ~ '. ' ~ s) -%}{%- endfor -%}
+      {%- elif p.needed -%}
+      {%- set _ = out.append('업그레이드 결과:') -%}
+      {%- for h in hv if h._whpg_upg_after is defined and h._whpg_upg_after.stdout_lines is defined -%}
+      {%- set _ = out.append('  ' ~ h.inventory_hostname ~ ': ' ~ (h._whpg_upg_after.stdout_lines | join(', ') or '변경 없음')) -%}
+      {%- endfor -%}
+      {%- set c = hostvars[coordinator_host] -%}
+      {%- if c._whpg_upg_alter is defined and c._whpg_upg_alter.stdout_lines is defined -%}
+      {%- set _ = out.append('  ALTER EXTENSION UPDATE: ' ~ (c._whpg_upg_alter.stdout_lines | join(' / ') or '갱신할 extension 없음')) -%}
+      {%- endif -%}
+      {%- if c._whpg_upg_postsql is defined and c._whpg_upg_postsql.stdout_lines is defined -%}
+      {%- set bad = c._whpg_upg_postsql.stdout_lines | reject('match', '^OK ') | list -%}
+      {%- set _ = out.append('  7.6.x 권한 SQL: OK ' ~ (c._whpg_upg_postsql.stdout_lines | select('match', '^OK ') | list | length) ~ '개 DB'
+            ~ ((' / 확인 필요: ' ~ bad | join(' / ')) if bad else '')) -%}
+      {%- endif -%}
+      {%- if c._whpg_upg_db_after is defined and c._whpg_upg_db_after.stdout_lines is defined -%}
+      {%- for l in c._whpg_upg_db_after.stdout_lines -%}{%- set _ = out.append('  ' ~ l) -%}{%- endfor -%}
+      {%- endif -%}
+      {%- set _ = out.append('  업그레이드 전 상태 기록: ' ~ whpg_upgrade_baseline_file ~ ' (각 노드)') -%}
+      {%- if p.needs_stop and whpg_upgrade_backup_binaries | bool -%}
+      {%- set _ = out.append('  바이너리 백업: ' ~ whpg_real_install_dir ~ '_save_' ~ p.current ~ ' (확인 후 삭제)') -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- if p.needed -%}
+      {%- set notes = [] -%}
+      {%- if ansible_check_mode and p.downtime -%}
+      {%- set _ = notes.append('실행 전 (문서 1~5): 모니터링 / 외부 스케줄러 / 애플리케이션 중지, gpbackup --leaf-partition-data, 스냅샷 등') -%}
+      {%- endif -%}
+      {%- if p.needs_stop -%}
+      {%- set _ = notes.append('inventory/whpg_cluster.yml 의 whpg_version 을 ' ~ p.tgt_n ~ ' 로 변경') -%}
+      {%- set _ = notes.append('업그레이드 후 PXF smoke test 등 애플리케이션 확인, 트래픽 / 스케줄러 / 모니터링 재개 (문서 38, 42~45)') -%}
+      {%- endif -%}
+      {%- if p.needs_stop or 'flowserver' in p.up_groups -%}
+      {%- set _ = notes.append('FlowServer 사용 시: 각 호스트에서 nohup ./flowserver -c /path/flow_server.json & 후 잡 재제출 (문서 41)') -%}
+      {%- endif -%}
+      {%- if p.needs_stop and p.cur_n is version('7.6.0', '<') and p.tgt_n is version('7.6.0', '>=') -%}
+      {%- set _ = notes.append('[7.6.0] pg_dump 출력의 \\restrict 마커, COPY FROM STDIN 의 \\. 종료, resource group CPUSET 순서(coordinator;segment) 확인') -%}
+      {%- endif -%}
+      {%- if p.needs_stop and p.cur_n is version('7.6.1', '<') and p.tgt_n is version('7.6.1', '>=') -%}
+      {%- set _ = notes.append('[7.6.1] gpfdists:// s3:// 는 TLS 1.2 이상 필요') -%}
+      {%- endif -%}
+      {%- if p.needs_stop and p.tgt_n is version('7.6.0', '>=') and not whpg_upgrade_post_sql | bool -%}
+      {%- set _ = notes.append('whpg_upgrade_post_sql=false → 문서 32~34 권한 SQL 을 모든 DB 에 직접 적용') -%}
+      {%- endif -%}
+      {%- if notes -%}
+      {%- set _ = out.append('수동 작업 (문서: ' ~ whpg_upgrade_doc_url ~ '):') -%}
+      {%- for n in notes -%}{%- set _ = out.append('  - ' ~ n) -%}{%- endfor -%}
+      {%- endif -%}
+      {%- endif -%}
+      {{ out }}
+  run_once: true
