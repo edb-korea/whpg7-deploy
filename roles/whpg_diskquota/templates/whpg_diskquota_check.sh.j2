@@ -1,0 +1,37 @@
+#!/bin/bash
+# Managed by Ansible (roles/whpg_diskquota) - diskquota hard limit 자동 전환
+#   사용량(show_cluster_quota_view.total_size_in_bytes) >= 기준 용량 × {{ whpg_diskquota_hard_percent }}% → diskquota.hard_limit on
+#   사용량 < 기준 용량 × {{ whpg_diskquota_soft_percent }}% 이고 on 이면 → off
+#   active coordinator 에서만 동작 (standby 는 아무것도 안 함). gpadmin crontab 에서 실행
+source {{ whpg_install_dir }}/greenplum_path.sh
+export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+export PGPORT={{ whpg_coordinator_port }}
+
+CAP_BYTES={{ _dq_capacity_bytes }}
+SOFT_PCT={{ whpg_diskquota_soft_percent }}
+HARD_PCT={{ whpg_diskquota_hard_percent }}
+DB={{ whpg_database }}
+LOG={{ whpg_diskquota_check_log }}
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; logger -t whpg_diskquota "$*"; }
+
+[ "$(psql -d postgres -Atc 'select pg_is_in_recovery()' 2>/dev/null)" = "f" ] || exit 0
+
+used=$(psql -d "$DB" -Atc "select total_size_in_bytes from diskquota.show_cluster_quota_view" 2>/dev/null)
+[[ "$used" =~ ^[0-9]+$ ]] || { log "WARN show_cluster_quota_view 조회 실패"; exit 1; }
+hard=$(psql -d postgres -Atc "show diskquota.hard_limit" 2>/dev/null)
+pct=$(( used * 100 / CAP_BYTES ))
+
+if [ $(( used * 100 )) -ge $(( CAP_BYTES * HARD_PCT )) ] && [ "$hard" != "on" ]; then
+  if gpconfig -c diskquota.hard_limit -v on >/dev/null 2>&1 && gpstop -u -a >/dev/null 2>&1; then
+    log "hard limit ON: cluster usage ${pct}% (${used} bytes) >= ${HARD_PCT}% of ${CAP_BYTES} bytes"
+  else
+    log "ERROR hard limit ON 실패 (usage ${pct}%)"
+  fi
+elif [ $(( used * 100 )) -lt $(( CAP_BYTES * SOFT_PCT )) ] && [ "$hard" = "on" ]; then
+  if gpconfig -c diskquota.hard_limit -v off >/dev/null 2>&1 && gpstop -u -a >/dev/null 2>&1; then
+    log "hard limit OFF: cluster usage ${pct}% < ${SOFT_PCT}%"
+  else
+    log "ERROR hard limit OFF 실패 (usage ${pct}%)"
+  fi
+fi

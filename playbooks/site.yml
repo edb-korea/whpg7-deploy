@@ -1,7 +1,7 @@
 ---
 # ======================================================
 # WarehousePG 전체 배포 메인 플레이북 (site.yml)
-# 실행 순서: OS 구성 → WHPG 설치 → 초기화 → Extension → pgBouncer → HA → WEM
+# 실행 순서: OS 구성 → WHPG 설치 → 초기화 → Extension → pgBouncer → HA → WEM → diskquota
 # ======================================================
 
 # Phase 1: OS 사전 구성 (모든 클러스터 노드)
@@ -78,3 +78,15 @@
   tags:
     - phase7
     - wem
+
+# Phase 8: cluster 차원 diskquota (post 작업, soft 90% / hard 92%)
+- name: "Phase 8: diskquota 설정"
+  hosts: whpg_cluster
+  become: true
+  any_errors_fatal: true
+  roles:
+    - role: whpg_diskquota
+      when: whpg_diskquota_enabled | default(true) | bool
+  tags:
+    - phase8
+    - diskquota

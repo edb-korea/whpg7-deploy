@@ -50,7 +50,7 @@ rpm_disable_gpg_check: true         # GPG 검사 비활성화 (내부 레포 시
 # ------------------------------------------
 gpadmin_user: gpadmin
 gpadmin_group: gpadmin
-gpadmin_uid: 5000
+gpadmin_uid: 5000                    # 계정 / 그룹이 없을 때만 사용 (이미 있으면 기존 uid / gid 유지)
 gpadmin_gid: 5000
 gpadmin_home: "/home/{{ gpadmin_user }}"
 gpadmin_password: "{{ vault_gpadmin_password | default('changeme') }}"  # vault로 암호화 권장
@@ -114,7 +114,7 @@ xfs_mount_options: "rw,noatime,allocsize=16m,inode64,logbufs=8,logbsize=256k"
 #   볼륨 1개: 모두 /data            예) 2 / 4 / 8 → /data 에 primary 2 / 4 / 8 + mirror 2 / 4 / 8
 #   볼륨 2개: /data1, /data2 번갈아  예) 2: 각 1개, 4: 각 2개, 8: 각 4개  (primary / mirror 각각)
 #   포트: primary whpg_port_base + k, mirror whpg_mirror_port_base + k (k = 0 ~ segments_per_host-1)
-whpg_segments_per_host: 2
+whpg_segments_per_host: 4
 whpg_data_root: "{{ whpg_data_mounts[0].path }}"   # Coordinator/Standby 데이터 위치
 whpg_seg_prefix: gpseg
 coordinator_data_dir: "{{ whpg_data_root }}/coordinator/{{ whpg_seg_prefix }}-1"
@@ -172,7 +172,7 @@ whpg_pg_hba_rules:
 # 로컬 YUM 레포지토리 설정
 # ------------------------------------------
 whpg_local_repo_enabled: true
-whpg_local_repo_baseurl: "http://repo.internal/whpg"   # 환경에 맞게 수정
+whpg_local_repo_baseurl: "http://10.0.8.192/whpg-repo/"   # 환경에 맞게 수정
 whpg_local_repo_gpgcheck: false
 
 # ------------------------------------------
@@ -226,6 +226,17 @@ install_whpg_cron: true             # 작업 스케줄러 (pg_cron, shared_prelo
 # diskquota 는 버전이 붙은 라이브러리(diskquota-<major.minor>.so)를 preload 해야 함
 # diskquota RPM 업그레이드 시 이 값도 함께 변경 (예: 2.4.0 → "2.4")
 diskquota_lib_version: "2.4"
+
+# cluster 차원 diskquota (playbooks/08_diskquota.yml, WHPG 구성 후 post 작업, whpg-diskquota 2.4)
+#   soft : cluster quota = 기준 용량 × soft% (넘으면 모든 감시 DB 에서 새 쓰기 거부)
+#   hard : 사용량 >= 기준 용량 × hard% 이면 diskquota.hard_limit on (실행 중인 쿼리도 중단)
+#   기준 용량: 0 이면 segment 데이터 볼륨 합 (mirror 있으면 ÷ 2), 또는 GB 로 지정
+#   기타 변수: roles/whpg_diskquota/defaults/main.yml
+whpg_diskquota_enabled: true
+whpg_diskquota_soft_percent: 90
+whpg_diskquota_hard_percent: 92
+whpg_diskquota_hard_mode: auto       # auto: 사용량에 따라 cron 이 on / off, on: 항상, off: soft 만
+whpg_diskquota_capacity_gb: 0
 
 # PXF Hadoop 연동
 pxf_hadoop_enabled: true
@@ -292,11 +303,11 @@ whpg_extension_catalog:
 # 비밀번호는 inventory/vault.yml (vault_wem_admin_password, vault_clickhouse_password, vault_wem_whpg_password)
 # ------------------------------------------
 wem_enabled: true
-# wem_version: "1.4.0"              # 설치할 whpg-enterprise-manager 버전
+wem_version: "1.4.0"              # 설치할 whpg-enterprise-manager 버전
 # wem_port: 8080                    # WEM 웹 포트 (Host Agent 포트는 +1)
 # wem_use_vip: true                 # 기본: coordinator_ha_enabled 값. true 면 WEM 이 coordinator_vip 로 WHPG 접속
 # wem_state_install: false          # true: WEM host 에 별도 상태 DB(PostgreSQL 5433) 설치
-# clickhouse_data_dir: ""           # ClickHouse 데이터를 다른 디스크에 둘 때 (예: /data1/clickhouse)
+clickhouse_data_dir: "/data/clickhouse"           # ClickHouse 데이터를 다른 디스크에 둘 때 (예: /data1/clickhouse)
 # wem_pool_max_conns: "40"          # wem.conf 의 WEM_POOL_MAX_CONNS (비우면 넣지 않음)
 
 # ------------------------------------------
@@ -316,7 +327,7 @@ pgbouncer_target_port: "{{ whpg_coordinator_port }}"
 # ------------------------------------------
 # Coordinator HA 설정 (keepalived/corosync)
 # ------------------------------------------
-coordinator_ha_enabled: true
+coordinator_ha_enabled: false
 coordinator_vip: "192.168.10.100"        # 환경에 맞게 수정
 coordinator_vip_interface: "eth0"
 coordinator_ha_method: "keepalived"      # keepalived or pacemaker

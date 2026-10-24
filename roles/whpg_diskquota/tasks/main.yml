@@ -1,0 +1,284 @@
+---
+# ======================================================
+# Role: whpg_diskquota (WHPG 구성 후 post 작업, hosts: whpg_cluster)
+#   문서(Installing / Using / Reference) 절차:
+#     1. 모든 노드에 edb-whpg7-diskquota, 라이브러리(diskquota-2.4) 확인
+#     2. createdb diskquota (launcher DB)
+#     3. shared_preload_libraries 에 diskquota-2.4 추가 (기존 라이브러리 유지), diskquota.max_monitored_databases
+#        → 바뀐 경우에만 gpstop -ar
+#     4. 모든 사용자 DB 에 CREATE EXTENSION diskquota → init_table_size_table()
+#     5. set_cluster_quota(기준 용량 × soft%)
+#     6. hard limit: auto(cron 으로 사용량 hard% 이상이면 on / soft% 미만이면 off) | on | off
+#   --check: 점검 + 변경 예정 사항 Summary 만 (변경 없음)
+#   클러스터 증설 / 볼륨 변경 / 새 DB 생성 후 다시 실행하면 quota, 기준 용량, extension 을 다시 맞춘다
+# ======================================================
+
+- name: diskquota 변수 확인
+  ansible.builtin.assert:
+    that:
+      - whpg_diskquota_soft_percent | int > 0
+      - whpg_diskquota_soft_percent | int < whpg_diskquota_hard_percent | int
+      - whpg_diskquota_hard_percent | int <= 100
+      - whpg_diskquota_hard_mode in ['auto', 'on', 'off']
+    fail_msg: >-
+      0 < whpg_diskquota_soft_percent({{ whpg_diskquota_soft_percent }}) < whpg_diskquota_hard_percent({{ whpg_diskquota_hard_percent }}) <= 100,
+      whpg_diskquota_hard_mode 는 auto / on / off 여야 합니다.
+    quiet: true
+  run_once: true
+
+# ---------- 1. 패키지 / 라이브러리 (모든 노드) ----------
+- name: diskquota 패키지 설치 (edb-whpg7-diskquota)
+  ansible.builtin.include_role:
+    name: rpm_install
+  vars:
+    rpm_pkg_name: "{{ whpg_ext_pkg_prefix }}-diskquota"
+    rpm_install_state: present
+
+- name: diskquota 라이브러리 확인 ({{ whpg_diskquota_library }}.so)
+  ansible.builtin.stat:
+    path: "{{ whpg_install_dir }}/lib/postgresql/{{ whpg_diskquota_library }}.so"
+  register: _dq_lib
+
+- name: diskquota 라이브러리 버전 확인
+  ansible.builtin.assert:
+    that: _dq_lib.stat.exists or ansible_check_mode
+    fail_msg: >-
+      {{ whpg_install_dir }}/lib/postgresql/{{ whpg_diskquota_library }}.so 가 없습니다.
+      설치된 edb-whpg7-diskquota 버전과 inventory 의 diskquota_lib_version 을 맞추세요 (cluster quota 는 2.4 이상).
+    quiet: true
+
+# ---------- 2. 기준 용량용 데이터 볼륨 크기 (segment 호스트) ----------
+- name: segment 데이터 볼륨 크기 조회
+  ansible.builtin.shell:
+    cmd: |
+      for p in {{ whpg_data_mounts | map(attribute='path') | join(' ') }}; do
+        findmnt -n -o TARGET --target "$p"
+      done | sort -u | while read -r mp; do
+        echo "$mp $(df -k --output=size "$mp" | tail -n1 | tr -d ' ')"
+      done
+    executable: /bin/bash
+  register: _dq_vol
+  changed_when: false
+  check_mode: false
+  when: inventory_hostname in segment_hosts
+
+# ---------- 3. 현재 상태 (coordinator) ----------
+- name: diskquota 현재 상태 조회 (Coordinator)
+  ansible.builtin.shell:
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      q() { psql -d "${2:-postgres}" -Atc "$1" 2>/dev/null; }
+      echo "UP=$(q 'select 1')"
+      echo "PRELOAD_FILE=$(gpconfig -s shared_preload_libraries --file 2>/dev/null | sed -n "s/^Coordinator value: *//p" | tr -d "'" | tr -d ' ')"
+      echo "PRELOAD_RUN=$(q 'show shared_preload_libraries' | tr -d ' ')"
+      echo "DQDB=$(q "select count(*) from pg_database where datname = '{{ whpg_diskquota_database }}'")"
+      echo "MIRRORS=$(q "select count(*) from gp_segment_configuration where role = 'm' and content >= 0")"
+      dbs=$(q "select string_agg(datname, ' ' order by datname) from pg_database
+               where datallowconn and datname not in ('{{ whpg_diskquota_exclude_databases | join("', '") }}')")
+      echo "DBS=$dbs"
+      for db in $dbs; do echo "EXT|$db|$(q "select extversion from pg_extension where extname = 'diskquota'" "$db")"; done
+      if q 'show diskquota.hard_limit' >/dev/null; then
+        echo "HARD=$(q 'show diskquota.hard_limit')"
+        echo "MAXDB=$(q 'show diskquota.max_monitored_databases')"
+        echo "CLUSTER=$(q 'select quota_in_mb || chr(124) || total_size_in_bytes from diskquota.show_cluster_quota_view' {{ whpg_database }})"
+      fi
+    executable: /bin/bash
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _dq_state_raw
+  changed_when: false
+  check_mode: false
+  when: inventory_hostname == coordinator_host
+
+- name: diskquota 계획 계산
+  ansible.builtin.set_fact:
+    _dq: >-
+      {%- set d = {'EXT': {}} -%}
+      {%- for l in hostvars[coordinator_host]._dq_state_raw.stdout_lines -%}
+      {%-   if l.startswith('EXT|') -%}{%- set f = l.split('|') -%}{%- set _ = d.EXT.update({f[1]: f[2]}) -%}
+      {%-   elif '=' in l -%}{%- set _ = d.update({l.split('=', 1)[0]: l.split('=', 1)[1]}) -%}{%- endif -%}
+      {%- endfor -%}
+      {#- 기준 용량 (KB) -#}
+      {%- set vols = [] -%}
+      {%- for h in segment_hosts if hostvars[h]._dq_vol.stdout_lines is defined -%}
+      {%-   for l in hostvars[h]._dq_vol.stdout_lines -%}{%- set _ = vols.append(l.split()[1] | int) -%}{%- endfor -%}
+      {%- endfor -%}
+      {%- set mirrors = d.MIRRORS | default('0') | int > 0 -%}
+      {%- set auto_kb = (vols | sum) // (2 if mirrors else 1) -%}
+      {%- set cap_kb = (whpg_diskquota_capacity_gb | int * 1024 * 1024) if whpg_diskquota_capacity_gb | int > 0 else auto_kb -%}
+      {%- set preload = d.PRELOAD_FILE | default('') | regex_replace('^$', '') -%}
+      {%- set libs = preload.split(',') | reject('equalto', '') | list -%}
+      {%- set new_libs = libs | reject('match', '^diskquota-') | list + [whpg_diskquota_library] -%}
+      {%- set dbs = (d.DBS | default('')).split() -%}
+      {%- set cur = (d.CLUSTER | default('')).split('|') -%}
+      {%- set _ = d.update({
+            'dbs': dbs,
+            'need_ext': dbs | reject('in', d.EXT | dict2items | selectattr('value') | map(attribute='key') | list) | list,
+            'vol_kb': vols | sum, 'mirrors': mirrors, 'cap_kb': cap_kb,
+            'cap_bytes': cap_kb * 1024,
+            'soft_mb': cap_kb * (whpg_diskquota_soft_percent | int) // 100 // 1024,
+            'hard_bytes': cap_kb * 1024 * (whpg_diskquota_hard_percent | int) // 100,
+            'libs': libs, 'new_preload': new_libs | join(','),
+            'preload_change': whpg_diskquota_library not in libs or (libs | select('match', '^diskquota-') | list | length) != 1,
+            'loaded': whpg_diskquota_library in (d.PRELOAD_RUN | default('')).split(','),
+            'maxdb_change': (d.MAXDB | default('')) != (whpg_diskquota_max_monitored_databases | string),
+            'cur_quota_mb': cur[0] if cur | length == 2 else '',
+            'cur_used': cur[1] if cur | length == 2 else ''}) -%}
+      {%- set _ = d.update({'restart': d.preload_change or (not d.loaded) or d.maxdb_change}) -%}
+      {{ d }}
+  run_once: true
+
+- name: diskquota 사전 조건 확인
+  ansible.builtin.assert:
+    that:
+      - _dq.UP | default('') == '1'
+      - _dq.cap_kb | int > 0
+      - _dq.dbs | length <= whpg_diskquota_max_monitored_databases | int
+    fail_msg: >-
+      WarehousePG 가 실행 중이 아니거나({{ coordinator_host }} 에서 psql 접속 불가, WHPG 구성 후 실행하는 post 작업입니다),
+      기준 용량을 구하지 못했거나(segment 데이터 볼륨 / whpg_diskquota_capacity_gb 확인),
+      감시할 DB 수({{ _dq.dbs | length }})가 whpg_diskquota_max_monitored_databases({{ whpg_diskquota_max_monitored_databases }})보다 많습니다.
+    quiet: true
+  run_once: true
+
+# ---------- 4. 설정 (coordinator, --check 에서는 건너뜀) ----------
+- name: diskquota 설정
+  when: inventory_hostname == coordinator_host and not ansible_check_mode
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  vars:
+    _gp: "source {{ whpg_install_dir }}/greenplum_path.sh"
+  block:
+    - name: launcher DB 생성 (createdb {{ whpg_diskquota_database }})
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && createdb {{ whpg_diskquota_database }}"
+        executable: /bin/bash
+      when: _dq.DQDB | default('0') == '0'
+
+    - name: shared_preload_libraries 에 {{ whpg_diskquota_library }} 추가 ({{ _dq.new_preload }})
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpconfig -c shared_preload_libraries -v '{{ _dq.new_preload }}'"
+        executable: /bin/bash
+      when: _dq.preload_change
+
+    # 라이브러리가 로드되기 전에는 diskquota.* GUC 를 검증할 수 없어 --skipvalidation
+    - name: diskquota.max_monitored_databases = {{ whpg_diskquota_max_monitored_databases }}
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpconfig -c diskquota.max_monitored_databases -v {{ whpg_diskquota_max_monitored_databases }} --skipvalidation"
+        executable: /bin/bash
+      when: _dq.maxdb_change
+
+    - name: WHPG 재시작 (gpstop -ar, preload / max_monitored_databases 적용)
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpstop -ar -M fast 2>&1 | tail -n 3"
+        executable: /bin/bash
+      when: _dq.restart
+
+    - name: CREATE EXTENSION diskquota → init_table_size_table() ({{ _dq.need_ext | join(', ') or '없음' }})
+      ansible.builtin.shell:
+        cmd: |
+          {{ _gp }}
+          psql -d {{ item | quote }} -v ON_ERROR_STOP=1 -qc "CREATE EXTENSION IF NOT EXISTS diskquota" &&
+          psql -d {{ item | quote }} -v ON_ERROR_STOP=1 -Atc "SELECT diskquota.init_table_size_table()"
+        executable: /bin/bash
+      loop: "{{ _dq.need_ext }}"
+
+    # 자기 트랜잭션으로 커밋되므로 단독 실행 (psql -c 는 autocommit)
+    - name: cluster quota = {{ _dq.soft_mb }} MB ({{ whpg_diskquota_soft_percent }}% of {{ (_dq.cap_kb | int / 1024 / 1024) | round(1) }} GB)
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && psql -d {{ whpg_database }} -v ON_ERROR_STOP=1 -Atc \"SELECT diskquota.set_cluster_quota('{{ _dq.soft_mb }}MB')\""
+        executable: /bin/bash
+      when: _dq.cur_quota_mb | string != _dq.soft_mb | string
+
+    - name: diskquota.hard_limit = {{ whpg_diskquota_hard_mode }} (on / off 고정)
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpconfig -c diskquota.hard_limit -v {{ whpg_diskquota_hard_mode }} && gpstop -u -a"
+        executable: /bin/bash
+      when:
+        - whpg_diskquota_hard_mode in ['on', 'off']
+        - _dq.HARD | default('off') != whpg_diskquota_hard_mode or _dq.restart
+
+# ---------- 5. hard limit 자동 전환 (auto: coordinator / standby 에 점검 스크립트 + cron) ----------
+- name: hard limit 자동 전환 설정
+  when: inventory_hostname in [coordinator_host] + groups['standby_coordinator'] | default([])
+  vars:
+    _dq_capacity_bytes: "{{ _dq.cap_bytes }}"
+  block:
+    - name: 점검 스크립트 배포 ({{ whpg_diskquota_check_script }})
+      ansible.builtin.template:
+        src: whpg_diskquota_check.sh.j2
+        dest: "{{ whpg_diskquota_check_script }}"
+        owner: root
+        group: root
+        mode: '0755'
+      when: whpg_diskquota_hard_mode == 'auto'
+
+    - name: gpadmin cron ({{ whpg_diskquota_check_interval_min }}분마다, auto 일 때만)
+      ansible.builtin.cron:
+        name: whpg_diskquota_check
+        user: "{{ gpadmin_user }}"
+        minute: "*/{{ whpg_diskquota_check_interval_min }}"
+        job: "{{ whpg_diskquota_check_script }}"
+        state: "{{ 'present' if whpg_diskquota_hard_mode == 'auto' else 'absent' }}"
+
+    - name: 점검 1회 실행 (현재 사용량 반영)
+      ansible.builtin.command: "{{ whpg_diskquota_check_script }}"
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      when: whpg_diskquota_hard_mode == 'auto' and inventory_hostname == coordinator_host
+      changed_when: false
+
+# ---------- 6. 결과 / Summary ----------
+- name: diskquota 결과 조회
+  ansible.builtin.shell:
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      psql -d {{ whpg_database }} -Atc "select name || ': ' || status from diskquota.status()" 2>/dev/null | paste -sd',' | sed 's/^/status: /'
+      psql -d {{ whpg_database }} -Atc "select 'cluster quota ' || quota_in_mb || ' MB, used ' || pg_size_pretty(total_size_in_bytes::bigint) from diskquota.show_cluster_quota_view" 2>/dev/null
+      psql -d {{ whpg_diskquota_database }} -Atc "select 'monitored: ' || string_agg(d.datname, ', ' order by d.datname) from diskquota_namespace.database_list q, pg_database d where q.dbid = d.oid" 2>/dev/null
+    executable: /bin/bash
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _dq_after
+  changed_when: false
+  check_mode: false
+  when: inventory_hostname == coordinator_host and not ansible_check_mode
+
+- name: diskquota Summary
+  ansible.builtin.debug:
+    msg: >-
+      {%- set p = _dq -%}
+      {%- set gb = (p.cap_kb | int / 1024 / 1024) | round(1) -%}
+      {%- set out = ['모드: ' ~ ('--check (아무것도 변경하지 않음)' if ansible_check_mode else '설정 실행')] -%}
+      {%- set _ = out.append('기준 용량: ' ~ gb ~ ' GB ('
+            ~ ('whpg_diskquota_capacity_gb 지정' if whpg_diskquota_capacity_gb | int > 0 else
+               'segment 데이터 볼륨 합 ' ~ ((p.vol_kb | int / 1024 / 1024) | round(1)) ~ ' GB' ~ (' ÷ 2 (mirror)' if p.mirrors else '')) ~ ')') -%}
+      {%- set _ = out.append('soft ' ~ whpg_diskquota_soft_percent ~ '%: cluster quota ' ~ p.soft_mb ~ ' MB'
+            ~ (' (현재 ' ~ p.cur_quota_mb ~ ' MB)' if p.cur_quota_mb else ' (현재 없음)')) -%}
+      {%- set _ = out.append('hard ' ~ whpg_diskquota_hard_percent ~ '%: ' ~ ((p.hard_bytes | int / 1024 / 1024 / 1024) | round(1)) ~ ' GB, hard_limit '
+            ~ {'auto': '자동 전환 (cron ' ~ whpg_diskquota_check_interval_min ~ '분, ' ~ whpg_diskquota_check_script ~ ')', 'on': '항상 on', 'off': '항상 off'}[whpg_diskquota_hard_mode]
+            ~ (' / 현재 ' ~ p.HARD if p.HARD is defined else '')) -%}
+      {%- if p.cur_used -%}
+      {%- set _ = out.append('현재 사용량: ' ~ ((p.cur_used | int / 1024 / 1024 / 1024) | round(2)) ~ ' GB (' ~ ((p.cur_used | int * 100 / p.cap_bytes | int) | round(1)) ~ '%)') -%}
+      {%- endif -%}
+      {%- if ansible_check_mode -%}
+      {%- set steps = [] -%}
+      {%- if p.DQDB | default('0') == '0' -%}{%- set _ = steps.append('createdb ' ~ whpg_diskquota_database) -%}{%- endif -%}
+      {%- if p.preload_change -%}{%- set _ = steps.append('shared_preload_libraries: ' ~ (p.libs | join(',') or '(없음)') ~ ' → ' ~ p.new_preload) -%}{%- endif -%}
+      {%- if p.maxdb_change -%}{%- set _ = steps.append('diskquota.max_monitored_databases = ' ~ whpg_diskquota_max_monitored_databases) -%}{%- endif -%}
+      {%- if p.restart -%}{%- set _ = steps.append('gpstop -ar (재시작, 서비스 중단)') -%}{%- endif -%}
+      {%- if p.need_ext -%}{%- set _ = steps.append('CREATE EXTENSION diskquota + init_table_size_table(): ' ~ p.need_ext | join(', ')) -%}{%- endif -%}
+      {%- if p.cur_quota_mb | string != p.soft_mb | string -%}{%- set _ = steps.append('set_cluster_quota(' ~ p.soft_mb ~ 'MB)') -%}{%- endif -%}
+      {%- if whpg_diskquota_hard_mode == 'auto' -%}{%- set _ = steps.append('점검 스크립트 + gpadmin cron (coordinator / standby), 1회 실행') -%}
+      {%- else -%}{%- set _ = steps.append('diskquota.hard_limit = ' ~ whpg_diskquota_hard_mode ~ ' (gpstop -u), cron 제거') -%}{%- endif -%}
+      {%- set _ = out.append('변경 예정 사항:') -%}
+      {%- for s in steps -%}{%- set _ = out.append('  ' ~ loop.index ~ '. ' ~ s) -%}{%- endfor -%}
+      {%- else -%}
+      {%- for l in hostvars[coordinator_host]._dq_after.stdout_lines | default([]) -%}{%- set _ = out.append(l) -%}{%- endfor -%}
+      {%- endif -%}
+      {%- set _ = out.append('참고: 새 DB 생성 / 클러스터 증설 / 볼륨 변경 후 이 playbook 을 다시 실행하세요 (extension, 기준 용량, quota 갱신)') -%}
+      {{ out }}
+  run_once: true

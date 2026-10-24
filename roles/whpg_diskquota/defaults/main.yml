@@ -1,0 +1,39 @@
+---
+# ======================================================
+# whpg_diskquota role 기본값 (playbooks/08_diskquota.yml, WHPG 구성 후 post 작업)
+# 문서: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/extensions/additional/diskquota/
+#
+# cluster 차원 diskquota (whpg-diskquota 2.4, WarehousePG 7)
+#   soft : cluster quota = 기준 용량 × whpg_diskquota_soft_percent
+#          (diskquota.set_cluster_quota, 넘으면 모든 감시 DB 에서 새 쓰기 거부 = soft limit enforcement)
+#   hard : 사용량(show_cluster_quota_view)이 기준 용량 × whpg_diskquota_hard_percent 이상이면
+#          diskquota.hard_limit = on (실행 중인 쿼리도 중단 = hard limit enforcement), soft 미만으로 내려가면 off
+# ======================================================
+
+whpg_diskquota_soft_percent: 90
+whpg_diskquota_hard_percent: 92
+
+# hard limit enforcement 방식
+#   auto : 주기 점검(cron, coordinator / standby)이 사용량에 따라 diskquota.hard_limit 를 on / off
+#   on   : 항상 on (cluster quota = soft% 를 넘으면 실행 중인 쿼리도 중단)
+#   off  : 항상 off (soft limit 만)
+whpg_diskquota_hard_mode: auto
+whpg_diskquota_check_interval_min: 5        # auto 점검 주기 (분)
+
+# 기준 용량 (GB). 0 이면 자동: segment 호스트 데이터 볼륨(whpg_data_mounts) 크기 합, mirror 가 있으면 ÷ 2
+#   diskquota 사용량은 primary 의 테이블 합계(mirror 제외)이므로 primary 가 쓸 수 있는 용량을 기준으로 한다
+whpg_diskquota_capacity_gb: 0
+
+# launcher DB (문서: createdb diskquota)
+whpg_diskquota_database: diskquota
+# CREATE EXTENSION diskquota 에서 제외할 DB (그 외 모든 사용자 DB 에 생성해야 cluster quota 가 정확함)
+whpg_diskquota_exclude_databases: [template0, template1, diskquota]
+
+# diskquota GUC (재시작 필요). 감시 DB 수가 이 값을 넘으면 중단
+whpg_diskquota_max_monitored_databases: 50
+# preload 할 라이브러리 (diskquota-<major.minor>, inventory 의 diskquota_lib_version 과 같게)
+whpg_diskquota_library: "diskquota-{{ diskquota_lib_version | default('2.4') }}"
+
+# auto 점검 스크립트 / 로그
+whpg_diskquota_check_script: /usr/local/bin/whpg_diskquota_check.sh
+whpg_diskquota_check_log: "{{ gpadmin_home }}/gpAdminLogs/whpg_diskquota_check.log"
