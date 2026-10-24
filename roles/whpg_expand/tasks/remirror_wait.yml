@@ -14,3 +14,4 @@
   retries: "{{ (expand_remirror_sync_timeout | int / 30) | int }}"
   delay: 30
   changed_when: false
+  check_mode: false

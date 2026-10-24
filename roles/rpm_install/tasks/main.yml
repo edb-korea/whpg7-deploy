@@ -10,7 +10,7 @@
 #       name: rpm_install
 #     vars:
 #       rpm_pkg_name: "edb-whpg7-pgaudit"   # RPM 패키지명 (정확히 일치)
-#       rpm_pkg_version: "7.5.0"            # 선택: 특정 버전만 (생략 시 최신)
+#       rpm_pkg_version: "7.5.0"            # 선택: 특정 버전만 (생략 시 최신). "7.5.0_WHPG-1.el9" 처럼 버전-릴리스 전체도 가능
 #       rpm_install_state: latest           # 선택: present(기본) / latest
 # ======================================================
 

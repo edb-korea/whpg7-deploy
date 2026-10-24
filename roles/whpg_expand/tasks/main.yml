@@ -142,6 +142,7 @@
   environment: "{{ whpg_env }}"
   register: _expand_after
   changed_when: false
+  check_mode: false
 
 # ---------- 5. gpexpand 스키마 정리 ----------
 # gpexpand -c 는 "status_detail 을 파일로 덤프할지" 를 묻는다 → y (coordinator 데이터 디렉토리에 저장)
@@ -174,6 +175,7 @@
   environment: "{{ whpg_env }}"
   register: _layout
   changed_when: false
+  check_mode: false
 
 - name: 증설 결과
   ansible.builtin.debug:
