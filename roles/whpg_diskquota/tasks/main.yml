@@ -75,6 +75,8 @@
       source {{ whpg_install_dir }}/greenplum_path.sh
       q() { psql -d "${2:-postgres}" -Atc "$1" 2>/dev/null; }
       echo "UP=$(q 'select 1')"
+      # diskquota launcher (서버 시작 시 diskquota DB 가 있어야 뜬다)
+      echo "LAUNCHER=$(pgrep -fc '[d]iskquota')"
       echo "PRELOAD_FILE=$(gpconfig -s shared_preload_libraries --file 2>/dev/null | sed -n "s/^Coordinator value: *//p" | tr -d "'" | tr -d ' ')"
       echo "PRELOAD_RUN=$(q 'show shared_preload_libraries' | tr -d ' ')"
       echo "DQDB=$(q "select count(*) from pg_database where datname = '{{ whpg_diskquota_database }}'")"
@@ -131,7 +133,9 @@
             'maxdb_change': (d.MAXDB | default('')) != (whpg_diskquota_max_monitored_databases | string),
             'cur_quota_mb': cur[0] if cur | length == 2 else '',
             'cur_used': cur[1] if cur | length == 2 else ''}) -%}
-      {%- set _ = d.update({'restart': d.preload_change or (not d.loaded) or d.maxdb_change}) -%}
+      {#- launcher 는 서버 시작 시 diskquota DB 가 있어야 뜨므로, DB 를 새로 만들거나 launcher 가 없으면 재시작 -#}
+      {%- set _ = d.update({'restart': d.preload_change or (not d.loaded) or d.maxdb_change
+            or d.DQDB | default('0') == '0' or d.LAUNCHER | default('0') | int == 0}) -%}
       {{ d }}
   run_once: true
 
@@ -176,7 +180,7 @@
         executable: /bin/bash
       when: _dq.maxdb_change
 
-    - name: WHPG 재시작 (gpstop -ar, preload / max_monitored_databases 적용)
+    - name: WHPG 재시작 (gpstop -ar, preload / max_monitored_databases / diskquota launcher)
       ansible.builtin.shell:
         cmd: "{{ _gp }} && gpstop -ar -M fast 2>&1 | tail -n 3"
         executable: /bin/bash
