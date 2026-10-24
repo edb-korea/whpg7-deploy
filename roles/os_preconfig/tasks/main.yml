@@ -309,6 +309,23 @@
     mode: '0644'
   notify: reload_udev
 
+# ---------- 12-0. 시스템 python3 = OS 기본 (RHEL 9: 3.9) ----------
+# tuned 등 RHEL 도구는 #!/usr/bin/python3 로 OS 기본 Python 모듈을 쓴다 (python3 를 3.11 로 바꾸면 tuned-adm 실패).
+# WHPG 7 은 greenplum_path.sh 가 PATH 앞에 $GPHOME/ext/python3.11/bin(→ /usr/bin/python3.11)을 넣어
+# 시스템 python3 와 관계없이 python3.11 을 쓰므로, 시스템 python3 는 OS 기본으로 둔다
+- name: 시스템 python3 확인 (기대 {{ os_system_python3 }})
+  ansible.builtin.command: readlink -f /usr/bin/python3
+  register: _sys_python3
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: 시스템 python3 를 OS 기본으로 지정 (alternatives --set python3 {{ os_system_python3 }})
+  ansible.builtin.command: "alternatives --set python3 {{ os_system_python3 }}"
+  when:
+    - os_fix_system_python3 | bool
+    - _sys_python3.stdout != os_system_python3
+
 # ---------- 12. THP 비활성화 + Read-ahead 조정 (tuned) ----------
 - name: tuned 설치
   ansible.builtin.package:
