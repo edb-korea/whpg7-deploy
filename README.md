@@ -258,6 +258,7 @@ ansible-playbook playbooks/site.yml --check --diff
 | XFS 마운트 옵션 | `/etc/fstab` | noatime, allocsize=16m 등 (quota 사용 시 prjquota) |
 | 데이터 볼륨 quota | `/etc/projects`, `/etc/projid`, xfs_quota | 데이터 경로가 있는 볼륨에 XFS project quota hard = 볼륨 크기 × `whpg_data_quota_percent`(기본 95%) |
 | I/O 스케쥴러 | `/etc/udev/rules.d/99-vmware-db-scheduler.rules` | `none` (SSD/VMware) |
+| 시스템 python3 | alternatives | `/usr/bin/python3` 를 OS 기본(RHEL 9: 3.9)으로 유지 (tuned 등 RHEL 도구용). WHPG 는 `greenplum_path.sh` 가 PATH 앞에 넣는 `$GPHOME/ext/python3.11/bin` 으로 python3.11 사용 (`os_fix_system_python3`) |
 | THP 비활성화 | `/etc/tuned/whpg-optimized/tuned.conf` | `transparent_hugepages=never` |
 | Read-ahead 조정 | tuned profile | `readahead=16` |
 | SSH 임계값 | `/etc/ssh/sshd_config` | MaxStartups=100:30:200, MaxSessions=200 |

@@ -89,3 +89,8 @@ whpg_data_quota_percent: 95
 whpg_data_quota_soft_percent: 0
 whpg_data_quota_project_id_base: 1001
 whpg_data_quota_project_prefix: whpg
+
+# ---------- 시스템 python3 (tasks/main.yml 12-0) ----------
+# /usr/bin/python3 를 OS 기본 Python 으로 유지 (tuned 등 RHEL 도구용). WHPG 는 greenplum_path.sh 로 python3.11 사용
+os_fix_system_python3: true
+os_system_python3: "{{ '/usr/bin/python3.9' if ansible_distribution_major_version | int >= 9 else '/usr/bin/python3.6' }}"
