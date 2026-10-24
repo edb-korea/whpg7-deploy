@@ -6,6 +6,8 @@
 #       기존 2 / 3대 : 4대(whpg_mirror_group_size)까지만 증설 (2→3, 2→4, 3→4). mirror 를 새 구성에 맞게 재배치 (tasks/remirror.yml)
 #       기존 4대 이상: 4대 단위로 증설. 기존 mirror 는 그대로
 #   - 새 호스트를 expand_new_hosts 그룹에 등록 (이후 play 에서 사용)
+#   - 기존 segment 호스트의 core / extension RPM 버전을 조회해 _expand_pkg_versions 에 저장
+#     (새 호스트는 inventory 의 whpg_version / repo 최신이 아니라 이 버전으로 설치, tasks/prepare.yml)
 # ======================================================
 
 - name: 현재 segment 구성 조회
@@ -20,19 +22,24 @@
   environment: "{{ whpg_env }}"
   register: _segcfg
   changed_when: false
+  check_mode: false
 
 - name: gpexpand 진행 상태 조회 (postgres DB 의 gpexpand.status)
   ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      psql -d postgres -At -c
-      "SELECT CASE WHEN to_regclass('gpexpand.status') IS NULL THEN 'NONE'
-              ELSE coalesce((SELECT status FROM gpexpand.status ORDER BY updated DESC LIMIT 1), 'NONE') END"
+    # 테이블 이름은 파싱 시점에 확인되므로 CASE 로 감쌀 수 없음 → 존재 여부를 먼저 따로 조회
+    cmd: |
+      source {{ whpg_install_dir }}/greenplum_path.sh
+      if [ "$(psql -d postgres -Atc "SELECT to_regclass('gpexpand.status') IS NOT NULL")" = "t" ]; then
+        psql -d postgres -Atc "SELECT coalesce((SELECT status FROM gpexpand.status ORDER BY updated DESC LIMIT 1), 'NONE')"
+      else
+        echo NONE
+      fi
   become: true
   become_user: "{{ gpadmin_user }}"
   environment: "{{ whpg_env }}"
   register: _expand_status_q
   changed_when: false
+  check_mode: false
 
 - name: 증설 계획 계산
   ansible.builtin.set_fact:
@@ -84,6 +91,71 @@
       (또는 기존 segment 포트가 whpg_port_base / whpg_mirror_port_base 규칙과 다름)
     quiet: true
 
+# ---------- 기존 호스트의 설치 버전 (새 호스트를 같은 버전으로 설치) ----------
+- name: 기존 segment 호스트의 WHPG RPM 버전 조회
+  ansible.builtin.command:
+    cmd: rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n'
+  delegate_to: "{{ item }}"
+  loop: "{{ _existing_hosts }}"
+  register: _expand_rpm_q
+  changed_when: false
+  check_mode: false
+  when: _expand_new_hosts | length > 0
+
+- name: 기존 호스트 RPM 버전 정리
+  ansible.builtin.set_fact:
+    # {호스트: {패키지: 버전-릴리스}} (core + 설치 대상 extension 만)
+    _expand_host_pkgs: >-
+      {%- set out = {} -%}
+      {%- for r in _expand_rpm_q.results | default([]) if r.stdout is defined -%}
+      {%-   set d = {} -%}
+      {%-   for l in r.stdout_lines -%}
+      {%-     set f = l.split('\t') -%}
+      {%-     if f[0] in _pkgs -%}{%- set _ = d.update({f[0]: f[1]}) -%}{%- endif -%}
+      {%-   endfor -%}
+      {%-   set _ = out.update({r.item: d}) -%}
+      {%- endfor -%}
+      {{ out }}
+  vars:
+    _pkgs: "{{ [whpg_core_pkg_name] + (whpg_extension_catalog | selectattr('enabled') | map(attribute='pkg') | list) }}"
+  when: _expand_new_hosts | length > 0
+
+- name: 새 호스트에 설치할 버전 결정 (기존 호스트와 동일)
+  ansible.builtin.set_fact:
+    _expand_pkg_versions: "{{ _expand_host_pkgs[_existing_hosts | first] }}"
+    # 기존 호스트끼리 버전이 다른(또는 일부 호스트에만 있는) 패키지
+    _expand_pkg_mismatch: "{{ _mismatch }}"
+    # 설치 대상(catalog enabled)인데 기존 호스트에 없는 extension → 새 호스트에는 repo 최신으로 설치
+    _expand_pkg_missing: >-
+      {{ whpg_extension_catalog | selectattr('enabled') | map(attribute='pkg')
+         | reject('in', _expand_host_pkgs[_existing_hosts | first].keys() | list) | list }}
+  vars:
+    _mismatch: >-
+      {%- set names = [] -%}
+      {%- for d in _expand_host_pkgs.values() -%}{%- set _ = names.extend(d.keys() | list) -%}{%- endfor -%}
+      {%- set out = [] -%}
+      {%- for k in names | unique -%}
+      {%-   if _expand_host_pkgs.values() | map(attribute=k) | map('default', '') | unique | list | length > 1 -%}
+      {%-     set _ = out.append(k) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ out }}
+  when: _expand_new_hosts | length > 0
+
+- name: 기존 호스트 버전 일치 확인
+  ansible.builtin.assert:
+    that:
+      - _expand_pkg_versions[whpg_core_pkg_name] is defined
+      - _expand_pkg_mismatch | length == 0
+    fail_msg: >-
+      {{ ('기존 segment 호스트 ' ~ (_existing_hosts | first) ~ ' 에 ' ~ whpg_core_pkg_name ~ ' 이 설치되어 있지 않습니다.')
+         if _expand_pkg_versions[whpg_core_pkg_name] is not defined else '' }}
+      기존 segment 호스트끼리 버전이 다른 패키지가 있어 새 호스트에 설치할 버전을 정할 수 없습니다:
+      {% for k in _expand_pkg_mismatch %}{{ k }} ({% for h, d in _expand_host_pkgs.items() %}{{ h }}={{ d.get(k, '없음') }}{{ ', ' if not loop.last }}{% endfor %}) {% endfor %}
+      → playbooks/upgrade/upgrade.yml 로 버전을 맞춘 뒤 다시 실행하세요.
+    quiet: true
+  when: _expand_new_hosts | length > 0
+
 - name: 새 호스트를 expand_new_hosts 그룹에 등록
   ansible.builtin.add_host:
     name: "{{ item }}"
@@ -99,3 +171,5 @@
       - "{{ ('mirror 재배치: 기존 ' ~ _existing_hosts | length ~ '대 → ' ~ segment_hosts | length ~ '대 한 그룹 기준으로 기존 mirror 를 gpmovemirrors 로 이동 후 gpexpand')
            if (_expand_small | bool and _expand_has_mirrors | bool and _expand_new_hosts | length > 0) else 'mirror 재배치: 없음 (기존 mirror 유지)' }}"
       - "gpexpand 상태: {{ _expand_status }}"
+      - "새 호스트 설치 버전 (기존 {{ _existing_hosts | first }} 와 동일): {% for k, v in (_expand_pkg_versions | default({})).items() %}{{ k }} {{ v }}{{ ', ' if not loop.last }}{% else %}-{% endfor %}"
+      - "기존 호스트에 없는 extension (새 호스트에는 repo 최신으로 설치): {{ _expand_pkg_missing | default([]) | join(', ') or '없음' }}"

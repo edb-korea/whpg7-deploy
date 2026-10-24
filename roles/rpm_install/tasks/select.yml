@@ -5,6 +5,7 @@
 #    (예: whpg-backup ↔ whpg-backup-ddboost-plugin, warehouse-pg-7 ↔ warehouse-pg-7-clients 구분)
 #  - 여러 개면 버전 비교(sort -V)로 최신 선택 (1.9.1 < 1.11.0)
 #  - rpm_pkg_version 지정 시 해당 버전만 대상 (예: "7.5.0" → 7.5.0_WHPG-1 일치, 7.5.01 불일치)
+#    버전-릴리스 전체(예: "7.5.0_WHPG-1.el9")를 주면 정확히 같은 것만 대상
 #
 # 결과: _rpm_selected = 선택된 RPM 전체 경로 (없으면 '')
 #
@@ -24,7 +25,7 @@
         read -r n v r < <(rpm -qp --nosignature --qf '%{NAME} %{VERSION} %{RELEASE}\n' "$f" 2>/dev/null) || continue
         [ "$n" = "$RPM_NAME" ] || continue
         if [ -n "$RPM_VER" ]; then
-          [[ "$v" =~ ^${RPM_VER//./\\.}([^0-9]|$) ]] || continue
+          [ "$v-$r" = "$RPM_VER" ] || [[ "$v" =~ ^${RPM_VER//./\\.}([^0-9]|$) ]] || continue
         fi
         printf '%s-%s\t%s\n' "$v" "$r" "$f"
       done | sort -t $'\t' -k1,1 -V | tail -n 1 | cut -f2

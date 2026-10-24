@@ -17,6 +17,7 @@
     cmd: "getenforce; stat -fc %T /sys/fs/cgroup"
   register: _boot_state
   changed_when: false
+  check_mode: false
 
 # SELinux disabled, cgroup v2 는 재부팅해야 적용된다 (Phase 1 과 동일)
 - name: 새 호스트 재부팅 (SELinux 미비활성 또는 cgroup v2 비활성)
@@ -33,20 +34,55 @@
     - not (expand_reboot_if_needed | bool)
     - _boot_state.stdout_lines[0] != 'Disabled' or _boot_state.stdout_lines[1] != 'cgroup2fs'
 
+# core / extension 은 기존 segment 호스트와 같은 버전으로 설치 (plan.yml 의 _expand_pkg_versions)
 - name: WHPG Core 설치 / 데이터 디렉토리 (whpg_install)
   ansible.builtin.include_role:
     name: whpg_install
+  vars:
+    whpg_pkg_versions: "{{ hostvars[coordinator_host]._expand_pkg_versions }}"
 
 # coordinator 전용 작업(CREATE EXTENSION, gpconfig, 재시작)은 role 안에서 건너뛰고 RPM 만 설치된다
 - name: Extension RPM 설치 (whpg_extensions)
   ansible.builtin.include_role:
     name: whpg_extensions
+  vars:
+    whpg_pkg_versions: "{{ hostvars[coordinator_host]._expand_pkg_versions }}"
+
+- name: 설치된 RPM 버전 조회
+  ansible.builtin.command:
+    cmd: rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n'
+  register: _new_rpm_q
+  changed_when: false
+  check_mode: false
+
+- name: 기존 segment 호스트와 버전 일치 확인
+  ansible.builtin.assert:
+    that: _diff | length == 0
+    fail_msg: "기존 segment 호스트와 버전이 다름: {{ _diff | join(', ') }}"
+    success_msg: "기존 호스트와 같은 버전 {{ _ref | length }}개 설치 확인"
+  vars:
+    _ref: "{{ hostvars[coordinator_host]._expand_pkg_versions }}"
+    _have: >-
+      {%- set d = {} -%}
+      {%- for l in _new_rpm_q.stdout_lines -%}
+      {%-   set f = l.split('\t') -%}
+      {%-   set _ = d.update({f[0]: f[1]}) if f | length == 2 else none -%}
+      {%- endfor -%}
+      {{ d }}
+    _diff: >-
+      {%- set out = [] -%}
+      {%- for k, v in _ref.items() if _have.get(k) != v -%}
+      {%-   set _ = out.append(k ~ ' ' ~ _have.get(k, '없음') ~ ' (기존 ' ~ v ~ ')') -%}
+      {%- endfor -%}
+      {{ out }}
+  when: not ansible_check_mode   # --check 에서는 RPM 이 실제로 설치되지 않음
 
 # gpexpand 입력 파일의 hostname 열 (gp_segment_configuration.hostname 과 같은 실제 hostname)
 - name: 실제 hostname 조회
   ansible.builtin.command: hostname
   register: _hostname
   changed_when: false
+  check_mode: false
 
 - name: hostname 저장
   ansible.builtin.set_fact:

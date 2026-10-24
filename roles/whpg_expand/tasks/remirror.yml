@@ -104,6 +104,7 @@
   environment: "{{ whpg_env }}"
   register: _remirror_registered
   changed_when: false
+  check_mode: false
 
 # address 가 inventory 이름과 다르면 보존 목록이 비어 정상 mirror 까지 지울 수 있으므로 중단
 - name: 등록된 segment address 가 inventory [segments] 이름과 같은지 확인

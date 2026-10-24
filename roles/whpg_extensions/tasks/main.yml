@@ -22,12 +22,14 @@
 
 # ==========================================
 # RPM 설치 (모든 노드)
+# whpg_pkg_versions({패키지: 버전-릴리스})에 있으면 그 버전 (segment 증설 시 기존 호스트와 같은 버전), 없으면 최신
 # ==========================================
 - name: Extension RPM 설치
   ansible.builtin.include_role:
     name: rpm_install
   vars:
     rpm_pkg_name: "{{ _ext.pkg }}"
+    rpm_pkg_version: "{{ (whpg_pkg_versions | default({}))[_ext.pkg] | default('') }}"
   loop: "{{ _enabled_extensions }}"
   loop_control:
     loop_var: _ext
@@ -42,6 +44,7 @@
     cmd: "find {{ whpg_real_install_dir }} ! -user {{ gpadmin_user }} -print -quit"
   register: _whpg_owner
   changed_when: false
+  failed_when: false          # --check 등으로 설치 디렉토리가 아직 없으면 stdout 이 비어 건너뜀
   check_mode: false
 
 - name: WHPG 설치 디렉토리 소유권 재정비 ({{ gpadmin_user }})
