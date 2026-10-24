@@ -26,17 +26,32 @@
     mode: '0640'
   notify: restart_pgbouncer
 
-- name: userlist.txt 생성 (pgbouncer_auth_users)
+# pg_shadow 에서 사용자 / 해시를 읽어 Ansible 로 기록 (pgbouncer RPM 이 만든 userlist.txt 는
+# pgbouncer 사용자 소유라 gpadmin 셸 리다이렉트로는 덮어쓸 수 없음). 서비스는 gpadmin 으로 실행
+- name: pgBouncer 인증 사용자 조회 (pg_shadow, {{ pgbouncer_auth_users | join(', ') }})
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
       psql -d {{ whpg_database }} -t -A -c
       "SELECT '\"' || usename || '\" \"' || passwd || '\"' FROM pg_shadow
-       WHERE usename IN ('{{ pgbouncer_auth_users | join("','") }}');" > {{ pgbouncer_auth_file }}
+       WHERE usename IN ('{{ pgbouncer_auth_users | join("','") }}');"
   become: true
   become_user: "{{ gpadmin_user }}"
   environment: "{{ whpg_env }}"
-  changed_when: true
+  register: _pgb_userlist
+  changed_when: false
+  check_mode: false
+  no_log: true
+
+- name: userlist.txt 생성 ({{ pgbouncer_auth_file }})
+  ansible.builtin.copy:
+    dest: "{{ pgbouncer_auth_file }}"
+    content: "{{ _pgb_userlist.stdout }}\n"
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0600'
+  no_log: true
+  notify: restart_pgbouncer
 
 - name: pgBouncer systemd 서비스 등록
   ansible.builtin.template:

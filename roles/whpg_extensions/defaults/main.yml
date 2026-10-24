@@ -4,9 +4,10 @@
 # inventory/whpg_cluster.yml 에서 관리합니다 (업그레이드 playbook과 공유).
 
 # PXF 설정 파일 경로
-pxf_base_dir: "{{ gpadmin_home }}/pxf"
+# pxf_home / pxf_base_dir / pxf_env 는 inventory/whpg_cluster.yml
 pxf_hadoop_auth: simple
 
 # MADlib 설치 옵션
 madlib_schema: madlib
-madlib_platform: warehousepg
+madlib_home: /usr/local/madlib        # edb-whpg7-madlib 설치 경로 (bin → Current/bin → Versions/<버전>/bin)
+madlib_platform: greenplum           # madpack -p 값 (postgres | greenplum), WHPG 는 greenplum

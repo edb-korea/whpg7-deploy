@@ -76,6 +76,7 @@ os_required_packages:
   - lsof
   - sysstat
   - perl
+  - m4                 # MADlib madpack 이 SQL 생성에 사용
   - python3
   - python3-pip
   - java-11-openjdk

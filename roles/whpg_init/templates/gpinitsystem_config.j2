@@ -10,8 +10,8 @@ COORDINATOR_HOSTNAME={{ coordinator_host }}
 # Coordinator 포트
 COORDINATOR_PORT={{ whpg_coordinator_port }}
 
-# Coordinator 데이터 디렉토리
-COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
+# Coordinator 데이터 상위 디렉토리 (gpinitsystem 이 그 아래 {{ whpg_seg_prefix }}-1 을 만든다 → coordinator_data_dir)
+COORDINATOR_DIRECTORY={{ coordinator_data_dir | dirname }}
 
 # Array 이름
 ARRAY_NAME="{{ whpg_array_name }}"
@@ -40,5 +40,5 @@ DATABASE_NAME={{ whpg_database }}
 # Trusted Shell (ssh 권장)
 TRUSTED_SHELL={{ whpg_trusted_shell }}
 
-# WAL 동기화 방식 (net 권장)
+# 세그먼트 호스트 목록 파일
 MACHINE_LIST_FILE={{ whpg_hostfile_segments }}

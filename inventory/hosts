@@ -1,19 +1,22 @@
 # WarehousePG Cluster Inventory
 # 호스트명 및 IP를 환경에 맞게 수정하세요
+# 호스트 이름은 각 서버의 실제 hostname(`hostname` 명령 결과)과 같아야 한다.
+#   다르면 gpinitsystem(primary)과 gpaddmirrors(mirror)가 gp_segment_configuration.hostname 에
+#   서로 다른 이름을 기록해, PXF 등 hostname 기준 도구가 같은 서버를 두 대로 인식한다 (Phase 3 에서 확인 후 중단)
 
 [coordinator]
-cdw ansible_host=10.0.15.112
+whpg-cdw ansible_host=10.0.15.112
 
 [standby_coordinator]
-scdw ansible_host=10.0.8.209
+whpg-scdw ansible_host=10.0.8.209
 
-# segment 호스트는 4대(whpg_mirror_group_size) 단위로 적는다. 적힌 순서대로 4대씩 mirror 그룹이 된다.
-# 증설 시 기존 순서는 그대로 두고 끝에 4대씩 추가한다.
+# segment 호스트: 2 / 3대로 시작하면 4대까지 먼저 증설하고, 그 다음부터 4대(whpg_mirror_group_size) 단위로 증설한다.
+# 적힌 순서대로 mirror 그룹이 된다. 증설 시 기존 순서는 그대로 두고 끝에 추가한다.
 [segments]
-sdw1 ansible_host=10.0.3.219
-sdw2 ansible_host=10.0.14.73
-#sdw3 ansible_host=192.168.10.23
-#sdw4 ansible_host=192.168.10.24
+whpg-sdw1 ansible_host=10.0.3.219
+whpg-sdw2 ansible_host=10.0.14.73
+#whpg-sdw3 ansible_host=192.168.10.23
+#whpg-sdw4 ansible_host=192.168.10.24
 
 [whpg_cluster:children]
 coordinator

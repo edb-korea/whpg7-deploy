@@ -73,8 +73,12 @@
   become: true
   any_errors_fatal: true
   roles:
+    # wem role 에는 tags: [always] 태스크(점검 / Summary)가 있어 site.yml 을 다른 phase 태그로 실행해도 돌므로,
+    # 태그 없이 전체 실행하거나 phase7 / wem 태그를 지정했을 때만 실행
     - role: wem
-      when: wem_enabled | default(true)
+      when:
+        - wem_enabled | default(true)
+        - ansible_run_tags | intersect(['all', 'phase7', 'wem']) | length > 0
   tags:
     - phase7
     - wem

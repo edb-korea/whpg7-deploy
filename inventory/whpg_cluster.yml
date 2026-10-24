@@ -142,6 +142,9 @@ whpg_env:
   COORDINATOR_DATA_DIRECTORY: "{{ coordinator_data_dir }}"
   PGPORT: "{{ whpg_coordinator_port }}"
   PGDATABASE: "{{ whpg_database }}"
+  # greenplum_path.sh 의 environment.d/30-pljava.conf 가 $JAVA_HOME/lib/server 를 LD_LIBRARY_PATH 에 넣는다
+  # (gpstart 로 시작한 postmaster 가 pljava 의 libjvm.so 를 찾으려면 필요)
+  JAVA_HOME: "{{ whpg_java_home }}"
 
 # ------------------------------------------
 # DB 초기화 파라미터
@@ -152,9 +155,9 @@ whpg_mirror_port_base: 7000         # Mirror 세그먼트 시작 포트
 whpg_encoding: UTF8
 whpg_locale: ko_KR.UTF-8
 whpg_timezone: Asia/Seoul
-whpg_max_connections: 2000          # Coordinator max_connections
-whpg_seg_max_connections: 2000      # Segment max_connections
-whpg_shared_buffers: 2GB
+whpg_max_connections: 500           # Coordinator max_connections
+whpg_seg_max_connections: 1500      # Segment max_connections (coordinator 보다 커야 함, Greenplum 기본 비율 1:3)
+whpg_shared_buffers: 512MB
 whpg_effective_cache_size: 8GB
 whpg_resource_manager: "group-v2"   # cgroup v2 기반 resource group
 
@@ -238,6 +241,14 @@ whpg_diskquota_hard_percent: 92
 whpg_diskquota_hard_mode: auto       # auto: 사용량에 따라 cron 이 on / off, on: 항상, off: soft 만
 whpg_diskquota_capacity_gb: 0
 
+# PXF 경로 (edb-whpg7-pxf RPM 설치 경로 / 설정 base 디렉토리). gpadmin .bashrc 에 PXF_HOME, PXF_BASE, PATH 로 등록
+pxf_home: /usr/local/edb-whpg7-pxf
+pxf_base_dir: "{{ gpadmin_home }}/pxf"
+# PXF / pljava 용 JAVA_HOME (RHEL 의 버전 고정 링크, java 마이너 업데이트에도 경로 유지). gpadmin .bashrc 에도 등록
+whpg_java_home: /usr/lib/jvm/jre-17
+# PXF 명령 실행 환경 (greenplum_path.sh 는 PXF 경로를 PATH 에 넣지 않고, Ansible 셸은 .bashrc 를 읽지 않음)
+pxf_env: "{{ whpg_env | combine({'PXF_HOME': pxf_home, 'PXF_BASE': pxf_base_dir, 'JAVA_HOME': whpg_java_home}) }}"
+
 # PXF Hadoop 연동
 pxf_hadoop_enabled: true
 pxf_namenode_host: "namenode.internal"  # 환경에 맞게 수정
@@ -271,14 +282,15 @@ whpg_extension_catalog:
   - { name: pxf,          pkg: "{{ whpg_ext_pkg_prefix }}-pxf",             enabled: "{{ install_pxf | bool }}" }
   - { name: pgaudit,      pkg: "{{ whpg_ext_pkg_prefix }}-pgaudit",         enabled: "{{ install_pgaudit | bool }}", sql_ext: pgaudit, preload: pgaudit }
   - { name: user_profile, pkg: "{{ whpg_ext_pkg_prefix }}-user_profile",    enabled: "{{ install_user_profile | bool }}", preload: user_profile }
-  - { name: anonymizer,   pkg: "{{ whpg_ext_pkg_prefix }}-anonymizer",      enabled: "{{ install_anonymizer | bool }}", sql_ext: anon, cascade: true }
+  - { name: anonymizer,   pkg: "{{ whpg_ext_pkg_prefix }}-anonymizer",      enabled: "{{ install_anonymizer | bool }}", sql_ext: anon, cascade: true, preload: anon }   # security label provider
   - { name: whpg_fdw,     pkg: "{{ whpg_ext_pkg_prefix }}-whpg_fdw",        enabled: "{{ install_whpg_fdw | bool }}", sql_ext: whpg_fdw }
   - { name: diskquota,    pkg: "{{ whpg_ext_pkg_prefix }}-diskquota",       enabled: "{{ install_diskquota | bool }}", preload: "diskquota-{{ diskquota_lib_version }}" }
   - { name: datascience,  pkg: "{{ whpg_ext_pkg_prefix }}-data-science-python311", enabled: "{{ install_datascience_python | bool }}" }
   - { name: madlib,       pkg: "{{ whpg_ext_pkg_prefix }}-madlib",          enabled: "{{ install_madlib | bool }}" }
   - { name: plr,          pkg: "{{ whpg_ext_pkg_prefix }}-plr",             enabled: "{{ install_plr | bool }}", sql_ext: plr }
   - { name: datascience_r, pkg: "{{ whpg_ext_pkg_prefix }}-data-science-r", enabled: "{{ install_datascience_r | bool }}" }   # plr 다음에 설치
-  - { name: pljava,       pkg: "{{ whpg_ext_pkg_prefix }}-pljava",          enabled: "{{ install_pljava | bool }}", sql_ext: pljava }
+  - { name: pljava,       pkg: "{{ whpg_ext_pkg_prefix }}-pljava",          enabled: "{{ install_pljava | bool }}", sql_ext: pljava,
+      gucs: [{ name: pljava.libjvm_location, value: "{{ whpg_java_home }}/lib/server/libjvm.so" }] }   # libjvm 은 whpg_env 의 JAVA_HOME → LD_LIBRARY_PATH
   - { name: pg_partman,   pkg: "{{ whpg_ext_pkg_prefix }}-pg_partman",      enabled: "{{ install_pg_partman | bool }}", sql_ext: pg_partman }
   - { name: whpg_copy,    pkg: "edb-whpg-copy",                             enabled: "{{ install_whpg_copy | bool }}" }
   - { name: whpg_cron,    pkg: "{{ whpg_ext_pkg_prefix }}-whpg-cron",       enabled: "{{ install_whpg_cron | bool }}", sql_ext: pg_cron, preload: pg_cron,
