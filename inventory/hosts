@@ -11,7 +11,8 @@ whpg-cdw ansible_host=10.0.15.112
 whpg-scdw ansible_host=10.0.8.209
 
 # segment 호스트: 2 / 3대로 시작하면 4대까지 먼저 증설하고, 그 다음부터 4대(whpg_mirror_group_size) 단위로 증설한다.
-# 적힌 순서대로 mirror 그룹이 된다. 증설 시 기존 순서는 그대로 두고 끝에 추가한다.
+# 처음 설치(gpinitsystem) 시 적힌 순서대로 mirror 그룹이 된다.
+# 증설 시 현재 클러스터에 없는 호스트가 새 호스트가 된다 (위치 무관, 그룹 순서 = 기존 클러스터 순서 + 새 호스트 순서)
 [segments]
 whpg-sdw1 ansible_host=10.0.3.219
 whpg-sdw2 ansible_host=10.0.14.73
