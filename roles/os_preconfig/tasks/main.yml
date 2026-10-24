@@ -279,12 +279,22 @@
     group: "{{ gpadmin_group }}"
     mode: '0600'
 
-# 클러스터 모든 호스트의 키를 known_hosts 에 등록 (inventory 이름 / IP / 실제 hostname, 이미 있으면 건너뜀)
+# known_hosts 가 root 소유로 바뀌어 있어도(root 로 ssh-keygen -R 등) gpadmin 이 쓸 수 있도록 소유권 / 권한을 맞춘다
+- name: gpadmin known_hosts 소유권 / 권한 ({{ gpadmin_user }}, 0600)
+  ansible.builtin.file:
+    path: "{{ gpadmin_home }}/.ssh/known_hosts"
+    state: touch
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0600'
+    modification_time: preserve
+    access_time: preserve
+
+# 클러스터 모든 호스트의 키를 known_hosts 에 등록 (inventory 이름 / IP / 실제 hostname / alias, 이미 있으면 건너뜀)
 - name: gpadmin known_hosts 에 클러스터 호스트 키 등록 (ssh-keyscan)
   ansible.builtin.shell:
     cmd: |
       kh={{ gpadmin_home }}/.ssh/known_hosts
-      touch "$kh" && chmod 600 "$kh"
       for h in {{ _ssh_known_names | join(' ') }}; do
         ssh-keygen -F "$h" -f "$kh" >/dev/null 2>&1 && continue
         keys=$(ssh-keyscan -T 5 "$h" 2>/dev/null)
