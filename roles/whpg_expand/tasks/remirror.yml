@@ -29,7 +29,7 @@
   ansible.builtin.debug:
     msg: >-
       {{ ['기존 mirror ' ~ (_segs | selectattr('content', 'ge', 0) | selectattr('prole', 'equalto', 'm') | list | length)
-          ~ '개 중 ' ~ _remirror_moves | length ~ '개 이동 (' ~ segment_hosts | length ~ '대 한 그룹 기준)']
+          ~ '개 중 ' ~ _remirror_moves | length ~ '개 이동 (' ~ _expand_hosts | length ~ '대 한 그룹 기준)']
          + (_remirror_moves | map(attribute='content') | map('string')
             | zip(_remirror_moves | map(attribute='from'), _remirror_moves | map(attribute='final'),
                   _remirror_moves | map(attribute='direct'))

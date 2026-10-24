@@ -1,6 +1,7 @@
 {#
   gpexpand -i 입력 파일 (형식: hostname|address|port|datadir|dbid|content|preferred_role)
-  입력: _expand_new_hosts (inventory [segments] 끝에 추가된 호스트. 기존 2 / 3대면 합계 4대까지, 이후 4대 단위)
+  입력: _expand_new_hosts (현재 클러스터에 없는 [segments] 호스트. 기존 2 / 3대면 합계 4대까지, 이후 4대 단위)
+        _expand_hosts (증설 후 전체 호스트 순서 = 기존 호스트(클러스터 content 순서) + 새 호스트, tasks/plan.yml)
         _expand_max_content / _expand_max_dbid (현재 최대값)
 
   primary : 새 호스트 순서 × k(0..K-1) 순서로 content 부여, primary_data_dirs[k], 포트 whpg_port_base + k
@@ -26,12 +27,12 @@
 {% if _expand_has_mirrors | bool %}
 {%   for host in _expand_new_hosts %}
 {%     set i = loop.index0 %}
-{%     set h = segment_hosts.index(host) %}
+{%     set h = _expand_hosts.index(host) %}
 {%     set base = 0 if h < F else F + ((h - F) // G) * G %}
 {%     set S = F if h < F else G %}
 {%     for k in range(K) %}
 {%       set c = first + i * K + k %}
-{%       set mh = segment_hosts[base + (h - base + k % (S - 1) + 1) % S] %}
+{%       set mh = _expand_hosts[base + (h - base + k % (S - 1) + 1) % S] %}
 {%       set ns.dbid = ns.dbid + 1 %}
 {{ hostvars[mh]._expand_hostname }}|{{ mh }}|{{ whpg_mirror_port_base | int + k }}|{{ mirror_data_dirs[k] }}/{{ whpg_seg_prefix }}{{ c }}|{{ ns.dbid }}|{{ c }}|m
 {%     endfor %}

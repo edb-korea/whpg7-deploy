@@ -2,7 +2,7 @@
 # ======================================================
 # mirror 재배치 계획 (계산만, tasks/remirror.yml 에서 사용)
 #   입력: _segs (tasks/plan.yml 의 gp_segment_configuration: role, content, address, port, datadir, prole …)
-#         segment_hosts (증설 후 전체), whpg_mirror_first_group_size / whpg_mirror_group_size
+#         _expand_hosts (증설 후 전체 호스트 순서, tasks/plan.yml), whpg_mirror_first_group_size / whpg_mirror_group_size
 #   결과: _remirror_moves = [{content, from, final, temp, direct}]   (각 위치는 address|port|datadir)
 #     - 최종 위치는 templates/gpaddmirrors_config.j2, gpexpand_input.j2 와 같은 규칙
 #     - direct: 최종 위치의 호스트:포트를 지금 아무 segment 도 쓰지 않음 → 1차에 바로 이동
@@ -20,11 +20,11 @@
       {%- set out = [] -%}
       {%- for m in segs | selectattr('prole', 'equalto', 'm') | sort(attribute='content') -%}
       {%-   set p = segs | selectattr('prole', 'equalto', 'p') | selectattr('content', 'equalto', m.content) | first -%}
-      {%-   set h = segment_hosts.index(p.address) -%}
+      {%-   set h = _expand_hosts.index(p.address) -%}
       {%-   set k = p.port | int - whpg_port_base | int -%}
       {%-   set base = 0 if h < F else F + ((h - F) // G) * G -%}
       {%-   set S = F if h < F else G -%}
-      {%-   set th = segment_hosts[base + (h - base + k % (S - 1) + 1) % S] -%}
+      {%-   set th = _expand_hosts[base + (h - base + k % (S - 1) + 1) % S] -%}
       {%-   set tport = whpg_mirror_port_base | int + k -%}
       {%-   set tdir = mirror_data_dirs[k] ~ '/' ~ whpg_seg_prefix ~ m.content -%}
       {%-   if m.address != th or m.port | int != tport or m.datadir != tdir -%}
