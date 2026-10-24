@@ -32,6 +32,7 @@
       gpssh-exkeys -f {{ whpg_hostfile_all }}
   become: true
   become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
   when: _expand_new_hosts | length > 0
   changed_when: true
 

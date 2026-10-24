@@ -1,0 +1,39 @@
+---
+# ======================================================
+# gpadmin known_hosts 에 클러스터 모든 호스트의 키 등록
+#   tasks/main.yml (8단계) 과 segment 증설(playbooks/ops/expand_segments.yml, 전체 노드)에서 사용
+#   gpssh-exkeys 는 StrictHostKeyChecking=yes 로 접속하므로, 기존 노드도 새 호스트 키를 알고 있어야 한다
+# ======================================================
+
+# known_hosts 가 root 소유로 바뀌어 있어도(root 로 ssh-keygen -R 등) gpadmin 이 쓸 수 있도록 소유권 / 권한을 맞춘다
+- name: gpadmin known_hosts 소유권 / 권한 ({{ gpadmin_user }}, 0600)
+  ansible.builtin.file:
+    path: "{{ gpadmin_home }}/.ssh/known_hosts"
+    state: touch
+    owner: "{{ gpadmin_user }}"
+    group: "{{ gpadmin_group }}"
+    mode: '0600'
+    modification_time: preserve
+    access_time: preserve
+
+# 클러스터 모든 호스트의 키를 known_hosts 에 등록 (inventory 이름 / IP / 실제 hostname / alias, 이미 있으면 건너뜀)
+- name: gpadmin known_hosts 에 클러스터 호스트 키 등록 (ssh-keyscan)
+  ansible.builtin.shell:
+    cmd: |
+      kh={{ gpadmin_home }}/.ssh/known_hosts
+      for h in {{ _ssh_known_names | join(' ') }}; do
+        ssh-keygen -F "$h" -f "$kh" >/dev/null 2>&1 && continue
+        keys=$(ssh-keyscan -T 5 "$h" 2>/dev/null)
+        [ -n "$keys" ] && echo "$keys" >> "$kh" && echo "added $h"
+      done
+    executable: /bin/bash
+  vars:
+    _ssh_known_names: >-
+      {{ (groups['whpg_cluster'] + groups['whpg_cluster'] | map('extract', hostvars, 'ansible_host') | list
+          + groups['whpg_cluster'] | map('extract', hostvars, 'ansible_hostname') | select('defined') | list
+          + whpg_host_aliases | default({}) | dict2items | map(attribute='value') | list)
+         | reject('equalto', '') | unique | list }}
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  register: _known_hosts
+  changed_when: _known_hosts.stdout | length > 0

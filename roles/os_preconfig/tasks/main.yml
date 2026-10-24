@@ -279,38 +279,9 @@
     group: "{{ gpadmin_group }}"
     mode: '0600'
 
-# known_hosts 가 root 소유로 바뀌어 있어도(root 로 ssh-keygen -R 등) gpadmin 이 쓸 수 있도록 소유권 / 권한을 맞춘다
-- name: gpadmin known_hosts 소유권 / 권한 ({{ gpadmin_user }}, 0600)
-  ansible.builtin.file:
-    path: "{{ gpadmin_home }}/.ssh/known_hosts"
-    state: touch
-    owner: "{{ gpadmin_user }}"
-    group: "{{ gpadmin_group }}"
-    mode: '0600'
-    modification_time: preserve
-    access_time: preserve
-
-# 클러스터 모든 호스트의 키를 known_hosts 에 등록 (inventory 이름 / IP / 실제 hostname / alias, 이미 있으면 건너뜀)
-- name: gpadmin known_hosts 에 클러스터 호스트 키 등록 (ssh-keyscan)
-  ansible.builtin.shell:
-    cmd: |
-      kh={{ gpadmin_home }}/.ssh/known_hosts
-      for h in {{ _ssh_known_names | join(' ') }}; do
-        ssh-keygen -F "$h" -f "$kh" >/dev/null 2>&1 && continue
-        keys=$(ssh-keyscan -T 5 "$h" 2>/dev/null)
-        [ -n "$keys" ] && echo "$keys" >> "$kh" && echo "added $h"
-      done
-    executable: /bin/bash
-  vars:
-    _ssh_known_names: >-
-      {{ (groups['whpg_cluster'] + groups['whpg_cluster'] | map('extract', hostvars, 'ansible_host') | list
-          + groups['whpg_cluster'] | map('extract', hostvars, 'ansible_hostname') | select('defined') | list
-          + whpg_host_aliases | default({}) | dict2items | map(attribute='value') | list)
-         | reject('equalto', '') | unique | list }}
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  register: _known_hosts
-  changed_when: _known_hosts.stdout | length > 0
+# 클러스터 모든 호스트의 키를 gpadmin known_hosts 에 등록 (증설 시 전체 노드에 이 파일만 실행)
+- name: gpadmin known_hosts 에 클러스터 호스트 키 등록
+  ansible.builtin.include_tasks: known_hosts.yml
 
 # ---------- 9. 로컬 YUM 레포지토리 ----------
 - name: WHPG 로컬 YUM 레포 설정
@@ -321,6 +292,53 @@
     group: root
     mode: '0644'
   when: whpg_local_repo_enabled
+
+# ---------- 9-1. CodeReady Builder(CRB) + EPEL ----------
+# os_epel_enabled: true 일 때만 (기본 false, 로컬 레포 사용)
+# WHPG core 의 xerces-c 가 로컬 레포에 없으면 core RPM 설치가 "nothing provides xerces-c" 로 실패
+- name: CodeReady Builder / EPEL 레포
+  when: os_epel_enabled | bool
+  block:
+    # RHEL(RHUI 포함): codeready-builder-for-rhel-<N>-...-rpms, Rocky / Alma: crb
+    - name: CRB 레포 ID / 상태 조회
+      ansible.builtin.shell:
+        cmd: >-
+          dnf repolist --all 2>/dev/null | awk 'NR > 1 {print $1, $NF}'
+          | grep -E '^(codeready-builder-for-rhel-[0-9]+-[^ ]*rpms|crb) '
+          | grep -vE '(debug|source)-rpms ' | head -n 1
+      register: _crb_repo
+      changed_when: false
+      check_mode: false
+
+    - name: CRB 레포 활성화
+      ansible.builtin.command: "dnf config-manager --set-enabled {{ _crb_repo.stdout.split()[0] }}"
+      when:
+        - _crb_repo.stdout | length > 0
+        - _crb_repo.stdout.split()[-1] != 'enabled'
+
+    - name: CRB 레포 없음 경고
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: CodeReady Builder / crb 레포를 찾지 못했습니다. EPEL 패키지 의존성이 실패하면 직접 활성화하세요."
+      when: _crb_repo.stdout | length == 0
+
+    - name: epel-release 설치 여부 확인
+      ansible.builtin.command: rpm -q epel-release
+      register: _epel_installed
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: EPEL GPG 키 등록
+      ansible.builtin.rpm_key:
+        key: "{{ os_epel_gpg_key }}"
+        state: present
+      when: _epel_installed.rc != 0
+
+    - name: EPEL 레포 설치 (epel-release)
+      ansible.builtin.dnf:
+        name: "{{ os_epel_release_rpm }}"
+        state: present
+      when: _epel_installed.rc != 0
 
 # ---------- 10. 데이터 디스크 (XFS 포맷/마운트 + 블럭 디바이스 조회) ----------
 - name: 데이터 디스크 구성

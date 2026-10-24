@@ -66,6 +66,13 @@ io_read_ahead_kb: 16
 tuned_base_profile: throughput-performance
 tuned_readahead: 16
 
+# ---------- OS 추가 레포 (CodeReady Builder + EPEL, tasks/main.yml 9-1) ----------
+# WHPG core 가 요구하는 xerces-c 등은 기본적으로 로컬 레포(whpg_local_repo_baseurl)에 둔다
+# 로컬 레포에 없을 때만 true (CRB 활성화 + 인터넷에서 epel-release 설치). 내부 미러를 쓰면 URL 을 바꾼다
+os_epel_enabled: false
+os_epel_release_rpm: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ ansible_distribution_major_version }}.noarch.rpm"
+os_epel_gpg_key: "https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-{{ ansible_distribution_major_version }}"
+
 # ---------- 필수 패키지 ----------
 os_required_packages:
   - rsync
@@ -80,6 +87,7 @@ os_required_packages:
   - python3
   - python3-pip
   - java-11-openjdk
+  - java-17-openjdk-headless   # PXF / pljava 의 JAVA_HOME (whpg_java_home = /usr/lib/jvm/jre-17)
   - apr
   - apr-util
   - bash-completion

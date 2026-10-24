@@ -20,6 +20,7 @@
 #   1. 계획      : gp_segment_configuration 과 [segments] 비교 → 새 호스트 결정 / 조건 확인 / 기존 설치 버전 조회
 #   2. /etc/hosts: 전체 노드에 새 호스트 등록
 #   3. 새 호스트 : os_preconfig → (필요 시) 재부팅 → whpg_install → extension RPM
+#                  → 전체 노드 gpadmin known_hosts 에 새 호스트 키 등록 (gpssh-exkeys 용)
 #   4. gpexpand  : (기존 2 / 3대면) gpmovemirrors 로 기존 mirror 재배치
 #                  → 새 primary + mirror 추가 (mirror 는 초기 구성과 같은 그룹 spread 규칙)
 #                  → PXF 등록 → 테이블 재분배 → gpexpand 스키마 정리
@@ -58,6 +59,20 @@
       ansible.builtin.include_role:
         name: whpg_expand
         tasks_from: prepare.yml
+
+# 기존 노드도 새 호스트 키를 알아야 gpssh-exkeys(StrictHostKeyChecking=yes)가 통과한다
+# (새 호스트는 3/5 에서 gpadmin 이 만들어진 뒤라야 하므로 여기서 실행)
+- name: "증설 3/5: 전체 노드 gpadmin known_hosts 에 새 호스트 키 등록"
+  hosts: whpg_cluster
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: known_hosts 갱신
+      ansible.builtin.include_role:
+        name: os_preconfig
+        tasks_from: known_hosts.yml
+      when: hostvars[coordinator_host]._expand_new_hosts | default([]) | length > 0
 
 - name: "증설 4/5: gpexpand (segment 추가 / 재분배)"
   hosts: coordinator
