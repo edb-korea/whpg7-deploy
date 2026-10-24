@@ -249,10 +249,10 @@ ansible-playbook playbooks/site.yml --check --diff
 | SELinux 비활성화 | `/etc/selinux/config` | `SELINUX=disabled` |
 | firewalld 비활성화 | systemd | stopped + disabled |
 | OS 커널 파라미터 | `/etc/sysctl.d/95-whpg.conf` | shm, vm, net 튜닝 27개 |
-| /etc/hosts | `/etc/hosts` | 클러스터 전체 호스트 자동 등록 |
+| /etc/hosts | `/etc/hosts` | 클러스터 전체 호스트 자동 등록 (`IP 실제hostname alias`, alias: cdw / scdw / sdw1… , `host_alias` 로 변경) |
 | cgroup v1 강제 사용 | `/etc/default/grub` | `systemd.unified_cgroup_hierarchy=0` |
 | gpadmin 사용자/그룹 | `/etc/passwd` | 이미 있으면 기존 uid/gid 유지, 없으면 `gpadmin_uid` / `gpadmin_gid`(5000)로 생성, .bashrc 환경변수 |
-| SSH 무암호 로그인 | `~/.ssh/authorized_keys` | gpadmin RSA 키 전체 노드 배포 |
+| SSH 무암호 로그인 | `~/.ssh/authorized_keys`, `known_hosts` | gpadmin RSA 키 전체 노드 배포, 클러스터 호스트 키 등록(ssh-keyscan, gpssh-exkeys 용), `StrictHostKeyChecking accept-new` |
 | ulimits | `/etc/security/limits.d/95-gpadmin.conf` | nofile=524288, nproc=131072 |
 | 로컬 YUM 레포 | `/etc/yum.repos.d/whpg-local.repo` | 내부 레포 설정 |
 | XFS 마운트 옵션 | `/etc/fstab` | noatime, allocsize=16m 등 (quota 사용 시 prjquota) |

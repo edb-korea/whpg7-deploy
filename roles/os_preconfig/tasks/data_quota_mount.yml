@@ -6,7 +6,9 @@
     cmd: |
       opts=$(findmnt -n -o OPTIONS --target {{ _quota_mp }})
       echo "ACTIVE=$(grep -qE '(^|,)(prjquota|pquota)(,|$)' <<<"$opts" && echo yes || echo no)"
-      echo "SIZE_KB=$(df -k --output=size {{ _quota_mp }} | tail -n1 | tr -d ' ')"
+      # 실제 파일시스템 크기 (xfs_info 의 data blocks × bsize). df 는 project quota 가 걸린 경로에서
+      # quota 한도를 크기로 보여 주므로 쓰지 않는다 (df 기준이면 실행할 때마다 한도가 95% 씩 줄어듦)
+      echo "SIZE_KB=$(xfs_info {{ _quota_mp }} | sed -n 's/^data *= *bsize=\([0-9]*\) *blocks=\([0-9]*\).*/\1 \2/p' | awk '{ printf "%d", $1 * $2 / 1024 }')"
       id=$(awk -F: -v mp={{ _quota_mp }} '$2 == mp { print $1; exit }' /etc/projects 2>/dev/null)
       echo "ID=$id"
       echo "NAME=$( [ -n "$id" ] && awk -F: -v id="$id" '$2 == id { print $1; exit }' /etc/projid 2>/dev/null )"

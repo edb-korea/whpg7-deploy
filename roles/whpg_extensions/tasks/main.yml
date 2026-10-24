@@ -34,16 +34,50 @@
     label: "{{ _ext.name }} ({{ _ext.pkg }})"
 
 # ==========================================
+# Extension RPM 은 root 로 설치되므로, 설치 디렉토리에 gpadmin 소유가 아닌 파일이 있으면 소유권 재정비
+# (pxf cluster register 등 gpadmin 이 $GPHOME 아래 파일을 쓰는 작업이 Permission denied 로 실패)
+# ==========================================
+- name: WHPG 설치 디렉토리 소유권 확인 ({{ whpg_real_install_dir }})
+  ansible.builtin.shell:
+    cmd: "find {{ whpg_real_install_dir }} ! -user {{ gpadmin_user }} -print -quit"
+  register: _whpg_owner
+  changed_when: false
+  check_mode: false
+
+- name: WHPG 설치 디렉토리 소유권 재정비 ({{ gpadmin_user }})
+  ansible.builtin.command:
+    cmd: "chown -R {{ gpadmin_user }}:{{ gpadmin_group }} {{ whpg_real_install_dir }}"
+  when: _whpg_owner.stdout | length > 0
+
+# ==========================================
 # PXF 초기화 / 설정 / 시작 (Coordinator)
 # ==========================================
-- name: PXF 클러스터 초기화
+# PXF 6: pxf cluster prepare (PXF_BASE 생성) → register (extension 설치) → 설정 → sync → start
+#   (cluster init 은 deprecated). pxf 는 PATH 에 없으므로 {{ pxf_home }}/bin/pxf 로 실행
+- name: PXF base 디렉토리 확인 ({{ pxf_base_dir }})
+  ansible.builtin.stat:
+    path: "{{ pxf_base_dir }}/conf"
+  register: _pxf_base
+  when: "'pxf' in _enabled_extension_names and inventory_hostname == coordinator_host"
+
+- name: PXF base 준비 (pxf cluster prepare, 처음 한 번)
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      pxf cluster init 2>&1
+      {{ pxf_home }}/bin/pxf cluster prepare 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment: "{{ whpg_env }}"
+  environment: "{{ pxf_env }}"
+  when: "'pxf' in _enabled_extension_names and inventory_hostname == coordinator_host and not _pxf_base.stat.exists"
+
+- name: PXF extension 등록 (pxf cluster register)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      {{ pxf_home }}/bin/pxf cluster register 2>&1
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ pxf_env }}"
   when: "'pxf' in _enabled_extension_names and inventory_hostname == coordinator_host"
   changed_when: true
 
@@ -56,14 +90,15 @@
     mode: '0644'
   when: "'pxf' in _enabled_extension_names and pxf_hadoop_enabled | bool and inventory_hostname == coordinator_host"
 
-- name: PXF 클러스터 시작
+- name: PXF 설정 동기화 및 시작 (pxf cluster sync → start)
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      pxf cluster start 2>&1
+      {{ pxf_home }}/bin/pxf cluster sync 2>&1 &&
+      {{ pxf_home }}/bin/pxf cluster start 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment: "{{ whpg_env }}"
+  environment: "{{ pxf_env }}"
   when: "'pxf' in _enabled_extension_names and inventory_hostname == coordinator_host"
   changed_when: true
 
@@ -86,13 +121,14 @@
 
 # ==========================================
 # Extension 별 추가 GUC (카탈로그 gucs 항목, 예: pg_cron 의 cron.database_name)
-# 라이브러리가 아직 로드되지 않은 상태라 --skipvalidation 필요
+# 라이브러리가 아직 로드되지 않은 상태라 --skipvalidation 필요.
+# --skipvalidation 은 값을 그대로 기록하므로 작은따옴표로 감싼다 (경로 등 문자열 값이 따옴표 없이 들어가면 postgresql.conf 문법 오류로 시작 실패)
 # ==========================================
 - name: Extension 추가 GUC 설정
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpconfig -c {{ item.name }} -v '{{ item.value }}' --skipvalidation 2>&1
+      gpconfig -c {{ item.name }} -v "'{{ item.value }}'" --skipvalidation 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
   environment: "{{ whpg_env }}"
@@ -138,16 +174,29 @@
 # ==========================================
 # MADlib 설치 스크립트 (Coordinator)
 # ==========================================
-- name: MADlib 설치 스크립트 실행
+- name: MADlib 설치 여부 확인 ({{ madlib_schema }} 스키마)
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      $GPHOME/madlib/bin/madpack -s {{ madlib_schema }} install
+      psql -d {{ whpg_database }} -Atc "SELECT count(*) FROM pg_namespace WHERE nspname = '{{ madlib_schema }}'"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _madlib_schema
+  changed_when: false
+  check_mode: false
+  when: "'madlib' in _enabled_extension_names and inventory_hostname == coordinator_host"
+
+- name: MADlib 설치 (madpack install, 스키마가 없을 때만)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      {{ madlib_home }}/bin/madpack -s {{ madlib_schema }} install
       -p {{ madlib_platform }}
       -c {{ gpadmin_user }}@localhost:{{ whpg_coordinator_port }}/{{ whpg_database }} 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
   environment: "{{ whpg_env }}"
-  when: "'madlib' in _enabled_extension_names and inventory_hostname == coordinator_host"
-  changed_when: true
-  ignore_errors: true
+  when:
+    - "'madlib' in _enabled_extension_names and inventory_hostname == coordinator_host"
+    - _madlib_schema.stdout | default('0') | trim == '0'

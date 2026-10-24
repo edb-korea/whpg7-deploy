@@ -15,13 +15,55 @@
       - primary_data_dirs | length == mirror_data_dirs | length
       - (whpg_segments_per_host | int) % (whpg_data_mounts | length) == 0
       - whpg_data_mounts | map(attribute='path') | unique | list | length == whpg_data_mounts | length
+      # gpconfig: segment 의 max_connections 는 coordinator 보다 커야 함
+      - (whpg_seg_max_connections | int) > (whpg_max_connections | int)
     fail_msg: >-
       segment 호스트 수({{ segment_hosts | length }}: {{ segment_hosts | join(', ') }})는
       whpg_mirror_group_size({{ whpg_mirror_group_size }})의 배수이거나 2 ~ {{ whpg_mirror_group_size | int - 1 }}대여야 하고 (mirror 를 두려면 최소 2대),
       호스트당 segment 수(whpg_segments_per_host={{ whpg_segments_per_host }})는
       데이터 디스크 수({{ whpg_data_mounts | length }})의 배수여야 합니다 (디스크별 균등 배치).
+      또 whpg_seg_max_connections({{ whpg_seg_max_connections }})는 whpg_max_connections({{ whpg_max_connections }})보다 커야 합니다.
       inventory/hosts 의 [segments] 를 확인하세요.
     quiet: true
+  run_once: true
+
+# inventory 이름이 실제 hostname 과 다르면 gpinitsystem(primary: 실제 hostname)과 gpaddmirrors(mirror: inventory 이름)가
+# gp_segment_configuration.hostname 에 서로 다른 이름을 기록해, PXF 등이 같은 서버를 두 대로 인식한다
+- name: inventory 이름 = 실제 hostname 확인
+  ansible.builtin.assert:
+    that: _name_mismatch | length == 0
+    fail_msg: >-
+      inventory 이름과 실제 hostname 이 다릅니다: {{ _name_mismatch | join(', ') }}.
+      inventory/hosts 의 호스트 이름을 각 서버의 hostname 으로 바꾸세요 (ansible_host 는 그대로).
+    quiet: true
+  vars:
+    _name_mismatch: >-
+      {%- set out = [] -%}
+      {%- for h in groups['whpg_cluster'] if hostvars[h].ansible_hostname is defined and hostvars[h].ansible_hostname != h -%}
+      {%- set _ = out.append(h ~ ' → ' ~ hostvars[h].ansible_hostname) -%}
+      {%- endfor -%}
+      {{ out }}
+  when: inventory_hostname == coordinator_host
+  run_once: true
+
+# segment 호스트마다 인스턴스(primary + mirror) × shared_buffers 가 메모리의 절반을 넘으면 중단
+# (vm.overcommit_memory=2 에서 shared memory 할당 실패로 일부 segment 가 시작되지 않음)
+# 호스트 메모리 정보(facts)가 없으면 건너뜀 (Phase 3 단독 실행 시)
+- name: shared_buffers 메모리 확인 (segment 호스트당 인스턴스 {{ (whpg_segments_per_host | int) * 2 }}개)
+  ansible.builtin.assert:
+    that: (_sb_mb | float) * (whpg_segments_per_host | int) * 2 <= (_mem_mb | int) * 0.5
+    fail_msg: >-
+      whpg_shared_buffers({{ whpg_shared_buffers }}) × 인스턴스 {{ (whpg_segments_per_host | int) * 2 }}개
+      = {{ ((_sb_mb | float) * (whpg_segments_per_host | int) * 2) | int }}MB 가 segment 호스트 메모리({{ _mem_mb }}MB)의 50% 를 넘습니다.
+      whpg_shared_buffers 를 줄이세요 (예: {{ ((_mem_mb | int) * 0.25 / ((whpg_segments_per_host | int) * 2)) | int }}MB 이하).
+    quiet: true
+  vars:
+    _sb: "{{ whpg_shared_buffers | string | regex_search('^([0-9]+)\\s*([kKmMgGtT]?)', '\\1', '\\2') }}"
+    _sb_mb: "{{ (_sb[0] | int) * {'': 1/128, 'k': 1/1024, 'm': 1, 'g': 1024, 't': 1048576}[_sb[1] | lower] }}"
+    _mem_mb: "{{ segment_hosts | map('extract', hostvars, 'ansible_memtotal_mb') | select('defined') | min | default(0) }}"
+  when:
+    - _mem_mb | int > 0
+    - inventory_hostname == coordinator_host
   run_once: true
 
 # ---------- 1. gpinitsystem 설정파일 생성 ----------
@@ -85,7 +127,7 @@
   changed_when: "'Standby coordinator successfully created' in standby_result.stdout"
   failed_when:
     - standby_result.rc != 0
-    - "'already' not in standby_result.stderr | default('')"
+    - "'already' not in standby_result.stdout"   # 2>&1 이므로 stdout 에서 확인 (이미 있으면 재실행 시 통과)
 
 - name: Standby 추가 결과 출력
   ansible.builtin.debug:
@@ -163,13 +205,38 @@
   failed_when: false
   when: inventory_hostname == coordinator_host
 
-- name: "gpconfig resource_manager 설정 ({{ whpg_resource_manager }})"
+# cgroup v2: os_preconfig 의 gpdb.service 가 whpg_cgroup_dir(/sys/fs/cgroup/gpdb)를 만든다.
+# WHPG 의 gp_resource_group_cgroup_parent 기본값은 gpdb.service 이므로 같은 디렉토리로 맞춘 뒤 재시작하고,
+# 그 다음 gp_resource_manager 를 설정 (gpconfig 검증은 실행 중인 cgroup_parent 기준) → 재시작
+- name: resource group 현재 설정 조회
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      gpconfig -c gp_resource_manager -v '{{ whpg_resource_manager }}' 2>&1
+      psql -d postgres -Atc "show gp_resource_group_cgroup_parent" &&
+      psql -d postgres -Atc "show gp_resource_manager"
   become: true
   become_user: "{{ gpadmin_user }}"
   environment: "{{ whpg_env }}"
+  register: _rg_cur
+  changed_when: false
+  check_mode: false
   when: inventory_hostname == coordinator_host
-  changed_when: true
+
+- name: resource group 설정
+  when: inventory_hostname == coordinator_host
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  vars:
+    _rg_parent: "{{ whpg_cgroup_dir | regex_replace('^/sys/fs/cgroup/', '') }}"
+    _gp: "source {{ whpg_install_dir }}/greenplum_path.sh"
+  block:
+    - name: "gp_resource_group_cgroup_parent = {{ _rg_parent }} (재시작)"
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpconfig -c gp_resource_group_cgroup_parent -v '{{ _rg_parent }}' 2>&1 && gpstop -ra -a -M fast 2>&1 | tail -n 2"
+      when: _rg_cur.stdout_lines[0] != _rg_parent
+
+    - name: "gpconfig resource_manager 설정 ({{ whpg_resource_manager }}, 재시작)"
+      ansible.builtin.shell:
+        cmd: "{{ _gp }} && gpconfig -c gp_resource_manager -v '{{ whpg_resource_manager }}' 2>&1 && gpstop -ra -a -M fast 2>&1 | tail -n 2"
+      when: _rg_cur.stdout_lines[1] != whpg_resource_manager

@@ -95,10 +95,10 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      pxf cluster register && pxf cluster sync && pxf cluster start 2>&1
+      {{ pxf_home }}/bin/pxf cluster register && {{ pxf_home }}/bin/pxf cluster sync && {{ pxf_home }}/bin/pxf cluster start 2>&1
   become: true
   become_user: "{{ gpadmin_user }}"
-  environment: "{{ whpg_env }}"
+  environment: "{{ pxf_env }}"
   when:
     - _expand_new_hosts | length > 0
     - whpg_extension_catalog | selectattr('name', 'equalto', 'pxf') | selectattr('enabled') | list | length > 0

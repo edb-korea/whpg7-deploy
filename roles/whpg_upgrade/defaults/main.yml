@@ -66,4 +66,5 @@ whpg_upgrade_doc_url: https://www.enterprisedb.com/docs/warehousepg/latest/insta
 _whpg_upg_pxf_sh: |-
   source {{ gpadmin_home }}/.bashrc >/dev/null 2>&1
   source {{ whpg_install_dir }}/greenplum_path.sh
-  PXF=$(command -v pxf 2>/dev/null || echo "${PXF_HOME:-{{ whpg_install_dir }}/pxf}/bin/pxf")
+  export PXF_HOME=${PXF_HOME:-{{ pxf_home }}} PXF_BASE=${PXF_BASE:-{{ pxf_base_dir }}} JAVA_HOME=${JAVA_HOME:-{{ whpg_java_home }}}
+  PXF=$(command -v pxf 2>/dev/null || echo "$PXF_HOME/bin/pxf")

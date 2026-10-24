@@ -54,7 +54,13 @@
       for p in {{ whpg_data_mounts | map(attribute='path') | join(' ') }}; do
         findmnt -n -o TARGET --target "$p"
       done | sort -u | while read -r mp; do
-        echo "$mp $(df -k --output=size "$mp" | tail -n1 | tr -d ' ')"
+        # XFS 는 xfs_info 로 실제 크기 (df 는 project quota 한도를 크기로 보여 줌), 그 외 df
+        if [ "$(findmnt -n -o FSTYPE --target "$mp")" = xfs ]; then
+          kb=$(xfs_info "$mp" | sed -n 's/^data *= *bsize=\([0-9]*\) *blocks=\([0-9]*\).*/\1 \2/p' | awk '{ printf "%d", $1 * $2 / 1024 }')
+        else
+          kb=$(df -k --output=size "$mp" | tail -n1 | tr -d ' ')
+        fi
+        echo "$mp $kb"
       done
     executable: /bin/bash
   register: _dq_vol

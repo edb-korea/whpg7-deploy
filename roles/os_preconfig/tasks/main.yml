@@ -231,6 +231,10 @@
       export COORDINATOR_DATA_DIRECTORY={{ coordinator_data_dir }}
       export PGPORT={{ whpg_coordinator_port }}
       export PGDATABASE={{ whpg_database }}
+      export JAVA_HOME={{ whpg_java_home }}
+      export PXF_HOME={{ pxf_home }}
+      export PXF_BASE={{ pxf_base_dir }}
+      export PATH=$PXF_HOME/bin:$PATH
 
 # ---------- 8. gpadmin SSH 키 생성 및 무암호 로그인 ----------
 - name: gpadmin .ssh 디렉토리 생성
@@ -263,16 +267,40 @@
     key: "{{ gpadmin_pubkey['content'] | b64decode }}"
     state: present
 
-- name: SSH known_hosts 설정 (StrictHostKeyChecking 비활성화)
+# gpssh-exkeys 는 StrictHostKeyChecking=yes 로 접속하므로 known_hosts 에 호스트 키가 있어야 한다
+# (UserKnownHostsFile /dev/null 이면 "No ED25519 host key is known ... strict checking" 으로 실패)
+- name: gpadmin ssh 설정 (새 호스트 키 자동 등록)
   ansible.builtin.copy:
     dest: "{{ gpadmin_home }}/.ssh/config"
     content: |
       Host *
-        StrictHostKeyChecking no
-        UserKnownHostsFile /dev/null
+        StrictHostKeyChecking accept-new
     owner: "{{ gpadmin_user }}"
     group: "{{ gpadmin_group }}"
     mode: '0600'
+
+# 클러스터 모든 호스트의 키를 known_hosts 에 등록 (inventory 이름 / IP / 실제 hostname, 이미 있으면 건너뜀)
+- name: gpadmin known_hosts 에 클러스터 호스트 키 등록 (ssh-keyscan)
+  ansible.builtin.shell:
+    cmd: |
+      kh={{ gpadmin_home }}/.ssh/known_hosts
+      touch "$kh" && chmod 600 "$kh"
+      for h in {{ _ssh_known_names | join(' ') }}; do
+        ssh-keygen -F "$h" -f "$kh" >/dev/null 2>&1 && continue
+        keys=$(ssh-keyscan -T 5 "$h" 2>/dev/null)
+        [ -n "$keys" ] && echo "$keys" >> "$kh" && echo "added $h"
+      done
+    executable: /bin/bash
+  vars:
+    _ssh_known_names: >-
+      {{ (groups['whpg_cluster'] + groups['whpg_cluster'] | map('extract', hostvars, 'ansible_host') | list
+          + groups['whpg_cluster'] | map('extract', hostvars, 'ansible_hostname') | select('defined') | list
+          + whpg_host_aliases | default({}) | dict2items | map(attribute='value') | list)
+         | reject('equalto', '') | unique | list }}
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  register: _known_hosts
+  changed_when: _known_hosts.stdout | length > 0
 
 # ---------- 9. 로컬 YUM 레포지토리 ----------
 - name: WHPG 로컬 YUM 레포 설정
