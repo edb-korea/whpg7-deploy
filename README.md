@@ -24,6 +24,7 @@ whpg-ansible/
 │   ├── 05_pgbouncer.yml               # Phase 5: pgBouncer
 │   ├── 06_coordinator_ha.yml          # Phase 6: Coordinator HA
 │   ├── 07_wem.yml                     # Phase 7: WEM 1.4 (ClickHouse + Host Agent + otelcol, VIP 사용)
+│   ├── 08_diskquota.yml               # Phase 8: cluster 차원 diskquota (post 작업, soft 90% / hard 92%)
 │   └── ops/
 │       ├── status.yml                 # 클러스터 상태 확인
 │       ├── start.yml                  # 클러스터 시작
@@ -73,6 +74,10 @@ whpg-ansible/
     │   └── templates/
     │       ├── pgbouncer.ini.j2
     │       └── pgbouncer.service.j2
+    ├── whpg_diskquota/                # cluster diskquota (preload, CREATE EXTENSION, set_cluster_quota, hard limit 자동 전환)
+    │   ├── defaults/main.yml
+    │   ├── tasks/main.yml
+    │   └── templates/whpg_diskquota_check.sh.j2
     ├── whpg_upgrade/                  # 패키지를 repo 최신 버전으로 업그레이드 (minor upgrade 문서 절차)
     │   ├── defaults/main.yml
     │   └── tasks/main.yml
@@ -211,6 +216,9 @@ ansible-playbook playbooks/06_coordinator_ha.yml
 
 # Phase 7: WEM 1.4 (ClickHouse + Host Agent + otelcol) - HA 의 VIP 를 사용하므로 HA 이후
 ansible-playbook playbooks/07_wem.yml
+
+# Phase 8: cluster 차원 diskquota (post 작업, preload 추가 시 재시작)
+ansible-playbook playbooks/08_diskquota.yml
 ```
 
 ### 태그를 활용한 선택 실행
@@ -243,7 +251,7 @@ ansible-playbook playbooks/site.yml --check --diff
 | OS 커널 파라미터 | `/etc/sysctl.d/95-whpg.conf` | shm, vm, net 튜닝 27개 |
 | /etc/hosts | `/etc/hosts` | 클러스터 전체 호스트 자동 등록 |
 | cgroup v1 강제 사용 | `/etc/default/grub` | `systemd.unified_cgroup_hierarchy=0` |
-| gpadmin 사용자/그룹 | `/etc/passwd` | uid/gid=5000, .bashrc 환경변수 |
+| gpadmin 사용자/그룹 | `/etc/passwd` | 이미 있으면 기존 uid/gid 유지, 없으면 `gpadmin_uid` / `gpadmin_gid`(5000)로 생성, .bashrc 환경변수 |
 | SSH 무암호 로그인 | `~/.ssh/authorized_keys` | gpadmin RSA 키 전체 노드 배포 |
 | ulimits | `/etc/security/limits.d/95-gpadmin.conf` | nofile=524288, nproc=131072 |
 | 로컬 YUM 레포 | `/etc/yum.repos.d/whpg-local.repo` | 내부 레포 설정 |
@@ -525,6 +533,42 @@ core 절차 (괄호는 문서 단계 번호):
 - 변수 (`roles/whpg_upgrade/defaults/main.yml`): `whpg_upgrade_post_sql`(_optional), `whpg_upgrade_backup_binaries`, `whpg_upgrade_force`(활성 세션이 있어도 진행),
   `whpg_upgrade_restart`, `whpg_upgrade_ignore_session_users`, `whpg_upgrade_services`, `whpg_upgrade_symlinks`, `whpg_upgrade_special`
 - `playbooks/upgrade/upgrade_all.yml` / `upgrade_core.yml` / `upgrade_extensions.yml`, `playbooks/ops/minor_upgrade.yml` 은 이전 방식(`local_rpm_dir` / RPM 파일 지정)입니다.
+
+---
+
+## cluster diskquota (Phase 8, `playbooks/08_diskquota.yml`)
+
+[whpg-diskquota](https://www.enterprisedb.com/docs/supported-open-source/warehousepg/extensions/additional/diskquota/) 2.4 의
+cluster quota 로 모든 감시 DB 의 합계 사용량을 제한합니다. WHPG 구성 후 실행하는 post 작업입니다.
+
+```bash
+ansible-playbook playbooks/08_diskquota.yml --check   # 점검 + 변경 예정 사항 (변경 없음)
+ansible-playbook playbooks/08_diskquota.yml           # 설정
+ansible-playbook playbooks/08_diskquota.yml -e whpg_diskquota_soft_percent=85 -e whpg_diskquota_hard_percent=90
+```
+
+diskquota 의 cluster quota 는 값이 하나이고, soft / hard 는 같은 quota 에 대한 enforcement 방식입니다
+(soft: 넘으면 새 쓰기 거부, 항상 on / hard: `diskquota.hard_limit=on` 이면 실행 중인 쿼리도 중단, reload 로 전환).
+이를 이용해 두 기준을 다음과 같이 적용합니다.
+
+| 변수 (기본) | 적용 |
+|---|---|
+| `whpg_diskquota_soft_percent` (90) | `diskquota.set_cluster_quota(기준 용량 × 90%)` → 넘으면 모든 감시 DB 에서 새 쓰기 거부 |
+| `whpg_diskquota_hard_percent` (92) | 사용량(`show_cluster_quota_view`) ≥ 기준 용량 × 92% 이면 `diskquota.hard_limit=on` (실행 중인 쿼리도 중단), 90% 미만이면 off |
+| `whpg_diskquota_hard_mode` (auto) | `auto`: coordinator / standby 의 gpadmin cron(`whpg_diskquota_check_interval_min` 분)이 위 기준으로 on / off (active coordinator 에서만 동작, 로그 `~gpadmin/gpAdminLogs/whpg_diskquota_check.log`, syslog `whpg_diskquota`), `on` / `off`: 고정 |
+| `whpg_diskquota_capacity_gb` (0) | 기준 용량. 0 이면 segment 호스트 데이터 볼륨(`whpg_data_mounts`) 크기 합, mirror 가 있으면 ÷ 2 (diskquota 사용량은 primary 테이블 합계) |
+
+설정 순서 (문서 Installing / Using 절차):
+
+1. 모든 노드에 `edb-whpg7-diskquota`, `diskquota-2.4.so` 확인 (`diskquota_lib_version`)
+2. `createdb diskquota` (launcher DB)
+3. `shared_preload_libraries` 에 `diskquota-2.4` 추가 (기존 라이브러리 유지), `diskquota.max_monitored_databases` → 바뀐 경우에만 `gpstop -ar`
+4. 모든 사용자 DB(`whpg_diskquota_exclude_databases` 제외)에 `CREATE EXTENSION diskquota` → `init_table_size_table()`
+5. `set_cluster_quota()`, hard limit 설정 (auto 면 점검 스크립트 + cron)
+
+- 다시 실행해도 바뀐 것만 적용합니다. **새 DB 를 만들거나 클러스터 증설 / 볼륨 변경 후에는 다시 실행**하세요 (extension, 기준 용량, quota 갱신).
+- cluster quota 는 전체 합계 기준이라 특정 segment 에 데이터가 치우치면 그 디스크가 먼저 찰 수 있습니다. OS 단의 데이터 볼륨 quota(95%)가 마지막 방어선입니다.
+- 확인: `SELECT * FROM diskquota.status();`, `SELECT * FROM diskquota.show_cluster_quota_view;`
 
 ---
 

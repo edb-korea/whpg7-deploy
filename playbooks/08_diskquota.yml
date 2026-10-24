@@ -1,0 +1,19 @@
+---
+# ======================================================
+# WHPG cluster 차원 diskquota (post 작업, whpg-diskquota 2.4)
+#   soft : cluster quota = 기준 용량 × whpg_diskquota_soft_percent(90) → 넘으면 새 쓰기 거부
+#   hard : 사용량 >= 기준 용량 × whpg_diskquota_hard_percent(92) → diskquota.hard_limit on (실행 중 쿼리도 중단)
+#
+#   ansible-playbook playbooks/08_diskquota.yml --check   # 점검 + 변경 예정 사항 (변경 없음)
+#   ansible-playbook playbooks/08_diskquota.yml           # 설정 (preload 가 바뀌면 gpstop -ar 재시작)
+#   ansible-playbook playbooks/08_diskquota.yml -e whpg_diskquota_soft_percent=85 -e whpg_diskquota_hard_percent=90
+#
+#   변수: roles/whpg_diskquota/defaults/main.yml (inventory/whpg_cluster.yml 에서 override)
+#   새 DB 생성 / 증설 / 볼륨 변경 후 다시 실행
+# ======================================================
+- name: WHPG cluster diskquota
+  hosts: whpg_cluster
+  become: true
+  any_errors_fatal: true
+  roles:
+    - whpg_diskquota

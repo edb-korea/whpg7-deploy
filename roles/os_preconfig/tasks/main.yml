@@ -180,22 +180,44 @@
          '미생성 - cgroup v2가 활성화되지 않았습니다. reboot 후 재시도하세요.' }}
 
 # ---------- 7. gpadmin 사용자 / 그룹 생성 ----------
-- name: gpadmin 그룹 생성
+# 이미 있는 계정 / 그룹은 기존 uid / gid 를 그대로 쓰고 (실행 중인 프로세스, 파일 소유권 보호),
+# 없을 때만 gpadmin_uid / gpadmin_gid 로 만든다
+- name: gpadmin 기존 그룹 / 계정 조회
+  ansible.builtin.getent:
+    database: "{{ item }}"
+    key: "{{ gpadmin_group if item == 'group' else gpadmin_user }}"
+    fail_key: false
+  loop: [group, passwd]
+
+- name: gpadmin 그룹 생성 (없을 때만 gid {{ gpadmin_gid }})
   ansible.builtin.group:
     name: "{{ gpadmin_group }}"
-    gid: "{{ gpadmin_gid }}"
+    gid: "{{ omit if getent_group[gpadmin_group] | default(none) else gpadmin_gid }}"
     state: present
 
-- name: gpadmin 사용자 생성
+- name: gpadmin 사용자 생성 (없을 때만 uid {{ gpadmin_uid }})
   ansible.builtin.user:
     name: "{{ gpadmin_user }}"
-    uid: "{{ gpadmin_uid }}"
+    uid: "{{ omit if getent_passwd[gpadmin_user] | default(none) else gpadmin_uid }}"
     group: "{{ gpadmin_group }}"
     home: "{{ gpadmin_home }}"
     shell: /bin/bash
     password: "{{ gpadmin_password | password_hash('sha512') }}"
+    update_password: on_create          # 기존 계정의 비밀번호는 바꾸지 않음
     create_home: true
     state: present
+
+- name: gpadmin uid / gid 출력 (기존 계정이면 inventory 값과 다를 수 있음)
+  ansible.builtin.command: "id {{ gpadmin_user }}"
+  register: _gpadmin_id
+  changed_when: false
+  check_mode: false
+
+- name: gpadmin 계정 정보
+  ansible.builtin.debug:
+    msg: >-
+      {{ _gpadmin_id.stdout }}
+      {{ '(기존 계정 사용)' if getent_passwd[gpadmin_user] | default(none) else '(새로 생성)' }}
 
 - name: gpadmin .bashrc에 WHPG 환경변수 추가
   ansible.builtin.blockinfile:
