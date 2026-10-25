@@ -92,18 +92,41 @@
         _expand_status: "SETUP DONE"
 
 # ---------- 3. PXF 새 호스트 등록 ----------
-- name: PXF 새 호스트 등록 / 설정 동기화 / 시작
-  ansible.builtin.shell:
-    cmd: >
-      source {{ whpg_install_dir }}/greenplum_path.sh &&
-      {{ pxf_home }}/bin/pxf cluster register && {{ pxf_home }}/bin/pxf cluster sync && {{ pxf_home }}/bin/pxf cluster start 2>&1
-  become: true
-  become_user: "{{ gpadmin_user }}"
-  environment: "{{ pxf_env }}"
+# phase 1 뒤에 다시 실행해도(새 호스트가 이미 클러스터에 있음) 실행되도록 _expand_active 기준
+- name: PXF 새 호스트 준비 / 등록 / 설정 동기화 / 시작
   when:
-    - _expand_new_hosts | length > 0
+    - _expand_active | bool
     - whpg_extension_catalog | selectattr('name', 'equalto', 'pxf') | selectattr('enabled') | list | length > 0
-  changed_when: true
+  block:
+    # 새 호스트는 PXF_BASE 가 준비(pxf prepare)되지 않아 run / logs 가 없으면 pxf start 가
+    # "cannot access pid file: .../run/pxf-app.pid" 로 실패한다. pxf prepare 는 빈 PXF_BASE 에서만 동작하므로
+    # 먼저 sync 된 설정이 있으면 옆으로 옮기고 prepare (설정은 아래 pxf cluster sync 가 coordinator 에서 다시 복사)
+    - name: PXF base 준비 (prepare 되지 않은 segment 호스트, pxf prepare)
+      ansible.builtin.shell:
+        cmd: |
+          [ -d "$PXF_BASE/run" ] && exit 0
+          if [ -e "$PXF_BASE" ]; then
+            mv "$PXF_BASE" "${PXF_BASE}_unprepared_$(date +%Y%m%d%H%M%S)" && echo "moved: $PXF_BASE"
+          fi
+          {{ pxf_home }}/bin/pxf prepare >/dev/null && echo "prepared: $PXF_BASE"
+        executable: /bin/bash
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ pxf_env }}"
+      delegate_to: "{{ item }}"
+      loop: "{{ segment_hosts }}"
+      register: _pxf_prepare
+      changed_when: "'prepared' in _pxf_prepare.stdout"
+
+    - name: PXF 등록 / 설정 동기화 / 시작 (pxf cluster register / sync / start)
+      ansible.builtin.shell:
+        cmd: >
+          source {{ whpg_install_dir }}/greenplum_path.sh &&
+          {{ pxf_home }}/bin/pxf cluster register && {{ pxf_home }}/bin/pxf cluster sync && {{ pxf_home }}/bin/pxf cluster start 2>&1
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ pxf_env }}"
+      changed_when: true
 
 # ---------- 4. 테이블 재분배 (gpexpand phase 2) ----------
 - name: 테이블 재분배 (gpexpand)
@@ -123,6 +146,7 @@
   when:
     - expand_redistribute | bool
     - _expand_status in ['SETUP DONE', 'EXPANSION STARTED', 'EXPANSION STOPPED']
+    - not ansible_check_mode   # async 는 --check 에서 실행할 수 없음
 
 - name: 재분배 결과
   ansible.builtin.debug:
