@@ -3,6 +3,7 @@
   입력: _expand_new_hosts (현재 클러스터에 없는 [segments] 호스트. 기존 2 / 3대면 합계 4대까지, 이후 4대 단위)
         _expand_hosts (증설 후 전체 호스트 순서 = 기존 호스트(클러스터 content 순서) + 새 호스트, tasks/plan.yml)
         _expand_max_content / _expand_max_dbid (현재 최대값)
+        hostname 열: 새 호스트는 _expand_hostname(tasks/prepare.yml), 기존 호스트는 _expand_seg_hostnames(tasks/plan.yml, 등록된 hostname)
 
   primary : 새 호스트 순서 × k(0..K-1) 순서로 content 부여, primary_data_dirs[k], 포트 whpg_port_base + k
   mirror  : roles/whpg_init/templates/gpaddmirrors_config.j2 와 같은 규칙
@@ -34,7 +35,7 @@
 {%       set c = first + i * K + k %}
 {%       set mh = _expand_hosts[base + (h - base + k % (S - 1) + 1) % S] %}
 {%       set ns.dbid = ns.dbid + 1 %}
-{{ hostvars[mh]._expand_hostname }}|{{ mh }}|{{ whpg_mirror_port_base | int + k }}|{{ mirror_data_dirs[k] }}/{{ whpg_seg_prefix }}{{ c }}|{{ ns.dbid }}|{{ c }}|m
+{{ hostvars[mh]._expand_hostname | default(_expand_seg_hostnames[mh]) }}|{{ mh }}|{{ whpg_mirror_port_base | int + k }}|{{ mirror_data_dirs[k] }}/{{ whpg_seg_prefix }}{{ c }}|{{ ns.dbid }}|{{ c }}|m
 {%     endfor %}
 {%   endfor %}
 {% endif %}

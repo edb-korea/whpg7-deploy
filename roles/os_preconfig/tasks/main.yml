@@ -143,8 +143,14 @@
       # cgroup2 파일시스템이 마운트된 경우에만 실행
       ExecCondition=bash -c '[ xcgroup2fs = x$(stat -fc "%%T" /sys/fs/cgroup) ] || exit 1'
 
+      # 최상위 cgroup.procs 를 gpadmin 이 쓸 수 있어야 한다: postmaster 가 ssh 세션의 cgroup(user.slice)에서
+      # {{ whpg_cgroup_dir }} 아래로 자신을 옮길 때 공통 조상(/sys/fs/cgroup)의 cgroup.procs 쓰기 권한이 필요
+      # (없으면 "can't write data to file '.../queries/cgroup.procs': Permission denied" 로 segment 시작 실패)
+      # /sys/fs/cgroup 은 재부팅 때마다 초기화되므로 이 서비스가 매번 다시 설정한다
       ExecStart=bash -ec '\
         echo "{{ whpg_cgroup_controllers }}" > /sys/fs/cgroup/cgroup.subtree_control; \
+        chown {{ gpadmin_user }}:{{ gpadmin_group }} /sys/fs/cgroup/cgroup.procs; \
+        chmod 660 /sys/fs/cgroup/cgroup.procs; \
         mkdir -p {{ whpg_cgroup_dir }}; \
         chown -R {{ gpadmin_user }}:{{ gpadmin_group }} {{ whpg_cgroup_dir }}; \
         echo "{{ whpg_cgroup_controllers }}" > {{ whpg_cgroup_dir }}/cgroup.subtree_control; \
@@ -152,6 +158,7 @@
 
       [Install]
       WantedBy=multi-user.target
+  register: _gpdb_service_unit
 
 - name: "{{ whpg_cgroup_service_name }}.service systemd 데몬 리로드 및 활성화"
   ansible.builtin.systemd:
@@ -160,10 +167,11 @@
     daemon_reload: true
   ignore_errors: "{{ ansible_check_mode }}"  # check 모드에서는 유닛 파일이 생성되지 않음
 
+# 유닛 파일이 바뀌었으면 다시 실행 (oneshot + RemainAfterExit 라 started 만으로는 재실행되지 않음)
 - name: "{{ whpg_cgroup_service_name }}.service 즉시 실행 (현재 세션에 cgroup 적용)"
   ansible.builtin.systemd:
     name: "{{ whpg_cgroup_service_name }}.service"
-    state: started
+    state: "{{ 'restarted' if _gpdb_service_unit is changed else 'started' }}"
   register: _gpdb_service_start
   failed_when: false  # cgroup2 미활성 환경에서는 ExecCondition 실패 허용
 

@@ -25,6 +25,30 @@
   changed_when: false
   check_mode: false
 
+# gpexpand 입력 파일의 hostname 열: 새 mirror 가 기존 호스트에 놓일 때 기존 호스트의 등록된 hostname 사용
+# (새 호스트는 tasks/prepare.yml 의 _expand_hostname)
+- name: 기존 segment 호스트의 hostname 조회 (address → hostname)
+  ansible.builtin.shell:
+    cmd: >
+      source {{ whpg_install_dir }}/greenplum_path.sh &&
+      psql -d postgres -At -F '|' -c
+      "SELECT DISTINCT address, hostname FROM gp_segment_configuration WHERE content >= 0"
+  become: true
+  become_user: "{{ gpadmin_user }}"
+  environment: "{{ whpg_env }}"
+  register: _seg_hostnames_q
+  changed_when: false
+  check_mode: false
+
+- name: 기존 segment 호스트 hostname 저장
+  ansible.builtin.set_fact:
+    _expand_seg_hostnames: >-
+      {%- set d = {} -%}
+      {%- for l in _seg_hostnames_q.stdout_lines if '|' in l -%}
+      {%-   set _ = d.update({l.split('|')[0]: l.split('|')[1]}) -%}
+      {%- endfor -%}
+      {{ d }}
+
 - name: gpexpand 진행 상태 조회 (postgres DB 의 gpexpand.status)
   ansible.builtin.shell:
     # 테이블 이름은 파싱 시점에 확인되므로 CASE 로 감쌀 수 없음 → 존재 여부를 먼저 따로 조회
@@ -67,6 +91,10 @@
     _expand_new_hosts: "{{ segment_hosts | reject('in', _existing_hosts) | list }}"
     # 증설 후 전체 호스트 순서 (mirror 그룹 기준): inventory 순서가 아니라 현재 클러스터 기준
     _expand_hosts: "{{ _existing_hosts + (segment_hosts | reject('in', _existing_hosts) | list) }}"
+    # 이번 실행에서 증설 작업(새 호스트 추가 또는 진행 중인 gpexpand 이어서)이 있는지.
+    # gpexpand phase 1 뒤에 다시 실행하면 새 호스트가 이미 클러스터에 들어가 _expand_new_hosts 가 비므로,
+    # PXF / WEM 처럼 phase 1 이후 단계는 이 값으로 실행 여부를 정한다
+    _expand_active: "{{ (segment_hosts | reject('in', _existing_hosts) | list | length > 0) or _expand_status != 'NONE' }}"
     # 기존 segment 호스트가 2 / 3대 (whpg_mirror_group_size 미만) → 4대까지 증설 + mirror 재배치
     _expand_small: "{{ _existing_hosts | length < whpg_mirror_group_size | int }}"
 

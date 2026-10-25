@@ -88,4 +88,5 @@
   ansible.builtin.import_playbook: ../07_wem.yml
   when:
     - wem_enabled | default(true) | bool
-    - hostvars[coordinator_host]._expand_new_hosts | default([]) | length > 0
+    # 새 호스트가 있거나 진행 중인 gpexpand 를 이어서 할 때 (phase 1 뒤 재실행 시 _expand_new_hosts 는 빔)
+    - hostvars[coordinator_host]._expand_active | default(false) | bool
