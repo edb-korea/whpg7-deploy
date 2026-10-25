@@ -1,0 +1,15 @@
+---
+# ======================================================
+# 시간대 설정 (os_timezone, 예: Asia/Seoul). tasks/main.yml 13-1 에서 사용
+#   클러스터 노드끼리 시간대가 다르면 OS 로그 / cron / WEM agent 로그 시각이 어긋난다
+#   (DB 의 timezone / log_timezone 은 postgresql.conf 값이라 영향 없음)
+# ======================================================
+- name: 현재 시간대 조회
+  ansible.builtin.command: timedatectl show -p Timezone --value
+  register: _os_tz
+  changed_when: false
+  check_mode: false
+
+- name: "시간대 설정 ({{ os_timezone }})"
+  ansible.builtin.command: "timedatectl set-timezone {{ os_timezone }}"
+  when: (_os_tz.stdout | trim) != os_timezone
