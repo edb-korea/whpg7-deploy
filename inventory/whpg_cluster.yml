@@ -29,7 +29,7 @@ wem_host: "{{ groups['wem_node'] | first }}"
 # ------------------------------------------
 # 설치할 Core 버전. local_rpm_dir 에서 패키지명 + 버전이 일치하는 RPM 을 찾음
 # (예: warehouse-pg-7-7.5.0_WHPG-1.el9.x86_64.rpm), 없으면 dnf 로 같은 버전 설치
-whpg_version: "7.5.0"
+whpg_version: "7.6.1"
 whpg_core_pkg_name: "warehouse-pg-7"                     # Core 패키지명 (RPM NAME)
 whpg_ext_pkg_prefix: "edb-whpg7"                         # Extension 패키지 접두어
 
@@ -315,7 +315,7 @@ whpg_extension_catalog:
 # 비밀번호는 inventory/vault.yml (vault_wem_admin_password, vault_clickhouse_password, vault_wem_whpg_password)
 # ------------------------------------------
 wem_enabled: true
-wem_version: "1.4.0"              # 설치할 whpg-enterprise-manager 버전
+wem_version: "1.5.0"              # 설치할 whpg-enterprise-manager 버전
 # wem_port: 8080                    # WEM 웹 포트 (Host Agent 포트는 +1)
 # wem_use_vip: true                 # 기본: coordinator_ha_enabled 값. true 면 WEM 이 coordinator_vip 로 WHPG 접속
 # wem_state_install: false          # true: WEM host 에 별도 상태 DB(PostgreSQL 5433) 설치

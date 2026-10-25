@@ -438,6 +438,11 @@
     line: "MaxSessions {{ sshd_max_sessions }}"
   notify: restart_sshd
 
+# ---------- 13-1. 시간대 (모든 노드 같게: OS 로그 / cron / WEM agent 로그 시각) ----------
+- name: 시간대 설정
+  ansible.builtin.include_tasks: timezone.yml
+  when: os_timezone | default('') | length > 0
+
 # ---------- 14. NTP (chrony) 설정 ----------
 - name: chrony 설치
   ansible.builtin.package:

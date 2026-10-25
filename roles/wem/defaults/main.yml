@@ -179,6 +179,8 @@ clickhouse_packages:
 # WEM 패키지 (버전 고정. local_rpm_dir 에 여러 버전이 있어도 이 버전을 설치)
 wem_pkg_name: "whpg-enterprise-manager"
 wem_version: "1.4.0"
+# wem.conf 기본 경로 / 그룹. 실제로는 wem.service 의 EnvironmentFile / Group 을 따른다 (tasks/06-wem.yml)
+#   1.4: /etc/wem/wem.conf, 1.5: /etc/edb/wem/wem.conf (User / Group = wem)
 wem_config_file: "/etc/wem/wem.conf"
 # wem.conf 의 그룹 (WEM 서비스가 읽을 수 있어야 함)
 wem_unix_group: "{{ gpadmin_user }}"
