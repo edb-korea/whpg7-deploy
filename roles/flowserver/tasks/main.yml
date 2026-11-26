@@ -53,23 +53,23 @@
     - name: flow_server.json 배포 ({{ flowserver_conf_file }})
       ansible.builtin.copy:
         dest: "{{ flowserver_conf_file }}"
-        content: "{{ _conf | to_nice_json(indent=4) }}\n"
+        content: "{{ _conf | to_nice_json(indent=4, sort_keys=false) }}\n"
         owner: "{{ gpadmin_user }}"
         group: "{{ gpadmin_group }}"
         mode: '0640'
       vars:
         _conf: >-
-          {%- set c = {
-                'Host': flowserver_listen_host, 'Port': flowserver_port | int,
+          {#- 키 순서는 EDB 샘플과 같게: Host, Port, Gpfdist, Prometheus, DebugPort, Logging -#}
+          {%- set c = {'Host': flowserver_listen_host, 'Port': flowserver_port | int,
                 'Gpfdist': {'Host': flowserver_gpfdist_host, 'Port': flowserver_gpfdist_port | int,
-                            'ReuseTables': flowserver_gpfdist_reuse_tables | bool},
-                'Logging': {'SplitLogByJob': flowserver_log_split_by_job | bool,
-                            'FrontendLevel': flowserver_log_frontend_level, 'BackendLevel': flowserver_log_backend_level}} -%}
+                            'ReuseTables': flowserver_gpfdist_reuse_tables | bool}} -%}
           {%- if flowserver_prometheus_enabled | bool -%}
           {%- set _ = c.update({'Prometheus': {'Host': flowserver_prometheus_host, 'Port': flowserver_prometheus_port | int,
                                                'MetricsPath': flowserver_prometheus_path}}) -%}
           {%- endif -%}
           {%- if flowserver_debug_port | int > 0 -%}{%- set _ = c.update({'DebugPort': flowserver_debug_port | int}) -%}{%- endif -%}
+          {%- set _ = c.update({'Logging': {'SplitLogByJob': flowserver_log_split_by_job | bool,
+                'FrontendLevel': flowserver_log_frontend_level, 'BackendLevel': flowserver_log_backend_level}}) -%}
           {{ c }}
       notify: restart_flowserver
 

@@ -607,7 +607,7 @@ ansible-playbook playbooks/09_flowserver.yml --check --diff   # 변경 예정 �
 ansible-playbook playbooks/09_flowserver.yml                  # 구성 / 잡 제출
 ```
 
-1. `~gpadmin/flowserver/flow_server.json` (FlowServer 6060, gpfdist 6070, 선택: Prometheus / DebugPort, Logging)
+1. `~gpadmin/flowserver/flow_server.json` (EDB 샘플 기준: FlowServer 6060, gpfdist 6070 / Host = `flowserver_gpfdist_host` (기본 coordinator IP), Prometheus 9080 `/flow_metrics`, DebugPort 6080, Logging debug / info)
 2. 잡 YAML: `flowserver_jobs` 의 `template` 을 렌더링해 `~gpadmin/flowserver/jobs/<name>.yaml` (0600, DB 비밀번호는 vault 변수)
 3. systemd `flowserver` 서비스 (gpadmin, 부팅 시 자동 시작, 로그 `~gpadmin/gpAdminLogs`)
    - 시작할 때마다 `submit_jobs.sh` 가 등록되지 않은 잡을 제출 (`start: true` 면 `-s`). 서버 재시작 후 잡 재제출이 필요하기 때문

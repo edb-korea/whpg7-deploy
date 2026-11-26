@@ -317,6 +317,9 @@ whpg_extension_catalog:
 flowserver_host: "{{ coordinator_host }}"
 flowserver_port: 6060              # FlowCLI → FlowServer
 flowserver_gpfdist_port: 6070      # segment → FlowServer (gpfdist, HTTP)
+# flow_server.json 의 Gpfdist.Host: segment 가 gpfdist 로 접속할 IP (기본 coordinator IP)
+#   flowserver_host 를 바꾸면 이 값도 그 호스트 IP 로 변경 (예: "{{ hostvars[standby_coordinator_host].ansible_host }}" 또는 "10.0.3.8")
+flowserver_gpfdist_host: "{{ hostvars[coordinator_host].ansible_host }}"
 flowserver_jobs: []
 #  - { name: orders_kafka, template: "{{ inventory_dir }}/flowserver_jobs/orders_kafka.yaml.j2", start: true }
 
