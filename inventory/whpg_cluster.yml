@@ -267,7 +267,7 @@ install_pgaa: false
 install_pgvector: true
 install_vectorplus: false           # pgvector 기반 ivfplus 인덱스 (install_pgvector 필요)
 install_utl_raw: false              # Oracle UTL_RAW 호환 (orafce extension 필요 - 레포에 없음)
-install_flowserver: false
+install_flowserver: true
 
 # ------------------------------------------
 # Extension 카탈로그 (설치 + 업그레이드 playbook 공용)
