@@ -242,7 +242,8 @@ whpg_diskquota_hard_mode: auto       # auto: 사용량에 따라 cron 이 on / o
 whpg_diskquota_capacity_gb: 0
 
 # PXF 경로 (edb-whpg7-pxf RPM 설치 경로 / 설정 base 디렉토리). gpadmin .bashrc 에 PXF_HOME, PXF_BASE, PATH 로 등록
-pxf_home: /usr/local/edb-whpg7-pxf
+#   edb-whpg7-pxf 6.10.4 부터 /usr/edb/whpg7-pxf (이전 버전은 /usr/local/edb-whpg7-pxf)
+pxf_home: /usr/edb/whpg7-pxf
 pxf_base_dir: "{{ gpadmin_home }}/pxf"
 # PXF / pljava 용 JAVA_HOME (RHEL 의 버전 고정 링크, java 마이너 업데이트에도 경로 유지). gpadmin .bashrc 에도 등록
 whpg_java_home: /usr/lib/jvm/jre-17
