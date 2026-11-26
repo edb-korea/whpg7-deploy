@@ -1,0 +1,10 @@
+---
+# 방금 처음 시작했으면(설정 반영됨) 다시 재시작하지 않음. --check 에서는 unit 파일이 없으므로 건너뜀
+- name: restart_flowserver
+  ansible.builtin.systemd:
+    name: "{{ flowserver_service_name }}"
+    state: restarted
+    daemon_reload: true
+  when:
+    - not ansible_check_mode
+    - _fs_started is not changed

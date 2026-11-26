@@ -1,0 +1,44 @@
+---
+# ======================================================
+# flowserver role 기본값 (playbooks/09_flowserver.yml)
+# 실행 여부(install_flowserver), 실행 호스트 / 포트 / 잡은 inventory/whpg_cluster.yml 에서 지정
+# 참고: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/flowserver/
+# ======================================================
+
+# FlowServer 를 실행할 호스트 (whpg7-flow-server RPM 은 04_extensions.yml 이 모든 노드에 설치)
+flowserver_host: "{{ coordinator_host }}"
+
+flowserver_service_name: flowserver
+flowserver_bin: "{{ whpg_install_dir }}/bin/flowserver"
+flowserver_cli: "{{ whpg_install_dir }}/bin/flowcli"
+
+# 설정 / 잡 / 로그 디렉토리 (gpadmin 소유)
+flowserver_dir: "{{ gpadmin_home }}/flowserver"
+flowserver_conf_file: "{{ flowserver_dir }}/flow_server.json"
+flowserver_jobs_dir: "{{ flowserver_dir }}/jobs"
+flowserver_log_dir: "{{ gpadmin_home }}/gpAdminLogs"
+
+# flow_server.json (기본값은 문서 기준)
+flowserver_listen_host: ""             # "" = 모든 인터페이스
+flowserver_port: 6060                  # FlowCLI → FlowServer (gRPC)
+flowserver_gpfdist_host: ""            # segment 가 HTTP 로 접속하는 gpfdist (""= 모든 인터페이스)
+flowserver_gpfdist_port: 6070
+flowserver_gpfdist_reuse_tables: false # true: 설정값 해시 이름의 외부 테이블 재사용 / false: 잡 시작마다 drop + create
+flowserver_prometheus_enabled: false
+flowserver_prometheus_host: ""
+flowserver_prometheus_port: 9080
+flowserver_prometheus_path: /metrics
+flowserver_debug_port: 0               # 0 = debug(pprof) 서버 끄기
+flowserver_log_split_by_job: true
+flowserver_log_frontend_level: info    # debug / info / warn / error / fatal
+flowserver_log_backend_level: debug
+
+# 잡 (빈 목록이면 서버만 구성)
+#   name     : 잡 이름 (flowcli submit -n)
+#   template : 잡 설정 YAML 템플릿 (Controller 경로, Jinja2 → vault 변수 사용 가능)
+#   start    : true 면 제출 후 시작 (flowcli submit -s, 기본 true)
+# 서비스가 시작될 때마다(재부팅 / 재시작 / 업그레이드 후) 등록되지 않은 잡을 다시 제출한다
+flowserver_jobs: []
+
+# firewalld 가 실행 중이면 FlowServer / gpfdist (/ Prometheus) 포트 개방
+flowserver_manage_firewall: true

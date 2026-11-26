@@ -42,6 +42,8 @@ whpg_upgrade_post_sql_optional: false   # true: 7.6.1 선택 항목(문서 33 �
 whpg_upgrade_services:
   - "{{ pgbouncer_service_name | default('pgbouncer') }}"
   - wem
+# FlowServer systemd 서비스 (roles/flowserver). 실행 중이면 core / flowserver 업그레이드 시 정지 → 시작 (시작 시 잡 자동 재제출)
+whpg_upgrade_flowserver_service: "{{ flowserver_service_name | default('flowserver') }}"
 # core 업그레이드 시 gpadmin crontab 을 백업 / 제거 후 복원할 호스트
 whpg_upgrade_cron_hosts: "{{ groups['coordinator'] + groups['standby_coordinator'] | default([]) }}"
 # 확인할 symlink (모두 whpg_real_install_dir 를 가리켜야 함, 없으면 생성)

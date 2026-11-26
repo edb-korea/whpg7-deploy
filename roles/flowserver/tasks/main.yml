@@ -1,0 +1,173 @@
+---
+# ======================================================
+# Role: flowserver
+# FlowServer(Kafka / RabbitMQ → WHPG 적재) 를 flowserver_host 에 systemd 서비스로 구성하고 잡을 제출
+#   RPM(whpg7-flow-server) 은 04_extensions.yml 이 install_flowserver 일 때 모든 노드에 설치
+#   (FlowServer 가 gpfdist 를 열고 segment 가 HTTP 로 가져가므로 FlowServer 호스트에서만 실행하면 됨)
+# 참고: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/flowserver/installing/
+# ======================================================
+
+- name: FlowServer 구성 (flowserver_host)
+  when: inventory_hostname == flowserver_host
+  block:
+    - name: FlowServer 바이너리 확인 ({{ flowserver_bin }})
+      ansible.builtin.stat:
+        path: "{{ flowserver_bin }}"
+      register: _fs_bin
+
+    - name: FlowServer 미설치 시 중단
+      ansible.builtin.fail:
+        msg: >-
+          {{ flowserver_bin }} 가 없습니다. install_flowserver: true 로 두고
+          ansible-playbook playbooks/04_extensions.yml 로 whpg7-flow-server 를 먼저 설치하세요.
+      when: not _fs_bin.stat.exists and not ansible_check_mode
+
+    - name: 잡 정의 확인 (name / template)
+      ansible.builtin.assert:
+        that:
+          - flowserver_jobs | map(attribute='name') | select('match', '^[A-Za-z0-9_.-]+$') | list | length == flowserver_jobs | length
+          - flowserver_jobs | map(attribute='name') | unique | list | length == flowserver_jobs | length
+          - flowserver_jobs | selectattr('template', 'undefined') | list | length == 0
+        fail_msg: "flowserver_jobs 의 각 항목은 고유한 name(영문/숫자/_.-) 과 template 이 필요합니다: {{ flowserver_jobs }}"
+        quiet: true
+
+    - name: FlowServer 디렉토리 생성
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0750'
+      loop:
+        - "{{ flowserver_dir }}"
+        - "{{ flowserver_jobs_dir }}"
+
+    # gpAdminLogs 는 다른 gp 도구와 같이 쓰므로 권한은 그대로 두고 없을 때만 생성
+    - name: 로그 디렉토리 확인 ({{ flowserver_log_dir }})
+      ansible.builtin.file:
+        path: "{{ flowserver_log_dir }}"
+        state: directory
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+
+    - name: flow_server.json 배포 ({{ flowserver_conf_file }})
+      ansible.builtin.copy:
+        dest: "{{ flowserver_conf_file }}"
+        content: "{{ _conf | to_nice_json(indent=4) }}\n"
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0640'
+      vars:
+        _conf: >-
+          {%- set c = {
+                'Host': flowserver_listen_host, 'Port': flowserver_port | int,
+                'Gpfdist': {'Host': flowserver_gpfdist_host, 'Port': flowserver_gpfdist_port | int,
+                            'ReuseTables': flowserver_gpfdist_reuse_tables | bool},
+                'Logging': {'SplitLogByJob': flowserver_log_split_by_job | bool,
+                            'FrontendLevel': flowserver_log_frontend_level, 'BackendLevel': flowserver_log_backend_level}} -%}
+          {%- if flowserver_prometheus_enabled | bool -%}
+          {%- set _ = c.update({'Prometheus': {'Host': flowserver_prometheus_host, 'Port': flowserver_prometheus_port | int,
+                                               'MetricsPath': flowserver_prometheus_path}}) -%}
+          {%- endif -%}
+          {%- if flowserver_debug_port | int > 0 -%}{%- set _ = c.update({'DebugPort': flowserver_debug_port | int}) -%}{%- endif -%}
+          {{ c }}
+      notify: restart_flowserver
+
+    # 잡 YAML 에는 DB 비밀번호가 평문으로 들어가므로 0600 (템플릿에서 vault 변수 사용)
+    - name: 잡 설정 배포 ({{ flowserver_jobs_dir }}/<name>.yaml)
+      ansible.builtin.template:
+        src: "{{ item.template }}"
+        dest: "{{ flowserver_jobs_dir }}/{{ item.name }}.yaml"
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0600'
+      loop: "{{ flowserver_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: _fs_job_files
+
+    - name: 잡 제출 스크립트 배포
+      ansible.builtin.template:
+        src: submit_jobs.sh.j2
+        dest: "{{ flowserver_dir }}/submit_jobs.sh"
+        owner: "{{ gpadmin_user }}"
+        group: "{{ gpadmin_group }}"
+        mode: '0750'
+
+    - name: FlowServer systemd 서비스 등록
+      ansible.builtin.template:
+        src: flowserver.service.j2
+        dest: "/etc/systemd/system/{{ flowserver_service_name }}.service"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart_flowserver
+
+    - name: FlowServer 포트 개방 (firewalld 실행 중인 경우만)
+      ansible.builtin.shell:
+        cmd: |
+          if systemctl is-active --quiet firewalld; then
+            for p in {{ _ports | join(' ') }}; do
+              firewall-cmd --permanent --query-port=${p}/tcp >/dev/null || { firewall-cmd --permanent --add-port=${p}/tcp >/dev/null; echo "opened $p"; }
+            done
+            firewall-cmd --reload >/dev/null
+          fi
+        executable: /bin/bash
+      vars:
+        _ports: "{{ [flowserver_port, flowserver_gpfdist_port] + ([flowserver_prometheus_port] if flowserver_prometheus_enabled | bool else []) }}"
+      register: _fs_fw
+      changed_when: "'opened' in _fs_fw.stdout"
+      when: flowserver_manage_firewall | bool
+
+    - name: FlowServer 서비스 시작 / 부팅 시 자동 시작
+      ansible.builtin.systemd:
+        name: "{{ flowserver_service_name }}"
+        state: started
+        enabled: true
+        daemon_reload: true
+      register: _fs_started
+      ignore_errors: "{{ ansible_check_mode }}"   # --check 에서는 unit 파일이 아직 없음
+
+    - name: 설정 변경 시 재시작
+      ansible.builtin.meta: flush_handlers
+
+    # 서비스 시작 시 ExecStartPost 로도 제출하지만, 결과 확인 / 새로 추가한 잡 제출을 위해 한 번 더 실행 (등록된 잡은 건너뜀)
+    - name: 잡 제출 (등록되지 않은 잡만)
+      ansible.builtin.command: "{{ flowserver_dir }}/submit_jobs.sh"
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      register: _fs_submit
+      changed_when: "'SUBMITTED' in _fs_submit.stdout"
+      failed_when: _fs_submit.rc != 0
+      when: not ansible_check_mode
+
+    - name: 잡 목록 조회
+      ansible.builtin.command: "{{ flowserver_cli }} --port {{ flowserver_port }} --log-dir {{ flowserver_log_dir }} list"
+      become: true
+      become_user: "{{ gpadmin_user }}"
+      register: _fs_list
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: FlowServer Summary
+      ansible.builtin.debug:
+        msg: >-
+          {%- set out = ['FlowServer: ' ~ inventory_hostname ~ ':' ~ flowserver_port ~ ' (gpfdist ' ~ flowserver_gpfdist_port ~ ')'
+                ~ ', 서비스 ' ~ flowserver_service_name ~ ', 설정 ' ~ flowserver_conf_file ~ ', 로그 ' ~ flowserver_log_dir] -%}
+          {%- if _fs_submit.stdout_lines is defined -%}
+          {%- for l in _fs_submit.stdout_lines -%}{%- set _ = out.append('  ' ~ l) -%}{%- endfor -%}
+          {%- endif -%}
+          {%- if not flowserver_jobs -%}{%- set _ = out.append('  잡 없음 (flowserver_jobs 에 추가 후 다시 실행)') -%}{%- endif -%}
+          {%- set changed = _fs_job_files.results | default([]) | selectattr('changed') | map(attribute='item.name') | list -%}
+          {%- set existing = (_fs_submit.stdout_lines | default([])) | select('match', '^EXISTS ') | map('regex_replace', '^EXISTS ', '') | list -%}
+          {%- set stale = changed | select('in', existing) | list -%}
+          {%- if stale -%}
+          {%- set _ = out.append('  ! 설정이 바뀐 기존 잡: ' ~ stale | join(', ') ~ ' → 직접 반영: flowcli stop <name>; flowcli remove <name>'
+                ~ ' (Kafka consumer group 도 삭제되어 offset 초기화); flowcli submit -s -n <name> ' ~ flowserver_jobs_dir ~ '/<name>.yaml') -%}
+          {%- endif -%}
+          {%- if _fs_list.stdout_lines is defined -%}
+          {%- set _ = out.append('flowcli list:') -%}
+          {%- for l in _fs_list.stdout_lines -%}{%- set _ = out.append('  ' ~ l) -%}{%- endfor -%}
+          {%- endif -%}
+          {{ out }}

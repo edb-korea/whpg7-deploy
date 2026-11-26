@@ -1,0 +1,28 @@
+# FlowServer 잡 예시 (Kafka JSON → WHPG 테이블). inventory/flowserver_jobs/ 등에 복사해 수정 후
+# flowserver_jobs: [{ name: orders_kafka, template: "{{ '{{' }} inventory_dir {{ '}}' }}/flowserver_jobs/orders_kafka.yaml.j2" }]
+# 형식: https://www.enterprisedb.com/docs/supported-open-source/warehousepg/flowserver/loading/config_file/
+version: v1.0
+source:
+  kafka:
+    brokers:
+      - kafka1.example.com:9092
+    topic: orders
+    value:
+      json:
+        column:
+          name: data
+          type: json
+target:
+  database:
+    host: {{ coordinator_vip if coordinator_ha_enabled | default(false) | bool else coordinator_host }}
+    port: {{ whpg_coordinator_port }}
+    user: {{ gpadmin_user }}
+    password: "{{ vault_flowserver_db_password | default('CHANGE_ME') }}"
+    dbname: {{ whpg_database }}
+    tables:
+      - table: orders_raw
+        schema: public
+        mode:
+          insert: {}
+        mapping:
+          data: data
