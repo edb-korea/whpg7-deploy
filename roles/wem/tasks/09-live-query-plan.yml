@@ -1,0 +1,237 @@
+---
+# WEM 1.6 이상: edb-whpg7-live-query-plan 설치와 whpg_live_query_plan extension 생성
+# tag: liveplan, upgrade (기본 실행과 -t upgrade 에서 모두 실행)
+#
+# WEM host 의 whpg-enterprise-manager 가 wem_live_query_plan_min_version(1.6) 이상일 때만 수행한다.
+#   1) 모든 노드에 edb-whpg7-live-query-plan rpm 설치
+#   2) coordinator 에서 gpconfig 로 shared_preload_libraries 에 whpg_live_query_plan 추가, gp_enable_query_metrics=on
+#   3) 지금 실행 중인 값에 반영되어 있지 않으면 WHPG 클러스터 재시작 (gpstop -ar, 실행 중인 세션은 끊긴다)
+#   4) wem_live_query_plan_databases 에 CREATE EXTENSION IF NOT EXISTS whpg_live_query_plan
+# 이미 반영되어 있으면 재시작하지 않는다.
+
+# ---------------------------------------------------------------------------
+# WEM 버전 확인 (WEM host)
+#   --check 에서 설치 / 업그레이드가 예정되어 있으면 실제 설치된 버전 대신 예정 버전으로 판단한다
+# ---------------------------------------------------------------------------
+- name: Check WEM version for live query plan
+  ansible.builtin.command: rpm -q --qf '%{VERSION}' whpg-enterprise-manager
+  register: _lqp_wem_rpm
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: inventory_hostname == wem_host
+
+- name: Decide WEM version for live query plan
+  ansible.builtin.set_fact:
+    _lqp_wem_ver: >-
+      {{ (_upg_wem_target | regex_search('^[0-9][0-9.]*') or '0')
+           if (ansible_check_mode and (_upg_wem | default({})) is changed and _upg_wem_target | length > 0)
+         else ((wem_version | regex_search('^[0-9][0-9.]*') or '0')
+           if (ansible_check_mode and (_wem_pkg_changed | default(false) | bool))
+         else (((_lqp_wem_rpm.stdout | trim) if _lqp_wem_rpm.rc == 0 else '') | regex_search('^[0-9][0-9.]*') or '0')) }}
+  vars:
+    # upgrade.yml 의 _upg_targets: "whpg-enterprise-manager 1.5.0-1.el9 -> 1.6.0-1.el9"
+    _upg_wem_target: >-
+      {{ (_upg_targets | default([]) | select('match', '^whpg-enterprise-manager ') | first | default(''))
+         | regex_replace('^.*-> *', '') }}
+  when: inventory_hostname == wem_host
+
+- name: Decide whether live query plan applies
+  ansible.builtin.set_fact:
+    _lqp_enabled: >-
+      {{ (wem_live_query_plan | bool)
+         and (hostvars[wem_host]['_lqp_wem_ver'] | default('0')) is version(wem_live_query_plan_min_version, '>=') }}
+
+- name: Show live query plan decision
+  ansible.builtin.debug:
+    msg: >-
+      WEM {{ hostvars[wem_host]['_lqp_wem_ver'] | default('미설치') }}:
+      {{ ('live query plan 구성 (' ~ live_query_plan_package ~ ', extension ' ~ live_query_plan_extension ~ ')')
+         if (_lqp_enabled | bool)
+         else ('건너뜀 (wem_live_query_plan=false)' if not (wem_live_query_plan | bool)
+               else ('건너뜀 (WEM ' ~ wem_live_query_plan_min_version ~ ' 미만)')) }}
+  run_once: true
+
+- name: Configure live query plan (WEM 1.6 이상)
+  when: _lqp_enabled | bool
+  block:
+    # -----------------------------------------------------------------------
+    # 1) rpm 설치 (모든 노드). 한 노드라도 실패하면 preload 설정 전에 중단된다 (any_errors_fatal)
+    #    Controller 의 local_rpm_dir 우선 → dnf fallback
+    # -----------------------------------------------------------------------
+    - name: Check whether the live query plan package is installed
+      ansible.builtin.command: rpm -q {{ live_query_plan_package }}
+      register: _lqp_rpm_q
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Install live query plan package
+      ansible.builtin.include_role:
+        name: rpm_install
+      vars:
+        rpm_pkg_name: "{{ live_query_plan_package }}"
+        rpm_pkg_version: "{{ live_query_plan_version }}"
+      when: _lqp_rpm_q.rc != 0 or (live_query_plan_version | length > 0)
+
+    # -----------------------------------------------------------------------
+    # 2) GUC 설정 (coordinator)
+    # -----------------------------------------------------------------------
+    - name: Configure WHPG for live query plan
+      when: inventory_hostname == coordinator_host
+      become_user: "{{ gpadmin_user }}"
+      environment: "{{ whpg_env }}"
+      block:
+        # 라이브러리가 없는 세그먼트 호스트가 하나라도 있으면 preload 후 그 세그먼트가 기동하지 못한다.
+        #   --limit 로 일부 노드만 실행한 경우 등을 막기 위해 gp_segment_configuration 의 모든 호스트를 확인한다
+        - name: Check that every WHPG host has the live query plan library
+          ansible.builtin.shell:
+            cmd: |
+              cd /tmp
+              source {{ whpg_install_dir }}/greenplum_path.sh
+              so="$(pg_config --pkglibdir)/{{ live_query_plan_extension }}.so"
+              missing=""
+              for h in $(psql -d postgres -Atc "SELECT DISTINCT hostname FROM gp_segment_configuration ORDER BY 1"); do
+                ssh -o BatchMode=yes -o ConnectTimeout=10 "$h" test -f "$so" || missing="$missing $h"
+              done
+              echo "so=$so"
+              echo "missing=${missing# }"
+            executable: /bin/bash
+          register: _lqp_so_check
+          changed_when: false
+          check_mode: false
+          # --check 에서 아직 설치되지 않은 노드가 있으면(설치 예정) 확인하지 않는다
+          when: not (ansible_check_mode and ansible_play_hosts | map('extract', hostvars, '_lqp_rpm_q') | selectattr('rc', 'defined') | selectattr('rc', 'ne', 0) | list | length > 0)
+
+        - name: Fail when some WHPG hosts do not have the library
+          ansible.builtin.assert:
+            that: (_lqp_so_check.stdout | regex_findall('(?m)^missing=(.*)$') | first | default('') | trim) | length == 0
+            fail_msg: >-
+              {{ _lqp_so_check.stdout | regex_findall('(?m)^so=(.*)$') | first | default('') }} 이 없는 호스트가 있습니다:
+              {{ _lqp_so_check.stdout | regex_findall('(?m)^missing=(.*)$') | first | default('') }}.
+              이 상태로 preload 하면 해당 세그먼트가 기동하지 못하므로 shared_preload_libraries 를 바꾸지 않고 중단합니다.
+              모든 노드가 inventory 에 있는지 확인하고 (--limit 없이) 다시 실행하세요.
+            quiet: true
+          when: _lqp_so_check is not skipped
+
+        - name: Read current WHPG settings for live query plan
+          ansible.builtin.shell:
+            cmd: |
+              cd /tmp
+              source {{ whpg_install_dir }}/greenplum_path.sh
+              echo "spl=$(psql -d postgres -Atc 'SHOW shared_preload_libraries')"
+              echo "qm=$(psql -d postgres -Atc 'SHOW gp_enable_query_metrics')"
+              gpconfig -s shared_preload_libraries | grep -q 'Values on all segments are consistent' && echo "spl_consistent=yes" || echo "spl_consistent=no"
+            executable: /bin/bash
+          register: _lqp_guc
+          changed_when: false
+          check_mode: false
+
+        - name: Decide WHPG settings for live query plan
+          ansible.builtin.set_fact:
+            _lqp_spl_cur: "{{ _spl }}"
+            _lqp_spl_new: "{{ (_spl_list + ([live_query_plan_extension] if live_query_plan_extension not in _spl_list else [])) | join(',') }}"
+            _lqp_spl_missing: "{{ live_query_plan_extension not in _spl_list }}"
+            _lqp_qm_off: "{{ _qm != 'on' }}"
+          vars:
+            _spl: "{{ _lqp_guc.stdout | regex_findall('(?m)^spl=(.*)$') | first | default('') | trim }}"
+            _spl_list: "{{ _spl.split(',') | map('trim') | select | list }}"
+            _qm: "{{ _lqp_guc.stdout | regex_findall('(?m)^qm=(.*)$') | first | default('') | trim }}"
+
+        # 세그먼트마다 값이 다르면 coordinator 값으로 덮어써 다른 라이브러리가 빠질 수 있으므로 중단한다
+        - name: Fail when shared_preload_libraries differs between instances
+          ansible.builtin.assert:
+            that: "'spl_consistent=yes' in _lqp_guc.stdout"
+            fail_msg: >-
+              shared_preload_libraries 값이 coordinator 와 세그먼트 사이에 다릅니다 (gpconfig -s shared_preload_libraries 로 확인).
+              값을 맞춘 뒤 다시 실행하세요. 지금 값으로는 {{ live_query_plan_extension }} 을 추가하지 않습니다.
+            quiet: true
+          when: _lqp_spl_missing | bool
+
+        - name: Add live query plan to shared_preload_libraries
+          ansible.builtin.command:
+            argv:
+              - bash
+              - -c
+              - |
+                cd /tmp
+                source {{ whpg_install_dir }}/greenplum_path.sh
+                  gpconfig -c shared_preload_libraries -v "$1"
+              - gpconfig
+              - "{{ _lqp_spl_new }}"
+          when: _lqp_spl_missing | bool
+          changed_when: true
+
+        - name: Enable gp_enable_query_metrics
+          ansible.builtin.shell:
+            cmd: |
+              cd /tmp
+              source {{ whpg_install_dir }}/greenplum_path.sh
+              gpconfig -c gp_enable_query_metrics -v on
+            executable: /bin/bash
+          when: _lqp_qm_off | bool
+          changed_when: true
+
+        # -------------------------------------------------------------------
+        # 3) 재시작 (실행 중인 값에 아직 반영되지 않았을 때만)
+        # -------------------------------------------------------------------
+        - name: Show WHPG restart for live query plan
+          ansible.builtin.debug:
+            msg:
+              - "{{ 'WHPG 클러스터를 재시작합니다' if not ansible_check_mode else '--check: WHPG 클러스터 재시작 예정 (실제로 하지 않음)' }} (gpstop -ar -M {{ live_query_plan_restart_mode }})"
+              - "shared_preload_libraries: {{ _lqp_spl_cur }} -> {{ _lqp_spl_new }}"
+              - "gp_enable_query_metrics: {{ 'off -> on' if (_lqp_qm_off | bool) else 'on' }}"
+          when: (_lqp_spl_missing | bool) or (_lqp_qm_off | bool)
+
+        - name: Restart WHPG cluster for live query plan
+          ansible.builtin.shell:
+            cmd: |
+              cd /tmp
+              source {{ whpg_install_dir }}/greenplum_path.sh
+              gpstop -a -r -M {{ live_query_plan_restart_mode }}
+            executable: /bin/bash
+          when: (_lqp_spl_missing | bool) or (_lqp_qm_off | bool)
+          changed_when: true
+
+        # -------------------------------------------------------------------
+        # 4) extension 생성과 확인
+        # -------------------------------------------------------------------
+        - name: Create live query plan extension
+          ansible.builtin.shell:
+            cmd: |
+              cd /tmp
+              source {{ whpg_install_dir }}/greenplum_path.sh
+              for db in {{ wem_live_query_plan_databases | map('quote') | join(' ') }}; do
+                if [ "$(psql -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname = '$db'")" != "1" ]; then
+                  echo "NODB $db"; continue
+                fi
+                if [ "$(psql -d "$db" -Atc "SELECT 1 FROM pg_extension WHERE extname = '{{ live_query_plan_extension }}'")" = "1" ]; then
+                  echo "EXISTS $db"
+                else
+                  psql -d "$db" -v ON_ERROR_STOP=1 -qc 'CREATE EXTENSION IF NOT EXISTS {{ live_query_plan_extension }}' && echo "CREATED $db"
+                fi
+              done
+            executable: /bin/bash
+          register: _lqp_ext
+          changed_when: "'CREATED' in (_lqp_ext.stdout | default(''))"
+          failed_when: (_lqp_ext.rc | default(0)) != 0 or 'NODB' in (_lqp_ext.stdout | default(''))
+
+        - name: Check live query plan settings
+          ansible.builtin.shell:
+            cmd: |
+              cd /tmp
+              source {{ whpg_install_dir }}/greenplum_path.sh
+              echo "shared_preload_libraries = $(psql -d postgres -Atc 'SHOW shared_preload_libraries')"
+              echo "gp_enable_query_metrics = $(psql -d postgres -Atc 'SHOW gp_enable_query_metrics')"
+              for db in {{ wem_live_query_plan_databases | map('quote') | join(' ') }}; do
+                echo "$db: $(psql -d "$db" -Atc "SELECT extname || ' ' || extversion FROM pg_extension WHERE extname = '{{ live_query_plan_extension }}'")"
+              done
+            executable: /bin/bash
+          register: _lqp_after
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: Show live query plan settings
+          ansible.builtin.debug:
+            msg: "{{ _lqp_after.stdout_lines }}"
+          when: not ansible_check_mode

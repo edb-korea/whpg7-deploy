@@ -179,8 +179,9 @@ clickhouse_packages:
 # WEM 패키지 (버전 고정. local_rpm_dir 에 여러 버전이 있어도 이 버전을 설치)
 wem_pkg_name: "whpg-enterprise-manager"
 wem_version: "1.4.0"
-# wem.conf 기본 경로 / 그룹. 실제로는 wem.service 의 EnvironmentFile / Group 을 따른다 (tasks/06-wem.yml)
-#   1.4: /etc/wem/wem.conf, 1.5: /etc/edb/wem/wem.conf (User / Group = wem)
+# wem.conf 기본 경로 / 그룹. 실제로는 wem.service 의 EnvironmentFile / Group 을 따른다 (tasks/wem-facts.yml)
+#   1.4: /etc/wem/wem.conf, 1.5 / 1.6: /etc/edb/wem/wem.conf (User / Group = wem)
+#   (1.6 rpm 은 옛 파일을 /etc/wem/wem.conf.rpmsave 로 옮긴다)
 wem_config_file: "/etc/wem/wem.conf"
 # wem.conf 의 그룹 (WEM 서비스가 읽을 수 있어야 함)
 wem_unix_group: "{{ gpadmin_user }}"
@@ -214,6 +215,14 @@ host_agent_conf: "/etc/edb/acp-host-agent/acp-host-agent.conf"
 host_agent_join_token_file: "/etc/edb/acp-host-agent/join-token"
 # acp-host-agent 서비스 계정 (서비스가 join-token 을 이 계정 소유 0600 으로 만들고 이 계정으로 읽는다)
 host_agent_user: "acp-host-agent"
+host_agent_id_file: "/etc/edb/acp-host-agent/agent-id"
+# Host Agent 가 WEM 에서 받은 인증서 (current/bundle.pem 이 신뢰하는 WEM CA)
+host_agent_tls_dir: "/var/lib/edb/acp-host-agent/tls"
+# true: Host Agent 의 인증서가 지금 WEM 이 발급한 것이 아니면 (이전 WEM 설치에서 남은 인증서, agent 로그에 BadSignature)
+#   agent 를 멈추고 인증서 / agent-id / join-token 을 지운 뒤 다시 등록시킨다 [07-host-agent, upgrade]
+#   지우기 전에 host_agent_backup_dir 에 /etc/edb/acp-host-agent 와 /var/lib/edb/acp-host-agent 를 tar.gz 로 백업한다
+host_agent_reset_stale_state: true
+host_agent_backup_dir: "/root"
 
 
 # ----------------------------------------------------------------------------
@@ -265,6 +274,25 @@ otelcol_sqlquery_sslmode: "prefer"
 
 
 # ----------------------------------------------------------------------------
+# Live query plan (WEM 1.6 이상)  [09-live-query-plan]  (기본 실행과 -t upgrade, -t liveplan 에서 실행)
+# ----------------------------------------------------------------------------
+# true: WEM host 의 whpg-enterprise-manager 가 wem_live_query_plan_min_version 이상이면
+#   모든 노드에 live_query_plan_package 를 설치하고, shared_preload_libraries / gp_enable_query_metrics=on 을 설정한 뒤
+#   (아직 반영되지 않았으면) WHPG 클러스터를 재시작하고 wem_live_query_plan_databases 에 extension 을 만든다
+wem_live_query_plan: true
+wem_live_query_plan_min_version: "1.6"
+live_query_plan_package: "edb-whpg7-live-query-plan"
+# 버전 고정 (비우면 최신). Controller 의 local_rpm_dir 우선 → dnf fallback
+live_query_plan_version: ""
+# extension 이름이자 shared_preload_libraries 에 넣는 라이브러리 이름
+live_query_plan_extension: "whpg_live_query_plan"
+# CREATE EXTENSION 할 데이터베이스 (없는 DB 가 있으면 실패)
+wem_live_query_plan_databases: ["{{ wem_whpg_database }}"]
+# 재시작 방식 (gpstop -ar -M <값>). fast: 실행 중인 트랜잭션을 롤백하고 세션을 끊는다
+live_query_plan_restart_mode: "fast"
+
+
+# ----------------------------------------------------------------------------
 # WEM 1.4 삭제  [remove-wem14] (playbooks/ops/remove_wem.yml)
 # ----------------------------------------------------------------------------
 # WEM 1.4 삭제 (테스트 초기화용). WEM host 의 whpg-enterprise-manager 버전이 이 값 이상일 때만 삭제를 진행한다.
@@ -313,3 +341,5 @@ remove_paths_wem_host:
 remove_paths_wem14_only:
   - /etc/wem
   - /var/log/wem
+  - /etc/edb/wem
+  - /var/log/edb/wem

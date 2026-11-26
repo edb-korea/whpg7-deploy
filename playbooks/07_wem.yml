@@ -12,6 +12,10 @@
 #   ansible-playbook playbooks/07_wem.yml -t tune               # 일부 단계만 (README WEM 절의 tag 표)
 #   ansible-playbook playbooks/07_wem.yml -t upgrade --check    # 관련 RPM 의 설치 / repo 최신 버전 확인만
 #   ansible-playbook playbooks/07_wem.yml -t upgrade            # 관련 RPM 을 repo 최신 버전으로 업그레이드
+#   ansible-playbook playbooks/07_wem.yml -t liveplan           # WEM 1.6 이상: live query plan 구성 (WHPG 재시작 가능)
+#
+#   WEM 1.6 이상이면 기본 실행 / -t upgrade 에서도 live query plan 을 구성하며, 반영되지 않았으면 WHPG 를 재시작한다
+#   (원치 않으면 -e wem_live_query_plan=false)
 # ======================================================
 - name: WEM 1.4 설치
   hosts: whpg_cluster

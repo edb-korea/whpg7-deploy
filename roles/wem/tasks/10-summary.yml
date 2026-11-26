@@ -26,6 +26,14 @@
             'WEM 웹 포털 HTTPS는 공식 설정 파라미터가 없어 구성하지 않았음 (HTTP + WEM_INSECURE_COOKIES=1)',
             'DB 메트릭(sqlquery) 수집: ' ~ (('standby(' ~ (_standby_hosts | first) ~ ')에서 ' ~ otelcol_sqlquery_host ~ ' 로 접속') if (_otel_sqlquery_move | bool) else 'coordinator에서 127.0.0.1 로 접속'),
             'otelcol 조정(file_log, sqlquery)은 ' ~ otelcol_local_config ~ ' 에 있음 (acp-host-agent 재시작에도 유지, 값 변경 후 -t tune)'] -%}
+      {%- set stale = ansible_play_hosts | select('in', hostvars) | map('extract', hostvars) | selectattr('_agent_stale', 'defined')
+                      | selectattr('_agent_stale') | map(attribute='inventory_hostname') | list -%}
+      {%- if stale -%}
+      {%- set _ = out.append('이전 WEM 설치의 Host Agent 인증서가 남아 있던 노드' ~ (' (--check: 실제로 변경하지 않음)' if ansible_check_mode else '')
+                             ~ ': ' ~ (stale | join(', '))
+                             ~ ((' -> 상태를 지우고 다시 등록 (백업: ' ~ host_agent_backup_dir ~ '/acp-host-agent-backup-*.tgz)')
+                                if (host_agent_reset_stale_state | bool) else ' -> 그대로 둠 (host_agent_reset_stale_state=false, WEM 에 등록되지 않음)')) -%}
+      {%- endif -%}
       {%- set upg_hosts = ansible_play_hosts | select('in', hostvars) | map('extract', hostvars) | selectattr('_upg_targets', 'defined') | list -%}
       {%- if upg_hosts -%}
       {%- set _ = out.append(('업그레이드 대상 (--check: 실제로 변경하지 않음. 업그레이드하려면 --check 없이 -t upgrade)' if ansible_check_mode else '업그레이드한 패키지') ~ ':') -%}

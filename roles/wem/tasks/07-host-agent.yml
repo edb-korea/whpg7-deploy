@@ -1,6 +1,19 @@
 ---
 # Host Agent + otelcol 설치, join-token 선등록 (전 노드)
 # tag: agent
+
+# -t agent 로 06-wem 을 건너뛰면 join secret 이 없으므로 WEM host 의 wem.conf 에서 읽는다
+- name: Find wem.conf and the join secret on the WEM host
+  ansible.builtin.import_tasks: wem-facts.yml
+
+- name: Check that the join secret is known
+  ansible.builtin.assert:
+    that: hostvars[wem_host].wem_join_secret_value | default('') | length > 0
+    fail_msg: >-
+      {{ wem_host }} 의 wem.conf({{ hostvars[wem_host]._wem_conf_path | default('?') }}) 에서
+      WEM_AGENT_JOIN_SECRET 을 읽지 못했습니다. 먼저 -t wem 으로 wem.conf 를 쓰세요.
+    quiet: true
+
 - name: Check whether Host Agent and otelcol are installed
   ansible.builtin.command: rpm -q {{ host_agent_package }} {{ otelcol_package }}
   register: _agent_installed
@@ -33,6 +46,10 @@
     - { key: "WEM_DATABASE", value: "{{ wem_whpg_database }}" }
   register: _agent_conf
 
+# 이전 WEM 설치에서 남은 인증서가 있으면 지우고 다시 등록하게 한다 (나중에 inventory 에 추가된 노드 등)
+- name: Reset Host Agent state left by a previous WEM install
+  ansible.builtin.import_tasks: host-agent-stale-reset.yml
+
 # 에이전트는 최초 기동 시 join-token을 스스로 생성하므로, 기동 전에
 # WEM_AGENT_JOIN_SECRET과 같은 값으로 미리 써 두어 수동 승인 없이 등록되게 한다.
 - name: Pre-seed Host Agent join-token
@@ -58,12 +75,12 @@
       vars:
         _otel_prestage: true
 
-    # 설정 / join-token 이 바뀐 경우에만 재시작 (다시 실행해도 agent 가 재등록되지 않음)
+    # 설정 / join-token 이 바뀌었거나 이전 WEM 의 상태를 지운 경우에만 재시작 (다시 실행해도 agent 가 재등록되지 않음)
     - name: Enable and start Host Agent (한 대씩 순차 기동)
       ansible.builtin.systemd:
         name: acp-host-agent
         enabled: true
-        state: "{{ 'restarted' if (_agent_conf is changed or _agent_token is changed) else 'started' }}"
+        state: "{{ 'restarted' if (_agent_conf is changed or _agent_token is changed or _agent_reset | default(false) | bool) else 'started' }}"
       throttle: 1
 
     - name: Verify join-token is still the pre-seeded value

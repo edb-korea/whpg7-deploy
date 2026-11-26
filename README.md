@@ -440,6 +440,17 @@ ansible-playbook playbooks/ops/expand_segments.yml -e expand_duration=04:00:00  
 - RPM 업그레이드(`-t upgrade`)는 설치되어 있는 패키지만 dnf repo 의 최신 버전으로 올립니다 (`local_rpm_dir` 은 보지 않음).
   WEM host(ClickHouse → WEM)를 먼저 올리고, 모든 노드의 Host Agent / otelcol 을 한 대씩 올리며, 업그레이드된 서비스만 재시작합니다.
   대상은 `wem_upgrade_packages_wem_host` / `wem_upgrade_packages_all_hosts`. 결과는 마지막 Summary 에 표시됩니다.
+- `wem.conf` 위치는 `wem` 서비스(systemd unit)의 `EnvironmentFile` / `Group` 을 따릅니다
+  (1.4: `/etc/wem/wem.conf`, 1.5 이상: `/etc/edb/wem/wem.conf`). WEM 1.6 rpm 은 옛 파일을 `/etc/wem/wem.conf.rpmsave` 로 옮기며,
+  `-t wem` 은 새 경로에 파일이 없으면 옛 경로 / `.rpmsave` 의 secret 을 이어 씁니다. `-t upgrade` 는 업그레이드 뒤 새 `wem.conf` 에
+  join secret 이 있는지 확인합니다. `-t agent` 단독 실행 시에도 WEM host 의 `wem.conf` 에서 join secret 을 읽습니다.
+- **이전 WEM 설치에서 남은 Host Agent 인증서 정리** (`host_agent_reset_stale_state`, 기본 true): WEM 을 다시 설치하면 agent CA 가 새로 만들어져
+  이전 인증서를 가진 노드(agent 로그 `BadSignature`, Host Agents 에 안 보임)는 접속하지 못합니다.
+  `agent` / `upgrade` 단계에서 이를 감지하면 `host_agent_backup_dir`(기본 `/root`)에 백업한 뒤 인증서 / agent-id / join-token 을 지우고 다시 등록합니다.
+- **Live query plan (WEM 1.6 이상)** (`wem_live_query_plan`, 기본 true): WEM host 의 WEM 이 1.6 이상이면 모든 노드에
+  `edb-whpg7-live-query-plan` 을 설치하고 `shared_preload_libraries` 에 `whpg_live_query_plan` 추가, `gp_enable_query_metrics=on` 설정 후
+  **아직 반영되지 않았으면 WHPG 클러스터를 재시작**(`gpstop -ar -M fast`)하고 `wem_live_query_plan_databases` 에 extension 을 만듭니다.
+  기본 실행과 `-t upgrade` 에서 모두 수행되며(1.6 으로 올리면 그때 구성), 단독 실행은 `-t liveplan`. 재시작을 원치 않으면 `-e wem_live_query_plan=false`.
 - 접속: `http://<wem_host IP>:8080/` (admin / `vault_wem_admin_password`). **Management > Host Agents** 에서 모든 노드가 approved 인지 확인
 
 ```bash
@@ -447,7 +458,8 @@ ansible-playbook playbooks/07_wem.yml                       # 설치
 ansible-playbook playbooks/07_wem.yml -e wem_use_vip=false  # VIP 대신 coordinator 실 IP 로 접속
 ansible-playbook playbooks/07_wem.yml -t tune               # 일부 단계만
 ansible-playbook playbooks/07_wem.yml -t upgrade --check    # WEM 관련 RPM 의 설치 / repo 최신 버전 확인만
-ansible-playbook playbooks/07_wem.yml -t upgrade            # WEM 관련 RPM 을 repo 최신 버전으로 업그레이드
+ansible-playbook playbooks/07_wem.yml -t upgrade            # WEM 관련 RPM 을 repo 최신 버전으로 업그레이드 (+ 1.6 이상이면 live query plan)
+ansible-playbook playbooks/07_wem.yml -t liveplan           # WEM 1.6 이상: live query plan 만 구성 (WHPG 재시작 가능)
 ansible-playbook playbooks/ops/remove_wem.yml               # 삭제 (확인 질문 없음, WEM 1.4 이상일 때만)
 ```
 
@@ -461,10 +473,11 @@ ansible-playbook playbooks/ops/remove_wem.yml               # 삭제 (확인 질
 | `wem` | `06-wem.yml` | WEM 1.4 설치, `wem.conf` |
 | `agent` | `07-host-agent.yml` | Host Agent / otelcol 설치, otelcol 조정 선적용, 자동 승인 |
 | `tune` | `08-otelcol-tune.yml` | WEM 이 배포한 otelcol 설정과 병합 검사, 변경 시만 재시작 |
-| `upgrade` | `upgrade.yml` | WEM 관련 RPM 을 repo 최신 버전으로 업그레이드 (`-t upgrade` 지정 시에만) |
+| `upgrade` | `upgrade.yml` | WEM 관련 RPM 을 repo 최신 버전으로 업그레이드 (`-t upgrade` 지정 시에만), 남은 Host Agent 인증서 정리 |
+| `liveplan`, `upgrade` | `09-live-query-plan.yml` | WEM 1.6 이상: live query plan rpm / preload / extension (필요 시 WHPG 재시작) |
 | (always) | `10-summary.yml` | 서비스 상태 |
 
-`-t agent` 는 `wem` 단계의 join secret 을 쓰므로 `-t wem,agent` 로 함께 실행합니다.
+`-t agent` 단독 실행 시 join secret 은 WEM host 의 `wem.conf` 에서 읽습니다 (없으면 `-t wem,agent` 로 함께 실행).
 자주 바꾸는 변수는 `inventory/whpg_cluster.yml` 의 WEM 구역에 주석으로 적어 두었고, 전체 목록은 `roles/wem/defaults/main.yml` 에 있습니다.
 
 ---

@@ -321,6 +321,8 @@ wem_version: "1.5.0"              # 설치할 whpg-enterprise-manager 버전
 # wem_state_install: false          # true: WEM host 에 별도 상태 DB(PostgreSQL 5433) 설치
 clickhouse_data_dir: "/data/clickhouse"           # ClickHouse 데이터를 다른 디스크에 둘 때 (예: /data1/clickhouse)
 # wem_pool_max_conns: "40"          # wem.conf 의 WEM_POOL_MAX_CONNS (비우면 넣지 않음)
+# wem_live_query_plan: true        # WEM 1.6 이상: live query plan 구성 (preload 반영 시 WHPG 재시작)
+# host_agent_reset_stale_state: true  # 이전 WEM 설치의 Host Agent 인증서가 남아 있으면 백업 후 지우고 재등록
 
 # ------------------------------------------
 # pgBouncer 설정 (pgbouncer_node 그룹)

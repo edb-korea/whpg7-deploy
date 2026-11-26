@@ -7,6 +7,9 @@
 #
 # 설치되어 있는 패키지만 올린다 (update_only). 설정 파일(wem.conf, config.yaml, edb-otelcol.conf,
 # config_local.yaml)은 RPM 의 %config(noreplace) 이거나 RPM 소유가 아니므로 업그레이드해도 유지된다.
+# 단, WEM 1.6 rpm 은 wem.conf 를 /etc/edb/wem/wem.conf 로 옮긴다 (옛 파일은 /etc/wem/wem.conf.rpmsave).
+# 업그레이드 뒤 wem 서비스가 읽는 wem.conf 에 join secret 이 있는지 확인한다.
+# 이전 WEM 설치에서 남은 Host Agent 인증서가 있으면 지우고 다시 등록시킨다 (host-agent-stale-reset.yml).
 # 순서: WEM host (ClickHouse → WEM) 를 먼저 올리고, 그 다음 모든 노드의 Host Agent / otelcol 을 한 대씩 올린다.
 # 서비스는 업그레이드된 패키지가 있을 때만 재시작한다.
 
@@ -104,9 +107,29 @@
     update_cache: true
   register: _upg_agent
 
+# WEM 1.6 부터 wem.conf 위치가 바뀐다 (/etc/wem -> /etc/edb/wem). 업그레이드 뒤의 위치와 join secret 을 읽는다
+- name: Find wem.conf and the join secret on the WEM host
+  ansible.builtin.import_tasks: wem-facts.yml
+
+- name: Check that WEM reads a wem.conf with the join secret
+  ansible.builtin.assert:
+    that: wem_join_secret_value | default('') | length > 0
+    fail_msg: >-
+      wem 서비스가 읽는 {{ _wem_conf_path }} 에 WEM_AGENT_JOIN_SECRET 이 없습니다.
+      rpm 업그레이드로 설정 파일 위치가 바뀌었다면 이전 파일(예: /etc/wem/wem.conf.rpmsave)의 값을 {{ _wem_conf_path }} 로 옮기거나
+      -t wem 으로 다시 쓰세요.
+    quiet: true
+  when:
+    - inventory_hostname == wem_host
+    - not (ansible_check_mode and (_upg_wem | default({})) is changed)
+
+# 업그레이드로는 바뀌지 않는, 이전 WEM 설치에서 남은 Host Agent 인증서를 정리한다
+- name: Reset Host Agent state left by a previous WEM install
+  ansible.builtin.import_tasks: host-agent-stale-reset.yml
+
 # config_local.yaml 은 RPM 소유가 아니고 edb-otelcol.conf 는 noreplace 이므로 조정 값은 유지된다
 - name: Restart Host Agent / otelcol after upgrade (한 대씩)
-  when: _upg_agent is changed
+  when: (_upg_agent is changed) or (_agent_reset | default(false) | bool)
   throttle: 1
   block:
     - name: Restart acp-host-agent
