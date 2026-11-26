@@ -52,6 +52,12 @@
   when: "'upgrade' in ansible_run_tags"
   tags: [upgrade, never]
 
+# WEM 1.6 이상: live query plan rpm 설치 + preload / gp_enable_query_metrics 설정 (필요하면 WHPG 재시작) + extension
+#   기본 실행과 -t upgrade 에서 모두 실행된다 (업그레이드로 1.6 이 되면 그때 구성). 단독 실행: -t liveplan
+- name: "09-live-query-plan"
+  ansible.builtin.import_tasks: 09-live-query-plan.yml
+  tags: [liveplan, upgrade]
+
 # 서비스 상태 확인
 - name: "10-summary"
   ansible.builtin.import_tasks: 10-summary.yml

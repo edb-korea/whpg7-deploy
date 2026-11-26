@@ -1,0 +1,100 @@
+---
+# 이전 WEM 설치에서 남은 Host Agent 인증서 정리 (모든 노드). 07-host-agent.yml, upgrade.yml 이 import 한다.
+#
+# Host Agent 는 처음 등록할 때 WEM 의 agent CA 로 발급받은 인증서를 host_agent_tls_dir 에 두고 계속 쓴다.
+# WEM 을 지우고 다시 설치하면 CA 가 새로 만들어지는데, 그때 inventory 에 없던 노드(나중에 추가된 segment 등)는
+# 이전 인증서가 그대로 남아 새 WEM 에 접속하지 못한다 (agent 로그: invalid peer certificate: BadSignature,
+# WEM 화면의 Host Agents 에 나타나지 않음). rpm 업그레이드로는 이 상태가 바뀌지 않는다.
+#
+# 확인: agent 가 신뢰하는 CA(current/bundle.pem)로 WEM agent 포트의 인증서를 검증한다.
+#   ok      : 지금 WEM 이 발급한 인증서 -> 그대로 둔다
+#   none    : 인증서가 없음 (처음 설치) -> 그대로 둔다
+#   unknown : openssl 이 없거나 WEM 에 접속하지 못함 -> 판단하지 않고 그대로 둔다
+#   stale   : 검증 실패 -> host_agent_reset_stale_state=true 면 agent 를 멈추고 백업한 뒤
+#             인증서 / agent-id / join-token 을 지우고 join-token 을 지금 WEM 의 값으로 다시 넣는다.
+#             agent 시작(재시작)은 이 파일을 부른 쪽에서 한다 (_agent_reset 이 true).
+- name: Check that the Host Agent certificate was issued by the current WEM
+  ansible.builtin.shell:
+    cmd: |
+      b={{ host_agent_tls_dir }}/current/bundle.pem
+      [ -f "$b" ] || { echo none; exit 0; }
+      command -v openssl >/dev/null 2>&1 || { echo unknown openssl 없음; exit 0; }
+      r=$(echo | timeout 15 openssl s_client -connect {{ wem_host_ip }}:{{ wem_agent_port }} -CAfile "$b" 2>/dev/null \
+          | grep -m1 'Verify return code')
+      case "$r" in
+        *"return code: 0 ("*)   echo ok ;;
+        *"Verify return code"*) echo "stale ${r#*: }" ;;
+        *)                      echo "unknown {{ wem_host_ip }}:{{ wem_agent_port }} 접속 실패" ;;
+      esac
+    executable: /bin/bash
+  register: _agent_tls
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Remember whether the Host Agent state is stale
+  ansible.builtin.set_fact:
+    _agent_stale: "{{ (_agent_tls.stdout | default('')).startswith('stale') }}"
+    _agent_reset: false
+
+- name: Warn about a Host Agent certificate from a previous WEM install
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: Host Agent 인증서가 지금 WEM 이 발급한 것이 아닙니다 ({{ _agent_tls.stdout }}).
+      {{ ('agent 상태를 지우고 다시 등록합니다 (백업: ' ~ host_agent_backup_dir ~ ').' ~ (' --check 이므로 변경하지 않음.' if ansible_check_mode else ''))
+         if (host_agent_reset_stale_state | bool) else
+         'host_agent_reset_stale_state=false 이므로 그대로 둡니다. WEM 에 등록되지 않습니다.' }}
+  when: _agent_stale | bool
+
+- name: Reset stale Host Agent state
+  when:
+    - _agent_stale | bool
+    - host_agent_reset_stale_state | bool
+  block:
+    - name: Check that the join secret is known
+      ansible.builtin.assert:
+        that: hostvars[wem_host].wem_join_secret_value | default('') | length > 0
+        fail_msg: >-
+          {{ wem_host }} 의 wem.conf({{ hostvars[wem_host]._wem_conf_path | default('?') }}) 에서
+          WEM_AGENT_JOIN_SECRET 을 읽지 못해 {{ inventory_hostname }} 의 Host Agent 를 다시 등록할 수 없습니다.
+        quiet: true
+
+    - name: Stop acp-host-agent
+      ansible.builtin.systemd:
+        name: acp-host-agent
+        state: stopped
+
+    - name: Back up Host Agent config and state
+      ansible.builtin.shell:
+        cmd: |
+          f={{ host_agent_backup_dir }}/acp-host-agent-backup-$(date +%Y%m%d-%H%M%S).tgz
+          tar czf "$f" --ignore-failed-read {{ host_agent_conf | dirname }} {{ host_agent_tls_dir | dirname }} 2>/dev/null
+          echo "$f"
+        executable: /bin/bash
+      register: _agent_backup
+
+    - name: Remove stale certificate / agent-id / join-token
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ host_agent_tls_dir }}"
+        - "{{ host_agent_id_file }}"
+        - "{{ host_agent_join_token_file }}"
+
+    - name: Seed join-token with the current WEM join secret
+      ansible.builtin.copy:
+        dest: "{{ host_agent_join_token_file }}"
+        content: "{{ hostvars[wem_host].wem_join_secret_value }}"
+        owner: "{{ host_agent_user }}"
+        group: "{{ host_agent_user }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Mark Host Agent for restart
+      ansible.builtin.set_fact:
+        _agent_reset: true
+
+    - name: Show backup file
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Host Agent 백업 {{ _agent_backup.stdout | default('', true) or '(--check: 만들지 않음)' }}"

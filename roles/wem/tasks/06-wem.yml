@@ -29,22 +29,13 @@
       # 설치를 건너뛰었으면 앞 단계(ClickHouse 등)의 rpm_install 결과가 남아 있으므로 보지 않는다
       when: _wem_installed_ver.rc != 0 or not (_wem_installed_ver.stdout | trim) is version(wem_version, '>=')
 
-    # WEM 버전마다 설정 파일 위치 / 실행 계정이 다르다 (1.4: /etc/wem/wem.conf, 1.5: /etc/edb/wem/wem.conf + User=wem)
+    # WEM 버전마다 설정 파일 위치 / 실행 계정이 다르다 (1.4: /etc/wem/wem.conf, 1.5 이상: /etc/edb/wem/wem.conf + User=wem)
     # wem.service 의 EnvironmentFile / Group 을 따른다 (서비스가 아직 없으면 wem_config_file / wem_unix_group)
     # 다른 경로에 쓰면 WEM 은 기존 secret 을 계속 쓰고 Host Agent 에는 새 join-token 이 들어가 새 agent 가 pending 으로 남는다
-    - name: wem.service 의 설정 파일 / 그룹 조회
-      ansible.builtin.shell:
-        cmd: |
-          systemctl show wem -p EnvironmentFiles --value 2>/dev/null | awk 'NR == 1 {print $1}' | sed 's/^-//'
-          echo "|$(systemctl show wem -p Group --value 2>/dev/null)"
-      register: _wem_unit
-      changed_when: false
-      check_mode: false
-
-    - name: wem.conf 경로 / 그룹 결정
-      ansible.builtin.set_fact:
-        _wem_conf_path: "{{ (_wem_unit.stdout_lines | reject('match', '^\\|') | first | default('')) or wem_config_file }}"
-        _wem_conf_group: "{{ (_wem_unit.stdout_lines | select('match', '^\\|') | first | default('|'))[1:] or wem_unix_group }}"
+    - name: Find wem.conf path and group
+      ansible.builtin.import_tasks: wem-facts.yml
+      vars:
+        _wem_facts_read_secret: false
 
     - name: 현재 wem.conf 소유자 확인
       ansible.builtin.stat:
@@ -54,9 +45,19 @@
     # 다시 실행할 때는 기존 wem.conf 의 secret 을 그대로 쓴다.
     # (새로 만들면 WEM 재시작 + 모든 Host Agent 의 join-token 교체가 필요해진다)
     # 업그레이드로 경로가 바뀌어 새 경로에 아직 없으면 이전 경로(wem_config_file)의 secret 을 이어 쓴다
+    # 1.6 rpm 은 이전 파일을 wem.conf.rpmsave 로 옮기므로, 이전 경로에도 없으면 .rpmsave 를 읽는다
+    - name: 이전 경로의 wem.conf 확인 (새 경로에 없을 때)
+      ansible.builtin.stat:
+        path: "{{ wem_config_file }}"
+      register: _wem_conf_prev_stat
+      when: not _wem_conf_stat.stat.exists
+
     - name: Read existing wem.conf
       ansible.builtin.slurp:
-        src: "{{ _wem_conf_path if _wem_conf_stat.stat.exists else wem_config_file }}"
+        src: >-
+          {{ _wem_conf_path if _wem_conf_stat.stat.exists
+             else (wem_config_file if (_wem_conf_prev_stat.stat.exists | default(false))
+             else wem_config_file ~ '.rpmsave') }}
       register: _wem_conf_old
       failed_when: false
       no_log: true

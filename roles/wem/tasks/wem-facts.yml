@@ -1,0 +1,59 @@
+---
+# WEM host 의 wem.conf 경로 / 그룹을 정하고, 필요하면 WEM_AGENT_JOIN_SECRET 을 읽는다 (WEM host 에서만)
+#   06-wem.yml, 07-host-agent.yml, upgrade.yml 이 import 한다.
+#
+#   _wem_conf_path  : wem 서비스(wem.service)의 EnvironmentFile
+#                     (WEM 1.4: /etc/wem/wem.conf, 1.5 이상: /etc/edb/wem/wem.conf), unit 이 없으면 wem_config_file
+#   _wem_conf_group : wem 서비스의 Group (1.5 이상: wem), 없으면 wem_unix_group
+#   wem_join_secret_value : 아직 없고 _wem_facts_read_secret 이 true 면 _wem_conf_path 에서 읽는다
+#                     (-t agent / -t upgrade 처럼 06-wem 을 건너뛰고 실행할 때 사용)
+- name: Read wem service config path and group
+  ansible.builtin.shell:
+    cmd: |
+      echo "conf=$(systemctl show wem -p EnvironmentFiles --value 2>/dev/null | awk 'NR==1 {print $1}')"
+      echo "group=$(systemctl show wem -p Group --value 2>/dev/null)"
+    executable: /bin/bash
+  register: _wem_unit
+  changed_when: false
+  check_mode: false
+  when: inventory_hostname == wem_host
+
+- name: Decide wem.conf path and group
+  ansible.builtin.set_fact:
+    _wem_conf_path: "{{ (_unit_conf | regex_replace('^-', '')) or wem_config_file }}"
+    _wem_conf_group: "{{ _unit_group or wem_unix_group }}"
+  vars:
+    _unit_conf: "{{ _wem_unit.stdout | regex_findall('(?m)^conf=(\\S*)') | first | default('') }}"
+    _unit_group: "{{ _wem_unit.stdout | regex_findall('(?m)^group=(\\S*)') | first | default('') }}"
+  when: inventory_hostname == wem_host
+
+- name: Read WEM_AGENT_JOIN_SECRET from wem.conf
+  ansible.builtin.slurp:
+    src: "{{ _wem_conf_path }}"
+  register: _wem_conf_content
+  failed_when: false
+  check_mode: false
+  no_log: true
+  when:
+    - inventory_hostname == wem_host
+    - _wem_facts_read_secret | default(true) | bool
+    - wem_join_secret_value is not defined
+
+# wem.conf.j2 는 WEM_AGENT_JOIN_SECRET='값' 처럼 따옴표로 쓴다. 따옴표는 빼고 값만 쓴다
+- name: Keep WEM_AGENT_JOIN_SECRET as a fact
+  ansible.builtin.set_fact:
+    wem_join_secret_value: "{{ _wem_conf_content.content | b64decode | regex_findall(_js_re) | first | default('') }}"
+  vars:
+    _js_re: "(?m)^\\s*WEM_AGENT_JOIN_SECRET\\s*=\\s*['\"]?([^'\"\\s]*)"
+  no_log: true
+  when:
+    - inventory_hostname == wem_host
+    - _wem_conf_content.content is defined
+
+- name: Show wem.conf path
+  ansible.builtin.debug:
+    msg: >-
+      wem.conf: {{ _wem_conf_path }} (group {{ _wem_conf_group }}){{
+      (', WEM_AGENT_JOIN_SECRET: ' ~ ('ok' if (wem_join_secret_value | default('') | length > 0) else '없음'))
+      if (_wem_facts_read_secret | default(true) | bool) else '' }}
+  when: inventory_hostname == wem_host
