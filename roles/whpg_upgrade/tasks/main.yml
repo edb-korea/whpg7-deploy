@@ -455,6 +455,26 @@
         recurse: true
       when: _whpg_upg_todo | length > 0
 
+    # edb-whpg7-pxf 6.10.4 부터 설치 경로가 바뀌므로 gpadmin .bashrc 의 PXF_HOME 을 실제 rpm 경로로 맞춘다
+    - name: PXF 설치 경로 확인 (rpm)
+      ansible.builtin.shell:
+        cmd: rpm -ql {{ whpg_upgrade_pxf_pkg }} | grep -m1 '/bin/pxf$'
+        executable: /bin/bash
+      register: _whpg_upg_pxf_bin
+      changed_when: false
+      failed_when: false
+      when: _p.pxf_up
+
+    - name: gpadmin .bashrc 의 PXF_HOME 갱신
+      ansible.builtin.lineinfile:
+        path: "{{ gpadmin_home }}/.bashrc"
+        regexp: '^export PXF_HOME='
+        line: "export PXF_HOME={{ _whpg_upg_pxf_bin.stdout | regex_replace('/bin/pxf$', '') }}"
+      when:
+        - _p.pxf_up
+        - _whpg_upg_pxf_bin.rc | default(1) == 0
+        - _whpg_upg_pxf_bin.stdout | length > 0
+
     - name: symlink 확인 (문서 27, → {{ whpg_real_install_dir }})
       ansible.builtin.file:
         src: "{{ whpg_real_install_dir }}"

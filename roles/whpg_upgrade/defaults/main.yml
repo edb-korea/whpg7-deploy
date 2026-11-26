@@ -62,9 +62,17 @@ whpg_upgrade_baseline_file: "{{ gpadmin_home }}/whpg_upgrade_baseline_{{ _whpg_u
 
 whpg_upgrade_doc_url: https://www.enterprisedb.com/docs/warehousepg/latest/install_guide/minor_upgrade/
 
-# PXF 명령 실행 환경: 문서대로 gpadmin .bashrc(PXF_HOME / PXF_BASE)를 읽고, PATH 에 없으면 $PXF_HOME/bin/pxf
+# PXF 패키지명 (설치 경로를 rpm 에서 확인)
+whpg_upgrade_pxf_pkg: "{{ whpg_ext_pkg_prefix }}-pxf"
+
+# PXF 명령 실행 환경: 문서대로 gpadmin .bashrc(PXF_HOME / PXF_BASE)를 읽되, PXF_HOME 은 설치된 rpm 의 경로를 우선
+#   edb-whpg7-pxf 6.10.4 부터 설치 경로가 /usr/local/edb-whpg7-pxf → /usr/edb/whpg7-pxf 로 바뀌어
+#   업그레이드 직후 .bashrc 의 PXF_HOME / PATH 는 옛 경로(bin/pxf 없음)를 가리킨다
 _whpg_upg_pxf_sh: |-
   source {{ gpadmin_home }}/.bashrc >/dev/null 2>&1
   source {{ whpg_install_dir }}/greenplum_path.sh
+  _pxf_bin=$(rpm -ql {{ whpg_upgrade_pxf_pkg }} 2>/dev/null | grep -m1 '/bin/pxf$')
+  [ -n "$_pxf_bin" ] && PXF_HOME=${_pxf_bin%/bin/pxf}
   export PXF_HOME=${PXF_HOME:-{{ pxf_home }}} PXF_BASE=${PXF_BASE:-{{ pxf_base_dir }}} JAVA_HOME=${JAVA_HOME:-{{ whpg_java_home }}}
-  PXF=$(command -v pxf 2>/dev/null || echo "$PXF_HOME/bin/pxf")
+  export PATH=$PXF_HOME/bin:$PATH
+  PXF=$PXF_HOME/bin/pxf
