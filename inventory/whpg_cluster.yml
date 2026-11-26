@@ -309,6 +309,18 @@ whpg_extension_catalog:
   - { name: flowserver,   pkg: "whpg7-flow-server",                         enabled: "{{ install_flowserver | bool }}" }
 
 # ------------------------------------------
+# FlowServer (playbooks/09_flowserver.yml, install_flowserver 일 때)
+#   flowserver_host 에서 systemd 서비스(flowserver, gpadmin)로 실행. 전체 변수: roles/flowserver/defaults/main.yml
+#   잡: template 은 Controller 의 잡 YAML(Jinja2) 경로. DB 비밀번호는 vault 변수로 (예: {{ vault_flowserver_db_password }})
+#   서비스 시작 시마다 등록되지 않은 잡을 다시 제출 (설정이 바뀐 기존 잡은 Summary 안내대로 직접 반영)
+# ------------------------------------------
+flowserver_host: "{{ coordinator_host }}"
+flowserver_port: 6060              # FlowCLI → FlowServer
+flowserver_gpfdist_port: 6070      # segment → FlowServer (gpfdist, HTTP)
+flowserver_jobs: []
+#  - { name: orders_kafka, template: "{{ inventory_dir }}/flowserver_jobs/orders_kafka.yaml.j2", start: true }
+
+# ------------------------------------------
 # WEM 1.4 (roles/wem, 참고: https://github.com/edb-korea/wem-deploy)
 #   WEM / ClickHouse : wem_host (wem_node 그룹, 기본 standby)
 #   Host Agent / otelcol : 모든 노드

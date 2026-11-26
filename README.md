@@ -25,6 +25,7 @@ whpg-ansible/
 │   ├── 06_coordinator_ha.yml          # Phase 6: Coordinator HA
 │   ├── 07_wem.yml                     # Phase 7: WEM 1.4 (ClickHouse + Host Agent + otelcol, VIP 사용)
 │   ├── 08_diskquota.yml               # Phase 8: cluster 차원 diskquota (post 작업, soft 90% / hard 92%)
+│   ├── 09_flowserver.yml              # Phase 9: FlowServer (systemd 서비스 + 잡 제출, install_flowserver)
 │   └── ops/
 │       ├── status.yml                 # 클러스터 상태 확인
 │       ├── start.yml                  # 클러스터 시작
@@ -78,6 +79,14 @@ whpg-ansible/
     │   ├── defaults/main.yml
     │   ├── tasks/main.yml
     │   └── templates/whpg_diskquota_check.sh.j2
+    ├── flowserver/                    # FlowServer (flow_server.json, systemd, 잡 YAML 템플릿 / 제출)
+    │   ├── defaults/main.yml
+    │   ├── handlers/main.yml
+    │   ├── tasks/main.yml
+    │   ├── files/kafka_job_example.yaml.j2
+    │   └── templates/
+    │       ├── flowserver.service.j2
+    │       └── submit_jobs.sh.j2
     ├── whpg_upgrade/                  # 패키지를 repo 최신 버전으로 업그레이드 (minor upgrade 문서 절차)
     │   ├── defaults/main.yml
     │   └── tasks/main.yml
@@ -322,7 +331,7 @@ ansible-playbook playbooks/site.yml --check --diff
 | `install_pgvector` | `edb-whpg7-pgvector` | 벡터 유사도 검색 (기본 true) |
 | `install_vectorplus` | `edb-whpg7-vectorplus` | ivfplus 벡터 인덱스 (pgvector 필요) |
 | `install_utl_raw` | `edb-whpg7-utl-raw` | Oracle UTL_RAW 호환 (orafce 필요) |
-| `install_flowserver` | `whpg7-flow-server` | 워크플로우 서버 |
+| `install_flowserver` | `whpg7-flow-server` | Kafka / RabbitMQ → WHPG 적재 (기본 true, 구성은 Phase 9) |
 
 ---
 
@@ -525,7 +534,7 @@ ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=postgis,pgaudit  # 개
 | `core` | `warehouse-pg-7` + `warehouse-pg-7-clients` (항상 함께) | 아래 core 절차 (서비스 중단) |
 | `pxf` | `edb-whpg7-pxf` | `pxf cluster stop` → dnf → `pxf cluster register` → `pxf cluster start` → `ALTER EXTENSION pxf UPDATE` |
 | `backup` | `whpg-backup` | dnf (gpbackup / gprestore 실행 중이면 중단) |
-| `flowserver` | `whpg7-flow-server` | dnf (실행 중이면 중단, 업그레이드 후 수동 시작 + 잡 재제출) |
+| `flowserver` | `whpg7-flow-server` | systemd `flowserver` 서비스면 정지 → dnf → 시작 (잡 자동 재제출). 서비스 밖에서 실행 중이면 중단 |
 | `extensions` / `<이름>` | `whpg_extension_catalog` 의 나머지 (name 또는 pkg 로 지정) | 클러스터 정지 없이 dnf → `ALTER EXTENSION ... UPDATE`. preload 라이브러리(pgaudit, user_profile, diskquota 등)는 재시작해야 적용 (`-e whpg_upgrade_restart=true` 면 `gpstop -ra`) |
 
 core 절차 (괄호는 문서 단계 번호):
@@ -539,7 +548,8 @@ core 절차 (괄호는 문서 단계 번호):
 5. 소유권 / symlink `/usr/local/greenplum-db`, `/usr/local/greenplum-db-clients` → `/usr/edb/whpg7` (27) → 모든 노드 버전 일치 확인
 6. `gpstart -a`(29) → `pxf cluster register` → `ALTER EXTENSION gp_exttable_fdw / gp_toolkit UPDATE`(35, 36)
 7. 7.6.x 권한 SQL (32~34, 모든 DB, template0 은 잠시 접속 허용 후 원복, `whpg_upgrade_post_sql`) → 버전 / `gpstate -f` / `gpstate -m` (30, 31)
-8. crontab 복원(37) → keepalived(coordinator → standby) → `pxf cluster start`(38) → pgBouncer(39) → WEM(40). FlowServer(41)는 수동
+8. crontab 복원(37) → keepalived(coordinator → standby) → `pxf cluster start`(38) → pgBouncer(39) → WEM(40) → FlowServer(41, systemd 서비스일 때, 잡 자동 재제출).
+   FlowServer 서비스는 3 단계에서 pgBouncer 보다 먼저 정지 (`ExecStop` 이 `flowcli stop --all`)
 
 - 점검에 문제가 있으면 `--check` 는 Summary 에 사유를 보여 주고, 실제 실행은 클러스터를 건드리기 전에 중단합니다. 실행 중 한 노드라도 실패하면 전체 중단.
 - Summary: `--check` 는 변경 예정 사항(서비스 중단 여부, 순서, 대상 노드 / DB), 실행 시는 결과. 수동 작업(문서 1~5, 38, 41~45, 버전별 확인 사항)도 표시합니다.
@@ -583,6 +593,40 @@ diskquota 의 cluster quota 는 값이 하나이고, soft / hard 는 같은 quot
 - 다시 실행해도 바뀐 것만 적용합니다. **새 DB 를 만들거나 클러스터 증설 / 볼륨 변경 후에는 다시 실행**하세요 (extension, 기준 용량, quota 갱신).
 - cluster quota 는 전체 합계 기준이라 특정 segment 에 데이터가 치우치면 그 디스크가 먼저 찰 수 있습니다. OS 단의 데이터 볼륨 quota(95%)가 마지막 방어선입니다.
 - 확인: `SELECT * FROM diskquota.status();`, `SELECT * FROM diskquota.show_cluster_quota_view;`
+
+---
+
+## FlowServer (Phase 9, `playbooks/09_flowserver.yml`)
+
+[FlowServer](https://www.enterprisedb.com/docs/supported-open-source/warehousepg/flowserver/) 로 Kafka / RabbitMQ 데이터를
+WHPG 에 적재합니다. RPM(`whpg7-flow-server`)은 `install_flowserver: true` 일 때 `04_extensions.yml` 이 모든 노드에 설치하고,
+이 Phase 는 `flowserver_host`(기본 coordinator) 에서 서버를 구성합니다.
+
+```bash
+ansible-playbook playbooks/09_flowserver.yml --check --diff   # 변경 예정 사항
+ansible-playbook playbooks/09_flowserver.yml                  # 구성 / 잡 제출
+```
+
+1. `~gpadmin/flowserver/flow_server.json` (FlowServer 6060, gpfdist 6070, 선택: Prometheus / DebugPort, Logging)
+2. 잡 YAML: `flowserver_jobs` 의 `template` 을 렌더링해 `~gpadmin/flowserver/jobs/<name>.yaml` (0600, DB 비밀번호는 vault 변수)
+3. systemd `flowserver` 서비스 (gpadmin, 부팅 시 자동 시작, 로그 `~gpadmin/gpAdminLogs`)
+   - 시작할 때마다 `submit_jobs.sh` 가 등록되지 않은 잡을 제출 (`start: true` 면 `-s`). 서버 재시작 후 잡 재제출이 필요하기 때문
+   - 정지할 때 `flowcli stop --all` 로 잡을 먼저 정지
+4. firewalld 가 실행 중이면 포트 개방 (`flowserver_manage_firewall`)
+
+```yaml
+# inventory/whpg_cluster.yml
+flowserver_jobs:
+  - { name: orders_kafka, template: "{{ inventory_dir }}/flowserver_jobs/orders_kafka.yaml.j2", start: true }
+# inventory/vault.yml
+vault_flowserver_db_password: "..."
+```
+
+- 잡 예시: `roles/flowserver/files/kafka_job_example.yaml.j2` ([잡 설정 형식](https://www.enterprisedb.com/docs/supported-open-source/warehousepg/flowserver/loading/config_file/))
+- 이미 등록된 잡은 다시 제출하지 않습니다. 잡 YAML 을 바꾼 경우 Summary 안내대로 `flowcli stop / remove` 후 재제출
+  (`remove` 는 Kafka consumer group 도 삭제해 offset 이 초기화되므로 자동으로 하지 않음)
+- 확인: `flowcli list`, `flowcli monitor <잡>`, `systemctl status flowserver`
+- 전체 변수: `roles/flowserver/defaults/main.yml`
 
 ---
 

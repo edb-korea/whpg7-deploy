@@ -16,10 +16,10 @@
 #   → gpstop -a -M fast(20) → 바이너리 백업(21) → dnf: server + clients(25, 26) → symlink(27) → 버전 일치 확인
 #   → gpstart -a(29) → pxf cluster register → ALTER EXTENSION gp_exttable_fdw / gp_toolkit UPDATE(35, 36)
 #   → 7.6.x 권한 SQL(32~34) → 버전 / gpstate -f / gpstate -m(30, 31)
-#   → crontab 복원(37) → keepalived → PXF(38) → pgBouncer(39) → WEM(40) 시작. FlowServer(41)는 잡 재제출이 필요해 수동
+#   → crontab 복원(37) → keepalived → PXF(38) → pgBouncer(39) → WEM(40) → FlowServer(41, systemd 서비스일 때) 시작
 # pxf        : pxf cluster stop → dnf → pxf cluster register → pxf cluster start → ALTER EXTENSION pxf UPDATE
 # backup     : dnf (gpbackup / gprestore 실행 중이면 중단)
-# flowserver : dnf (실행 중이면 중단, 업그레이드 후 수동 시작 + 잡 재제출)
+# flowserver : systemd flowserver 서비스(roles/flowserver)면 정지 → dnf → 시작(잡 자동 재제출), 서비스 밖에서 실행 중이면 중단
 # extension  : 클러스터 정지 없이 dnf → ALTER EXTENSION UPDATE (preload 라이브러리는 재시작해야 적용, whpg_upgrade_restart)
 #
 # 설치되어 있는 패키지만 올린다. local_rpm_dir 은 보지 않는다. WEM 은 playbooks/07_wem.yml -t upgrade.
@@ -97,7 +97,7 @@
         [ -n "$i" ] && u=$(dnf -q repoquery --upgrades --latest-limit 1 --qf '%{version}-%{release}' "$p" 2>/dev/null | tail -n1)
         echo "PKG|$p|$i|$u"
       done
-      for s in keepalived {{ whpg_upgrade_services | join(' ') }}; do
+      for s in keepalived {{ whpg_upgrade_flowserver_service }} {{ whpg_upgrade_services | join(' ') }}; do
         echo "SVC|$s|$(systemctl is-active "$s" 2>/dev/null)"
       done
       pgrep -x flowserver >/dev/null && echo "FLOW|yes" || echo "FLOW|no"
@@ -286,11 +286,12 @@
       {%- set flow_hosts = [] -%}
       {%- set bkp_hosts = [] -%}
       {%- for h in hv -%}
-      {%- if h._whpg_upg_kv.FLOW | default('no') == 'yes' -%}{%- set _ = flow_hosts.append(h.inventory_hostname) -%}{%- endif -%}
+      {#- systemd 서비스로 실행 중인 FlowServer 는 업그레이드가 정지 / 시작하므로 제외 -#}
+      {%- if h._whpg_upg_kv.FLOW | default('no') == 'yes' and whpg_upgrade_flowserver_service not in h._whpg_upg_active_svcs -%}{%- set _ = flow_hosts.append(h.inventory_hostname) -%}{%- endif -%}
       {%- if h._whpg_upg_kv.BKP | default('no') == 'yes' -%}{%- set _ = bkp_hosts.append(h.inventory_hostname) -%}{%- endif -%}
       {%- endfor -%}
       {%- if flow_hosts and (needs_stop or 'flowserver' in up_groups) -%}
-      {%- set _ = issues.append('FlowServer 실행 중 (' ~ flow_hosts | join(', ') ~ '): 잡 정지 후 flowcli stop --all; pkill flowserver. 업그레이드 후 수동 시작 + 잡 재제출') -%}
+      {%- set _ = issues.append('FlowServer 가 systemd 서비스 밖에서 실행 중 (' ~ flow_hosts | join(', ') ~ '): 잡 정지 후 flowcli stop --all; pkill flowserver. 업그레이드 후 수동 시작 + 잡 재제출 (서비스로 관리: playbooks/09_flowserver.yml)') -%}
       {%- endif -%}
       {%- if bkp_hosts and (needs_stop or 'backup' in up_groups) -%}
       {%- set _ = issues.append('gpbackup / gprestore 실행 중 (' ~ bkp_hosts | join(', ') ~ ')') -%}
@@ -359,6 +360,10 @@
     _db_running: "{{ _whpg_upg_plan.db.DB | default('') == 'running' }}"
     _pxf_running: "{{ _whpg_upg_plan.db.PXF | default('') == 'running' }}"
     _pxf_cycle: "{{ _whpg_upg_plan.needs_stop or _whpg_upg_plan.pxf_up }}"
+    # FlowServer(systemd): core 또는 flowserver 업그레이드 시 정지 → 시작 (시작 시 ExecStartPost 가 잡 재제출)
+    _flow_cycle: >-
+      {{ (_whpg_upg_plan.needs_stop or 'flowserver' in _whpg_upg_plan.up_groups)
+         and whpg_upgrade_flowserver_service in _whpg_upg_active_svcs }}
     _gp: "source {{ whpg_install_dir }}/greenplum_path.sh"
   block:
     # ----- 2-1. baseline 기록 (문서 10, 11) -----
@@ -389,6 +394,13 @@
       ansible.builtin.command: crontab -r -u {{ gpadmin_user }}
       when: _p.needs_stop and _whpg_upg_has_cron
       changed_when: true
+
+    # ExecStop 이 flowcli stop --all 로 잡을 먼저 정리
+    - name: FlowServer 정지 (systemd)
+      ansible.builtin.systemd:
+        name: "{{ whpg_upgrade_flowserver_service }}"
+        state: stopped
+      when: _flow_cycle | bool
 
     - name: PXF 정지 (pxf cluster stop)
       ansible.builtin.shell:
@@ -687,6 +699,13 @@
         state: started
       loop: "{{ whpg_upgrade_services | select('in', _whpg_upg_active_svcs) | list if _p.needs_stop else [] }}"
 
+    # DB 가 정지 상태로 남았으면 잡이 실패할 수 있으나 서비스는 시작 (DB 시작 후 flowcli start --all)
+    - name: FlowServer 시작 (systemd, 잡 자동 재제출)
+      ansible.builtin.systemd:
+        name: "{{ whpg_upgrade_flowserver_service }}"
+        state: started
+      when: _flow_cycle | bool
+
 # ---------------------------------------------------------------------------
 # 3. Summary
 # ---------------------------------------------------------------------------
@@ -738,6 +757,8 @@
       {%- set dbs = (p.db.DBS | default('')).split() -%}
       {%- set steps = ['업그레이드 전 상태 기록: ' ~ gpadmin_home ~ '/whpg_upgrade_baseline_<시각>.txt (모든 노드)'] -%}
       {%- if p.needs_stop and cron_hosts -%}{%- set _ = steps.append('gpadmin crontab 백업 후 제거: ' ~ cron_hosts | join(', ')) -%}{%- endif -%}
+      {%- set flow_cycle = svc[whpg_upgrade_flowserver_service] is defined and (p.needs_stop or 'flowserver' in p.up_groups) -%}
+      {%- if flow_cycle -%}{%- set _ = steps.append('FlowServer 정지 (flowcli stop --all → systemctl stop ' ~ whpg_upgrade_flowserver_service ~ '): ' ~ svc[whpg_upgrade_flowserver_service] | join(', ')) -%}{%- endif -%}
       {%- if pxf_cycle -%}{%- set _ = steps.append('pxf cluster stop') -%}{%- endif -%}
       {%- if p.needs_stop -%}
       {%- for s in whpg_upgrade_services if svc[s] is defined -%}{%- set _ = steps.append(s ~ ' 정지: ' ~ svc[s] | join(', ')) -%}{%- endfor -%}
@@ -778,6 +799,7 @@
       {%- if p.needs_stop -%}
       {%- for s in whpg_upgrade_services if svc[s] is defined -%}{%- set _ = steps.append(s ~ ' 시작: ' ~ svc[s] | join(', ')) -%}{%- endfor -%}
       {%- endif -%}
+      {%- if flow_cycle -%}{%- set _ = steps.append('FlowServer 시작 (잡 자동 재제출): ' ~ svc[whpg_upgrade_flowserver_service] | join(', ')) -%}{%- endif -%}
       {%- set _ = out.append('변경 예정 사항' ~ (' (점검 문제 해결 후)' if p.issues else '')
             ~ ' - 서비스 중단: ' ~ ('있음' if p.downtime and running else '없음')
             ~ ' / 실행: ansible-playbook playbooks/upgrade/upgrade.yml -e upgrade=' ~ (_whpg_upg_sel | join(','))) -%}
@@ -813,8 +835,11 @@
       {%- set _ = notes.append('inventory/whpg_cluster.yml 의 whpg_version 을 ' ~ p.tgt_n ~ ' 로 변경') -%}
       {%- set _ = notes.append('업그레이드 후 PXF smoke test 등 애플리케이션 확인, 트래픽 / 스케줄러 / 모니터링 재개 (문서 38, 42~45)') -%}
       {%- endif -%}
-      {%- if p.needs_stop or 'flowserver' in p.up_groups -%}
-      {%- set _ = notes.append('FlowServer 사용 시: 각 호스트에서 nohup ./flowserver -c /path/flow_server.json & 후 잡 재제출 (문서 41)') -%}
+      {%- set flow_svc_hosts = hv | selectattr('_whpg_upg_active_svcs', 'contains', whpg_upgrade_flowserver_service) | map(attribute='inventory_hostname') | list -%}
+      {%- if (p.needs_stop or 'flowserver' in p.up_groups) and flow_svc_hosts -%}
+      {%- set _ = notes.append('FlowServer(' ~ flow_svc_hosts | join(', ') ~ '): 잡 상태 확인 flowcli list / flowcli monitor <잡> (문서 41)') -%}
+      {%- elif p.needs_stop or 'flowserver' in p.up_groups -%}
+      {%- set _ = notes.append('FlowServer 를 서비스 밖에서 사용 시: nohup flowserver -c /path/flow_server.json & 후 잡 재제출 (문서 41)') -%}
       {%- endif -%}
       {%- if p.needs_stop and p.cur_n is version('7.6.0', '<') and p.tgt_n is version('7.6.0', '>=') -%}
       {%- set _ = notes.append('[7.6.0] pg_dump 출력의 \\restrict 마커, COPY FROM STDIN 의 \\. 종료, resource group CPUSET 순서(coordinator;segment) 확인') -%}

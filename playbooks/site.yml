@@ -1,7 +1,7 @@
 ---
 # ======================================================
 # WarehousePG 전체 배포 메인 플레이북 (site.yml)
-# 실행 순서: OS 구성 → WHPG 설치 → 초기화 → Extension → pgBouncer → HA → WEM → diskquota
+# 실행 순서: OS 구성 → WHPG 설치 → 초기화 → Extension → pgBouncer → HA → WEM → diskquota → FlowServer
 # ======================================================
 
 # Phase 1: OS 사전 구성 (모든 클러스터 노드)
@@ -94,3 +94,14 @@
   tags:
     - phase8
     - diskquota
+
+# Phase 9: FlowServer (Kafka / RabbitMQ → WHPG 적재, install_flowserver 일 때)
+- name: "Phase 9: FlowServer 구성"
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - role: flowserver
+      when: install_flowserver | default(false) | bool
+  tags:
+    - phase9
+    - flowserver

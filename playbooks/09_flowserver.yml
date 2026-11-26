@@ -1,0 +1,8 @@
+---
+# FlowServer 구성 (단독 실행). RPM 은 04_extensions.yml (install_flowserver: true) 로 설치
+- name: FlowServer 구성
+  hosts: whpg_cluster
+  become: true
+  roles:
+    - role: flowserver
+      when: install_flowserver | default(false) | bool

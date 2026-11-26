@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+[Unit]
+Description=WarehousePG FlowServer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User={{ gpadmin_user }}
+Group={{ gpadmin_group }}
+Type=simple
+WorkingDirectory={{ flowserver_dir }}
+ExecStart={{ flowserver_bin }} -c {{ flowserver_conf_file }} -l {{ flowserver_log_dir }}
+# 서버 재시작 후에는 잡을 다시 제출해야 하므로(문서) 시작할 때마다 등록되지 않은 잡을 제출 (실패해도 서비스는 유지)
+ExecStartPost=-{{ flowserver_dir }}/submit_jobs.sh
+# 정지 전에 실행 중인 잡을 정리
+ExecStop=-{{ flowserver_cli }} --port {{ flowserver_port }} --log-dir {{ flowserver_log_dir }} stop --all
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

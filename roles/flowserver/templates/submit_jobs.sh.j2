@@ -1,0 +1,29 @@
+#!/bin/bash
+# {{ ansible_managed }}
+# FlowServer 에 등록되지 않은 잡을 제출 (systemd ExecStartPost / Ansible 에서 호출, 여러 번 실행해도 안전)
+CLI="{{ flowserver_cli }} --port {{ flowserver_port }} --log-dir {{ flowserver_log_dir }}"
+JOBS="{{ flowserver_jobs_dir }}"
+
+# 서버 응답 대기 (최대 60초)
+ok=
+for i in $(seq 1 60); do
+  names=$($CLI list -n 2>/dev/null) && { ok=1; break; }
+  sleep 1
+done
+if [ -z "$ok" ]; then
+  echo "ERROR flowserver 응답 없음 (port {{ flowserver_port }})"
+  exit 1
+fi
+
+rc=0
+{% for j in flowserver_jobs %}
+if grep -qxF '{{ j.name }}' <<<"$names"; then
+  echo "EXISTS {{ j.name }}"
+elif out=$($CLI submit -n '{{ j.name }}'{{ ' -s' if j.start | default(true) | bool else '' }} "$JOBS/{{ j.name }}.yaml" 2>&1); then
+  echo "SUBMITTED {{ j.name }}{{ ' (started)' if j.start | default(true) | bool else '' }}"
+else
+  echo "FAILED {{ j.name }}: $(tail -n 3 <<<"$out" | paste -sd' ')"
+  rc=1
+fi
+{% endfor %}
+exit $rc
