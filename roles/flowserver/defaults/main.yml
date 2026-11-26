@@ -18,20 +18,21 @@ flowserver_conf_file: "{{ flowserver_dir }}/flow_server.json"
 flowserver_jobs_dir: "{{ flowserver_dir }}/jobs"
 flowserver_log_dir: "{{ gpadmin_home }}/gpAdminLogs"
 
-# flow_server.json (기본값은 문서 기준)
+# flow_server.json (EDB 샘플 기준)
 flowserver_listen_host: ""             # "" = 모든 인터페이스
 flowserver_port: 6060                  # FlowCLI → FlowServer (gRPC)
-flowserver_gpfdist_host: ""            # segment 가 HTTP 로 접속하는 gpfdist (""= 모든 인터페이스)
+# segment 가 HTTP 로 접속하는 gpfdist 주소 (기본 coordinator IP, segment 에서 접근 가능해야 함)
+flowserver_gpfdist_host: "{{ hostvars[coordinator_host].ansible_host }}"
 flowserver_gpfdist_port: 6070
 flowserver_gpfdist_reuse_tables: false # true: 설정값 해시 이름의 외부 테이블 재사용 / false: 잡 시작마다 drop + create
-flowserver_prometheus_enabled: false
+flowserver_prometheus_enabled: true
 flowserver_prometheus_host: ""
 flowserver_prometheus_port: 9080
-flowserver_prometheus_path: /metrics
-flowserver_debug_port: 0               # 0 = debug(pprof) 서버 끄기
-flowserver_log_split_by_job: true
-flowserver_log_frontend_level: info    # debug / info / warn / error / fatal
-flowserver_log_backend_level: debug
+flowserver_prometheus_path: /flow_metrics
+flowserver_debug_port: 6080            # debug(pprof) 서버, 0 = 끄기 (방화벽은 열지 않음)
+flowserver_log_split_by_job: false
+flowserver_log_frontend_level: debug   # stdout(journal) 레벨: debug / info / warn / error / fatal
+flowserver_log_backend_level: info     # 로그 파일 레벨
 
 # 잡 (빈 목록이면 서버만 구성)
 #   name     : 잡 이름 (flowcli submit -n)
