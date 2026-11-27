@@ -175,7 +175,7 @@ whpg_pg_hba_rules:
 # 로컬 YUM 레포지토리 설정
 # ------------------------------------------
 whpg_local_repo_enabled: true
-whpg_local_repo_baseurl: "http://10.0.8.192/whpg-repo/"   # 환경에 맞게 수정
+whpg_local_repo_baseurl: "http://10.0.8.192:8080/whpg-repo/"   # 환경에 맞게 수정
 whpg_local_repo_gpgcheck: false
 
 # ------------------------------------------
@@ -304,7 +304,7 @@ whpg_extension_catalog:
   - { name: pgvector,     pkg: "{{ whpg_ext_pkg_prefix }}-pgvector",        enabled: "{{ install_pgvector | bool }}", sql_ext: vector }
   - { name: vectorplus,   pkg: "{{ whpg_ext_pkg_prefix }}-vectorplus",      enabled: "{{ install_vectorplus | bool }}", sql_ext: edb_vectorplus, cascade: true }
   - { name: utl_raw,      pkg: "{{ whpg_ext_pkg_prefix }}-utl-raw",         enabled: "{{ install_utl_raw | bool }}", sql_ext: whpg_utl_raw, cascade: true }
-  - { name: pgfs,         pkg: "{{ whpg_ext_pkg_prefix }}-pgfs",            enabled: "{{ install_pgfs | bool }}" }
+  - { name: pgfs,         pkg: "{{ whpg_ext_pkg_prefix }}-pgfs",            enabled: "{{ install_pgfs | bool }}", sql_ext: pgfs }   # pgaa 가 requires (pgaa 보다 먼저 생성)
   - { name: pgaa,         pkg: "{{ whpg_ext_pkg_prefix }}-pgaa",            enabled: "{{ install_pgaa | bool }}", sql_ext: pgaa }
   - { name: flowserver,   pkg: "whpg7-flow-server",                         enabled: "{{ install_flowserver | bool }}" }
 

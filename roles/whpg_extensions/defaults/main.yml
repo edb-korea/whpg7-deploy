@@ -11,3 +11,7 @@ pxf_hadoop_auth: simple
 madlib_schema: madlib
 madlib_home: /usr/local/madlib        # edb-whpg7-madlib 설치 경로 (bin → Current/bin → Versions/<버전>/bin)
 madlib_platform: greenplum           # madpack -p 값 (postgres | greenplum), WHPG 는 greenplum
+# madpack.py 실행 python. bin/madpack 래퍼는 python2.7 을 먼저 찾으므로
+# (WHPG 6 의 edb-python27 이 같이 설치된 호스트에서 yaml 없는 python2 로 실행돼 실패) python3 로 직접 실행.
+# greenplum_path.sh 가 PATH 앞에 WHPG 7 python3.11 을 넣으므로 python3 = WHPG 7 python
+madlib_python: python3
