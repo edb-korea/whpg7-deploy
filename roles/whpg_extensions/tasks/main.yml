@@ -194,7 +194,7 @@
   ansible.builtin.shell:
     cmd: >
       source {{ whpg_install_dir }}/greenplum_path.sh &&
-      {{ madlib_home }}/bin/madpack -s {{ madlib_schema }} install
+      {{ madlib_python }} {{ madlib_home }}/Current/madpack/madpack.py -s {{ madlib_schema }} install
       -p {{ madlib_platform }}
       -c {{ gpadmin_user }}@localhost:{{ whpg_coordinator_port }}/{{ whpg_database }} 2>&1
   become: true
